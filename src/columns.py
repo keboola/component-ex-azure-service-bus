@@ -65,6 +65,13 @@ def metadata_column_names() -> list[str]:
     return [name for name, _ in METADATA_COLUMNS]
 
 
+def utc_now() -> datetime:
+    """The run's one wall clock (aware UTC). The component reads T0, ``extracted_at_utc``, the
+    pending set's ``deferred_at_utc`` and every collaborator's lock / expiry clock from it, so the
+    functional suite can align it with the fake broker's clock (Global Constraints: injectable time)."""
+    return datetime.now(UTC)
+
+
 def format_timestamp(value: datetime | int | float | None) -> str:  # noqa: PYI041 -- the two numeric
     # arms are semantically distinct (epoch milliseconds, always integral in practice) and the task
     # interface spells out `int | float` explicitly.

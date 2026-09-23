@@ -10,6 +10,7 @@ from columns import (
     message_metadata,
     metadata_column_names,
     render_preview,
+    utc_now,
 )
 from configuration import EntityType, SettlementMode, SubQueue
 from entity import EntityRef
@@ -72,3 +73,9 @@ def test_render_preview():
     lines = text.splitlines()
     assert lines[0].startswith("| Sequence Number |") and "| 7 |" in lines[2]
     assert "a\\|b" in lines[2] and "y" * 121 not in lines[2]
+
+
+def test_utc_now_is_the_aware_utc_wall_clock():
+    before = datetime.now(UTC)
+    value = utc_now()
+    assert value.tzinfo is UTC and before <= value <= datetime.now(UTC)

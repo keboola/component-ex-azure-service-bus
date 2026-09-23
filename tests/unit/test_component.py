@@ -1,7 +1,9 @@
+import csv
 import inspect
 import json
 import logging
 import runpy
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -518,3 +520,29 @@ def test_main_redacts_the_user_error(broker, tmp_path, monkeypatch, caplog):
         assert run_main(tmp_path, monkeypatch, PARAMS) == 1
     (message,) = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
     assert message.startswith("failed with Endpoint=") and "c2VjcmV0" not in message
+
+
+# --- one wall-clock source (Phase 5: the functional suite aligns it with the fake broker's clock) ----------
+
+
+def test_t0_and_extracted_at_come_from_utc_now(broker, tmp_path, monkeypatch):
+    import component as component_mod
+
+    frozen = broker.clock.now() + timedelta(seconds=5)
+    monkeypatch.setattr(component_mod, "utc_now", lambda: frozen)
+    q = broker.add_queue("q")
+    q.send(b"early")
+    q.send(b"late", enqueued_at=frozen + timedelta(seconds=1))  # at or after T0: the peek stops before it
+    component(tmp_path, monkeypatch, with_source(settlement_mode="peek")).execute_action()
+    rows = list(csv.DictReader((tmp_path / "out/tables/q.csv").open()))
+    assert [(r["body"], r["extracted_at_utc"]) for r in rows] == [("early", "2026-09-23 10:00:05.000000")]
+
+
+def test_pending_set_timestamp_comes_from_utc_now(broker, tmp_path, monkeypatch):
+    import component as component_mod
+
+    frozen = broker.clock.now() + timedelta(seconds=5)
+    monkeypatch.setattr(component_mod, "utc_now", lambda: frozen)
+    broker.add_queue("q").send(b"x")
+    component(tmp_path, monkeypatch, with_source(settlement_mode="defer_commit")).execute_action()
+    assert out_state(tmp_path)["pending_commit"][0]["deferred_at_utc"] == "2026-09-23 10:00:05.000000"

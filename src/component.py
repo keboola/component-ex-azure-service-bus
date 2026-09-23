@@ -12,7 +12,7 @@ never settle or lock a message.
 import logging
 import sys
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Any, Literal
 
 from azure.servicebus import NEXT_AVAILABLE_SESSION, ServiceBusReceiveMode
@@ -23,7 +23,7 @@ from keboola.component.sync_actions import MessageType, SelectElement, Validatio
 
 from body import FlattenRegistry
 from client import ServiceBusConnector, configure_logging, redact_secrets, to_user_exception
-from columns import format_timestamp, metadata_column_names, render_preview
+from columns import format_timestamp, metadata_column_names, render_preview, utc_now
 from commit import ForeignDeferralProbe, OrphanScanner, PendingCommitter
 from configuration import AuthConfiguration, BodyFormat, Configuration, FetchMode, SettlementMode
 from entity import (
@@ -124,7 +124,7 @@ class Component(ComponentBase):
     def _start_run(self, config: Configuration) -> RunContext:
         """T0, the row state, the metadata pre-check with its counts line and the effective-settings
         line (spec §6.1 steps 2-3)."""
-        t0 = datetime.now(UTC)
+        t0 = utc_now()
         entity = EntityRef.from_source(config.source)
         state = ExtractorState.load(self.get_state_file())
         stats = RunStats(mode=config.source.settlement_mode.value)
@@ -194,7 +194,7 @@ class Component(ComponentBase):
                 policy=config.body.unreadable_body, mode=mode, is_sub_queue=run.entity.is_sub_queue, stats=run.stats
             ),
             stats=run.stats,
-            clock=lambda: datetime.now(UTC),
+            clock=utc_now,
         )
 
     def _commit_pending(self, config: Configuration, run: RunContext) -> None:
@@ -216,6 +216,7 @@ class Component(ComponentBase):
                 prefetch_count=config.advanced.prefetch_count,
                 processor=processor,
                 stats=run.stats,
+                clock=utc_now,
             ).scan()
         else:
             ForeignDeferralProbe(
@@ -255,6 +256,7 @@ class Component(ComponentBase):
             t0=run.t0,
             state_size=lambda: self._projected_state(run).size_bytes(),
             arm_write_always=output.arm_write_always,
+            clock=utc_now,
         ).run()
 
     def _peek(self, config: Configuration, run: RunContext, processor: BatchProcessor) -> None:
@@ -276,6 +278,7 @@ class Component(ComponentBase):
             stats=run.stats,
             cursor=run.state.peek_cursor,
             t0=run.t0,
+            clock=utc_now,
         ).run()
 
     @staticmethod
@@ -286,7 +289,7 @@ class Component(ComponentBase):
         state = run.state.model_copy(deep=True)
         source = run.config.source
         if source.settlement_mode.is_destructive:
-            state.pending_commit = run.pending.build(format_timestamp(datetime.now(UTC)))
+            state.pending_commit = run.pending.build(format_timestamp(utc_now()))
         elif source.fetch_mode is FetchMode.INCREMENTAL_FETCH:
             state.peek_cursor = run.peek_cursor
         if run.registry is not None:
