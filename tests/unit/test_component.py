@@ -400,6 +400,20 @@ def test_test_connection_root_probes_management(broker, tmp_path, monkeypatch, c
     assert broker.admin_calls == [("list_queues", "")] and broker.receivers == []
 
 
+def test_test_connection_with_an_empty_source_is_the_root_probe(broker, tmp_path, monkeypatch, capsys):
+    component(
+        tmp_path, monkeypatch, {"#connection_string": SAS, "source": {}}, action="testConnection"
+    ).execute_action()
+    assert sync_result(capsys)["message"] == "Connected to the Service Bus namespace."
+    assert broker.admin_calls == [("list_queues", "")] and broker.receivers == []
+
+
+def test_test_connection_with_a_partial_source_reports_the_missing_field(broker, tmp_path, monkeypatch, capsys):
+    params = {"#connection_string": SAS, "source": {"entity_type": "queue"}}
+    err = sync_failure(capsys, component(tmp_path, monkeypatch, params, action="testConnection"))
+    assert "queue_name" in err and broker.admin_calls == []
+
+
 def test_test_connection_root_listen_sas(broker, tmp_path, monkeypatch, capsys):
     broker.management_denied = True
     err = sync_failure(capsys, component(tmp_path, monkeypatch, {"#connection_string": SAS}, action="testConnection"))

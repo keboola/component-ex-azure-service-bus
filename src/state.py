@@ -5,13 +5,13 @@ pending-commit set (H2/H5), the C4 peek cursor and the flatten-registry carry-ov
 non-partitioned single-consumer entity's pending set tiny -- consecutive deferrals collapse to one
 ``[start, end]`` pair instead of one entry per sequence number. ``PendingSetBuilder`` accumulates
 deferrals (and, on H3, carried-forward groups from an earlier run's state) during C2/H3 and emits the
-``PendingEntity`` list ``ExtractorState.pending_commit`` stores.
+``PendingEntity`` list ``ExtractorState.pending_commit`` stores. A stored range can cover millions of
+sequence numbers, so ranges are only ever expanded lazily (``iter_ranges``), never into a list.
 """
 
-from __future__ import annotations
-
 import json
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator, Sequence
+from dataclasses import dataclass, field
 from typing import Any
 
 from keboola.component.exceptions import UserException
@@ -42,12 +42,27 @@ def to_ranges(seqs: Iterable[int]) -> list[list[int]]:
     return ranges
 
 
-def from_ranges(ranges: list[list[int]]) -> list[int]:
-    """The inverse of ``to_ranges``: every sequence number covered by any ``[start, end]`` pair."""
-    seqs: list[int] = []
-    for start, end in ranges:
-        seqs.extend(range(start, end + 1))
-    return seqs
+def merge_ranges(ranges: Iterable[Sequence[int]]) -> list[list[int]]:
+    """Inclusive ``[start, end]`` ranges sorted, with overlapping and adjacent ones joined and empty
+    ones (``end < start``) dropped -- the ranges of a stored state may have been edited by hand."""
+    merged: list[list[int]] = []
+    for start, end in sorted((start, end) for start, end in ranges if start <= end):
+        if merged and start <= merged[-1][1] + 1:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return merged
+
+
+def iter_ranges(ranges: Iterable[Sequence[int]]) -> Iterator[int]:
+    """The inverse of ``to_ranges``, lazily: every covered sequence number, ascending and deduplicated."""
+    for start, end in merge_ranges(ranges):
+        yield from range(start, end + 1)
+
+
+def count_ranges(ranges: Iterable[Sequence[int]]) -> int:
+    """How many distinct sequence numbers ``ranges`` cover, without expanding them."""
+    return sum(end - start + 1 for start, end in merge_ranges(ranges))
 
 
 class PendingGroup(BaseModel):
@@ -60,8 +75,18 @@ class PendingGroup(BaseModel):
     max_body_bytes: int = 0
     ranges: list[list[int]] = Field(default_factory=list)
 
-    def sequence_numbers(self) -> list[int]:
-        return from_ranges(self.ranges)
+    def iter_sequence_numbers(self) -> Iterator[int]:
+        return iter_ranges(self.ranges)
+
+    @property
+    def count(self) -> int:
+        return count_ranges(self.ranges)
+
+    def tail(self, first: int) -> PendingGroup:
+        """This group restricted to its sequence numbers ``>= first`` -- what a commit interrupted
+        after deleting everything below ``first`` leaves pending."""
+        ranges = [[max(start, first), end] for start, end in merge_ranges(self.ranges) if end >= first]
+        return self.model_copy(update={"ranges": ranges})
 
 
 class PendingEntity(BaseModel):
@@ -135,6 +160,19 @@ class ExtractorState(BaseModel):
         return len(json.dumps(self.to_dict(), separators=_COMPACT_SEPARATORS))
 
 
+@dataclass
+class _GroupDraft:
+    """One group being built: the sequence numbers deferred in this run (added one by one) plus the
+    carried-forward ranges, kept as ranges (a carried range may cover millions of sequence numbers)."""
+
+    seqs: set[int] = field(default_factory=set)
+    carried: list[list[int]] = field(default_factory=list)
+    max_body_bytes: int = 0
+
+    def ranges(self) -> list[list[int]]:
+        return merge_ranges([*self.carried, *to_ranges(self.seqs)])
+
+
 class PendingSetBuilder:
     """Accumulates deferred (and carried-forward) groups during C2/H3 and emits the
     ``pending_commit`` list ``ExtractorState`` stores. Keyed by ``(entity_key, session_id,
@@ -144,7 +182,7 @@ class PendingSetBuilder:
 
     def __init__(self) -> None:
         self._entities: dict[str, dict[str, Any]] = {}
-        self._groups: dict[tuple[str, str | None, int], tuple[set[int], int]] = {}
+        self._groups: dict[tuple[str, str | None, int], _GroupDraft] = {}
 
     def _entity_key(self, entity: EntityRef) -> str:
         key = json.dumps(entity.to_dict(), sort_keys=True)
@@ -153,10 +191,9 @@ class PendingSetBuilder:
 
     def add(self, entity: EntityRef, sequence_number: int, session_id: str | None, body_bytes: int) -> None:
         entity_key = self._entity_key(entity)
-        group_key = (entity_key, session_id, partition_of(sequence_number))
-        seqs, max_bytes = self._groups.get(group_key, (set(), 0))
-        seqs.add(sequence_number)
-        self._groups[group_key] = (seqs, max(max_bytes, body_bytes))
+        draft = self._groups.setdefault((entity_key, session_id, partition_of(sequence_number)), _GroupDraft())
+        draft.seqs.add(sequence_number)
+        draft.max_body_bytes = max(draft.max_body_bytes, body_bytes)
 
     def carry(self, entities: list[PendingEntity]) -> None:
         """Merge carried-forward groups (e.g. H5's session-locked carry, H3's scan resume) into the
@@ -166,20 +203,19 @@ class PendingSetBuilder:
             entity = pending_entity.entity_ref()
             entity_key = self._entity_key(entity)
             for group in pending_entity.groups:
-                group_key = (entity_key, group.session_id, group.partition)
-                seqs, max_bytes = self._groups.get(group_key, (set(), 0))
-                seqs.update(group.sequence_numbers())
-                self._groups[group_key] = (seqs, max(max_bytes, group.max_body_bytes))
+                draft = self._groups.setdefault((entity_key, group.session_id, group.partition), _GroupDraft())
+                draft.carried = merge_ranges([*draft.carried, *group.ranges])
+                draft.max_body_bytes = max(draft.max_body_bytes, group.max_body_bytes)
 
     def build(self, deferred_at_utc: str) -> list[PendingEntity]:
         by_entity: dict[str, list[PendingGroup]] = {}
-        for (entity_key, session_id, partition), (seqs, max_bytes) in self._groups.items():
+        for (entity_key, session_id, partition), draft in self._groups.items():
             by_entity.setdefault(entity_key, []).append(
                 PendingGroup(
                     session_id=session_id,
                     partition=partition,
-                    max_body_bytes=max_bytes,
-                    ranges=to_ranges(seqs),
+                    max_body_bytes=draft.max_body_bytes,
+                    ranges=draft.ranges(),
                 )
             )
         result: list[PendingEntity] = []
@@ -196,8 +232,4 @@ class PendingSetBuilder:
 
     @property
     def count(self) -> int:
-        return sum(len(seqs) for seqs, _ in self._groups.values())
-
-    def encoded_size(self, deferred_at_utc: str) -> int:
-        pending = [p.model_dump(mode="json") for p in self.build(deferred_at_utc)]
-        return len(json.dumps(pending, separators=_COMPACT_SEPARATORS))
+        return sum(count_ranges(draft.ranges()) for draft in self._groups.values())

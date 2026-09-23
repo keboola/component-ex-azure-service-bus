@@ -2,6 +2,7 @@ import pytest
 from azure.servicebus import NEXT_AVAILABLE_SESSION, ServiceBusReceiveMode
 from azure.servicebus.exceptions import (
     MessageNotFoundError,
+    MessagingEntityNotFoundError,
     ServiceBusConnectionError,
     ServiceBusServerBusyError,
     SessionCannotBeLockedError,
@@ -14,6 +15,7 @@ from configuration import AuthConfiguration, EntityType, SubQueue
 from entity import EntityRef
 from state import PendingSetBuilder
 from stats import RunStats
+from tests.fakes.broker import FakeReceiver
 
 SAS = "Endpoint=sb://ns.servicebus.windows.net/;SharedAccessKeyName=k;SharedAccessKey=c2VjcmV0"
 Q = EntityRef(EntityType.QUEUE, "q", None, None, SubQueue.NONE)
@@ -103,8 +105,10 @@ def test_bisect_directly(broker):
     with client.get_queue_receiver(
         "q", receive_mode=ServiceBusReceiveMode.RECEIVE_AND_DELETE, prefetch_count=1, keep_alive=0
     ) as r:
-        received, gone = receive_deferred_bisect(r, [seqs[0], 777, seqs[1], seqs[2]], sleep=lambda s: None)
-    assert sorted(m.sequence_number for m in received) == seqs and gone == [777]
+        result = receive_deferred_bisect(r, [seqs[0], 777, seqs[1], seqs[2]], sleep=lambda s: None)
+    assert sorted(m.sequence_number for m in result.received) == seqs and result.not_found == [777]
+    received, gone = result  # still unpacks like the pair it is
+    assert len(received) == 3 and gone == [777]
 
 
 def test_transient_retry_then_success(broker):
@@ -259,7 +263,7 @@ def test_session_locked_carry_keeps_group_and_retries_open(broker):
     c, stats = committer(sleeps, configured=ref)
     (carried,) = c.commit(pending_for(ref, seqs, session_id="A", body_bytes=77))
     (group,) = carried.groups
-    assert group.sequence_numbers() == seqs and group.max_body_bytes == 77
+    assert list(group.iter_sequence_numbers()) == seqs and group.max_body_bytes == 77
     assert carried.deferred_at_utc == "2026-09-23 10:00:00.000000" and carried.entity_ref() == ref
     assert sleeps == [2, 4, 8] and stats.carried_forward == 2 and stats.committed == 0
     assert all(s.state_of(seq) == "DEFERRED" for seq in seqs)
@@ -306,6 +310,44 @@ def test_sub_queue_group_commits_without_a_session(broker):
     assert c.commit(pending_for(ref, [seq], session_id="A")) == []
     assert s.dead_letter.sequence_numbers() == [] and stats.committed == 1
     assert "session_id" not in broker.receivers[0].kwargs
+
+
+def _fail_deferred_call(monkeypatch, on_call: int, error: Exception) -> None:
+    """The ``on_call``-th ``receive_deferred_messages`` (1-based) raises ``error`` instead."""
+    original = FakeReceiver.receive_deferred_messages
+    calls: list[int] = []
+
+    def flaky(self, sequence_numbers, **kwargs):
+        calls.append(1)
+        if len(calls) == on_call:
+            raise error
+        return original(self, sequence_numbers, **kwargs)
+
+    monkeypatch.setattr(FakeReceiver, "receive_deferred_messages", flaky)
+
+
+def test_session_lock_lost_mid_group_carries_only_the_undeleted_tail(broker, monkeypatch):
+    s = broker.add_queue("s", sessions=True)
+    ref = EntityRef(EntityType.QUEUE, "s", None, None, SubQueue.NONE)
+    seqs = deferred(s, 600, session_id="A")
+    _fail_deferred_call(monkeypatch, 2, SessionCannotBeLockedError(message="held"))
+    c, stats = committer(configured=ref)
+    (carried,) = c.commit(pending_for(ref, seqs, session_id="A"))
+    assert carried.groups[0].ranges == [[seqs[250], seqs[-1]]]  # the failed chunk and everything after it
+    assert stats.committed == 250 and stats.carried_forward == 350
+    assert s.sequence_numbers() == seqs[250:]
+
+
+def test_stale_entity_mid_group_drops_the_rest_and_later_groups(broker, monkeypatch):
+    broker.add_queue("q")
+    old = broker.add_queue("old")
+    old_ref = EntityRef(EntityType.QUEUE, "old", None, None, SubQueue.NONE)
+    seqs = deferred(old, 300)
+    pending = pending_for(old_ref, [*seqs, (52 << 48) | 1, (52 << 48) | 2])  # a second partition group
+    _fail_deferred_call(monkeypatch, 2, MessagingEntityNotFoundError(message="gone"))
+    c, stats = committer(configured=Q)
+    assert c.commit(pending) == []
+    assert stats.committed == 250 and stats.dropped_stale == 50 + 2
 
 
 def test_other_service_bus_error_is_mapped(broker):

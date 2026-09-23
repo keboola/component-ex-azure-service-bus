@@ -272,7 +272,7 @@ def test_65_run_failure_write_always_per_mode(fake_broker, tmp_path, monkeypatch
     for i in range(3):
         q.send(f"m{i}".encode())
     if mode == "peek":
-        monkeypatch.setattr("receiver.PEEK_PAGE_SIZE", 1)
+        monkeypatch.setattr("peek.PEEK_PAGE_SIZE", 1)
         fake_broker.inject_peek_error(_auth_error(), on_call=on_call)
     else:
         fake_broker.inject_receive_error(_auth_error(), on_call=on_call)

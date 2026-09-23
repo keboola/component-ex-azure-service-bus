@@ -588,6 +588,8 @@ client** with `retry_total=0` (client level — `get_*_receiver(retry_total=…)
   rejected [live]), **≤ 250 sequence numbers per call** (broker limit [live]) **and ≤ 16 MiB per
   call**: `n = clamp(floor(16 MiB / max_body_bytes), 1, 250)` (largest verified call: 14.5 MB, 1.56 s
   [live]; single bodies > 16 MiB go one per call — unverified above 16 MB, Premium only). The
+  chunks are generated lazily from the stored ranges, one at a time — a range can cover millions of
+  sequence numbers, so it is never expanded into a list (nor when a group is carried forward). The
   returned messages are discarded (their rows were imported by the run that deferred them).
 - **Not found:** a `MessageNotFoundError` fails the whole call [live] → bisect the chunk; a sequence
   number that fails alone is treated as already committed (settled earlier, or expired — a deferred
@@ -1069,18 +1071,19 @@ state):
 
 | Module | Responsibility |
 |---|---|
-| `src/configuration.py` | Pydantic v2 models: `AuthConfiguration` (flat root auth fields, writer's `_validate_auth`), `SourceConfig`, `LimitsConfig`, `BodyConfig`, `DestinationConfig`, `AdvancedConfig`, `Configuration` (merged root + row + hidden `destructive_in_branch`); `StrEnum`s for every enum; `extra="ignore"`; `ValidationError` → `UserException` with field paths; §5.3 validators. Partial models: `AuthConfiguration` (list actions, root `testConnection`), `Configuration` (run and row actions). |
+| `src/configuration.py` | Pydantic v2 models: `AuthConfiguration` (flat root auth fields, writer's `_validate_auth`), `SourceConfig`, `LimitsConfig`, `BodyConfig`, `DestinationConfig`, `AdvancedConfig`, `Configuration` (merged root + row + hidden `destructive_in_branch`); `StrEnum`s for every enum; `extra="ignore"`; `ValidationError` → `UserException` with field paths; §5.3 validators. Partial models: `AuthConfiguration` (list actions, root `testConnection`), `SyncActionConfiguration` (auth + a possibly partial `source`: `testConnection`'s root-vs-row branch, `listSubscriptions`' topic), `Configuration` (run and row actions). |
 | `src/client.py` | `ServiceBusConnector` — credential factory (SAS / SP), `receive_client()`, `commit_client()` (`retry_total=0`), `admin_client()`, `user_agent`; `redact_secrets`, `to_user_exception` (§6.11). Pyamqp only. |
 | `src/entity.py` | `EntityRef` (entity type, names, sub-queue → receiver kwargs, entity path, derived table name, state key); `EntityInfo` (L2 metadata or heuristics: sessions, partitioning, lock duration, max delivery count); `partition_of(seq)`; management helpers for the dropdowns and `entityInfo`. |
-| `src/receiver.py` | `ReceiveLoop` — receiver profile (§6.2), batches, sessions loop, stop conditions, lock renewal, stop drain, recycling with cap + no-progress guard, catch-up wait; `PeekPager` — C4 incremental / full paging, partition / session variants, expired skip. |
+| `src/receiver.py` | `ReceiveLoop` — batches, sessions loop, stop conditions, lock renewal, stop drain, recycling with cap + no-progress guard, catch-up wait; the helpers it shares with the peek pager: `RecoveryTracker`, `StopReason`, receiver profile (§6.2), open / close / session-renew helpers, the watermark test. |
+| `src/peek.py` | `PeekPager` — C4 incremental / full paging, partition / session variants, expired and pending-scheduled skips (§6.7). |
 | `src/settlement.py` | `Settler` per mode (`complete`, `defer` → pending set, `none`); `UnreadableHandler` (abandon / dead-letter / leave / fail, suspect tracking, sub-queue degradation, abort share); `BatchProcessor` — the per-batch pipeline shared by the receive loop, the orphan recovery and the peek pager: map rows → write + flush → settle. |
 | `src/commit.py` | `PendingCommitter` (H5: grouping, count + byte chunking, bisection, transient retry, carry-forward, stale-entity drop); `OrphanScanner` (H3: plain bounded scan with K + page cap, best-effort full scan, session WARNING, recovery guard); `ForeignDeferralProbe` (C1/C3). |
-| `src/state.py` | `ExtractorState` Pydantic model (§6.8): load / defaults / version check, merge rule, range encoding, budget measurement, `to_dict()`. |
+| `src/state.py` | `ExtractorState` Pydantic model (§6.8): load / defaults / version check, merge rule, range encoding (ranges expanded only lazily), budget measurement, `to_dict()`. |
 | `src/body.py` | `decode_body` (DATA / VALUE / SEQUENCE, charset, text / base64), `flatten_json`, `FlattenRegistry` (naming, collisions, cap), errors `BodyDecodeError` / `NotJsonError` / `BodyTooLargeError`. |
 | `src/columns.py` | fixed column catalogue (name → base type), message → metadata row mapping (E1–E25), value formatting (timestamps, JSON, bytes), `previewMessages` markdown rendering. |
 | `src/output.py` | `OutputTable` — one streaming CSV writer for every body format (flatten: fixed columns + input-registry columns + `body_unmapped`, §6.10); manifest (schema, PK, incremental, `has_header`, `write_always` false until `arm_write_always()`; on the legacy queue the library omits the key and the component only warns, §6.9) via a callback into `ComponentBase.write_manifest`; context manager that flushes and closes on exit, including on exceptions. |
 | `src/stats.py` | `RunStats` counters, effective-settings line, summary, WARNING aggregation. |
-| `src/component.py` | `Component(ComponentBase)`: `__init__` parses `AuthConfiguration` and builds the `ServiceBusConnector` (lazy — no network in `__init__`); `run()` ≤ 30 lines delegating to `_load_run_config`, `_guard_dev_branch`, `_open_output`, `_commit_pending`, `_reconcile_deferrals`, `_consume`, `_peek`, `_finish`; `@sync_action`s (§5.4); the scaffold's `__main__` guard (`UserException` → exit 1 with redacted message, else exit 2). |
+| `src/component.py` | `Component(ComponentBase)`: `__init__` parses `AuthConfiguration` and builds the `ServiceBusConnector` (lazy — no network in `__init__`); `run()` ≤ 30 lines delegating to `_load_run_config`, `_guard_dev_branch`, `_open_output`, `_commit_pending`, `_reconcile_deferrals`, `_consume`, `_peek`, `_finish`; `@sync_action`s (§5.4, read through the typed partial models); the scaffold's `__main__` guard (`UserException` → exit 1 with redacted message, else exit 2). |
 
 - **Typing:** built-in generics, `collections.abc` iterators, full hints, `@staticmethod` where
   `self` is unused; ruff with `I`, `UP`, `G` (template config); PEP 758 `except A, B:` is valid on

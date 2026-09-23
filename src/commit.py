@@ -4,7 +4,8 @@
 stored pending set -- at the start of every destructive mode, before anything is received. Each
 stored (entity, session, partition) group is read back by sequence number on a RECEIVE_AND_DELETE
 receiver of the dedicated commit client (``retry_total=0``), in chunks of at most 250 sequence
-numbers and 16 MiB of bodies; the returned messages are discarded (the run that deferred them
+numbers and 16 MiB of bodies, generated lazily from the stored ranges (a range can cover millions
+of sequence numbers); the returned messages are discarded (the run that deferred them
 already imported their rows). The commit client has no SDK retries, so the transient errors are
 retried here (2 / 4 / 8 s); a sequence number the broker no longer has is bisected out and counted
 as already gone. Failing here is safe: nothing has been received yet and the input state is
@@ -18,12 +19,14 @@ which writes their rows and re-defers them into the new pending set. ``ForeignDe
 
 import logging
 import time
-from collections import defaultdict, deque
+from collections import defaultdict
 from collections.abc import Callable
 from contextlib import closing
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import partial
-from typing import Any
+from itertools import batched
+from typing import Any, NamedTuple
 
 from azure.servicebus import ServiceBusClient, ServiceBusMessageState, ServiceBusReceiveMode
 from azure.servicebus.exceptions import (
@@ -43,7 +46,7 @@ from keboola.component.exceptions import UserException
 from client import ServiceBusConnector, redact_secrets, to_user_exception
 from entity import EntityInfo, EntityRef, partition_of
 from settlement import BatchProcessor
-from state import PendingEntity, PendingGroup, to_ranges
+from state import PendingEntity, PendingGroup
 from stats import RunStats
 
 logger = logging.getLogger(__name__)
@@ -90,33 +93,49 @@ def with_transient_retry[T](
     return fn()
 
 
+class DeferredReceive(NamedTuple):
+    """The outcome of one deferred receive: the messages returned and the sequence numbers the
+    broker no longer has."""
+
+    received: list[Any]
+    not_found: list[int]
+
+
 def receive_deferred_bisect(
     receiver: Any,
     seqs: list[int],
     *,
     sleep: Callable[[float], None],
     extra: tuple[type[Exception], ...] = (),
-) -> tuple[list[Any], list[int]]:
-    """``(received_messages, not_found_seqs)`` for one deferred receive of ``seqs`` (one partition,
-    at most 250). A ``MessageNotFoundError`` fails the whole call [live], so the call is split in
-    halves until every missing sequence number fails alone; those are returned as not found.
-    Every call goes through :func:`with_transient_retry` (``extra`` is passed on)."""
+) -> DeferredReceive:
+    """One deferred receive of ``seqs`` (one partition, at most 250). A ``MessageNotFoundError``
+    fails the whole call [live], so the call is split in halves until every missing sequence number
+    fails alone; those are returned as not found. Every call goes through
+    :func:`with_transient_retry` (``extra`` is passed on)."""
     if not seqs:
-        return [], []
+        return DeferredReceive([], [])
     call = partial(receiver.receive_deferred_messages, seqs, timeout=DEFERRED_RECEIVE_TIMEOUT_SECONDS)
     try:
-        return list(with_transient_retry(call, sleep=sleep, extra=extra)), []
+        return DeferredReceive(list(with_transient_retry(call, sleep=sleep, extra=extra)), [])
     except MessageNotFoundError:
         if len(seqs) == 1:
-            return [], list(seqs)
+            return DeferredReceive([], list(seqs))
     middle = len(seqs) // 2
-    left, left_gone = receive_deferred_bisect(receiver, seqs[:middle], sleep=sleep, extra=extra)
-    right, right_gone = receive_deferred_bisect(receiver, seqs[middle:], sleep=sleep, extra=extra)
-    return left + right, left_gone + right_gone
+    left = receive_deferred_bisect(receiver, seqs[:middle], sleep=sleep, extra=extra)
+    right = receive_deferred_bisect(receiver, seqs[middle:], sleep=sleep, extra=extra)
+    return DeferredReceive(left.received + right.received, left.not_found + right.not_found)
 
 
 def _count(groups: list[PendingGroup]) -> int:
-    return sum(len(group.sequence_numbers()) for group in groups)
+    return sum(group.count for group in groups)
+
+
+@dataclass
+class _GroupProgress:
+    """How far the commit of one group got: every sequence number below ``next_seq`` is deleted
+    (chunks go in ascending order), so ``group.tail(next_seq)`` is what is still pending."""
+
+    next_seq: int = 0
 
 
 def _receiver_profile(connector: ServiceBusConnector, receive_mode: ServiceBusReceiveMode) -> dict[str, Any]:
@@ -178,15 +197,13 @@ class PendingCommitter:
         groups = [group for group in pending_entity.groups if group.ranges]
         carried: list[PendingGroup] = []
         for index, group in enumerate(groups):
-            seqs = sorted(set(group.sequence_numbers()))
-            size = commit_chunk_size(group.max_body_bytes)
-            chunks = deque(seqs[start : start + size] for start in range(0, len(seqs), size))
+            progress = _GroupProgress()
             try:
-                self._delete_group(client, ref, group.session_id, chunks)
+                self._delete_group(client, ref, group, progress)
             except SessionCannotBeLockedError:
-                left = [seq for chunk in chunks for seq in chunk]
-                carried.append(group.model_copy(update={"ranges": to_ranges(left)}))
-                self._stats.carried_forward += len(left)
+                left = group.tail(progress.next_seq)
+                carried.append(left)
+                self._stats.carried_forward += left.count
             except (*_STALE_ERRORS, UserException) as error:
                 # UserException: `open_receiver`'s EntityPath mismatch -- a connection string scoped to
                 # another entity can no longer read the stored one.
@@ -194,7 +211,7 @@ class PendingCommitter:
                     if isinstance(error, UserException):
                         raise
                     raise to_user_exception(error, ref.path, self._connector.secrets) from error
-                self._drop_stale(ref, sum(len(chunk) for chunk in chunks) + _count(groups[index + 1 :]))
+                self._drop_stale(ref, group.tail(progress.next_seq).count + _count(groups[index + 1 :]))
                 break  # the entity's remaining groups are just as unreadable
             except TRANSIENT_ERRORS as error:
                 raise UserException(
@@ -215,23 +232,24 @@ class PendingCommitter:
         return carried
 
     def _delete_group(
-        self, client: ServiceBusClient, ref: EntityRef, session_id: str | None, chunks: deque[list[int]]
+        self, client: ServiceBusClient, ref: EntityRef, group: PendingGroup, progress: _GroupProgress
     ) -> None:
-        """Delete ``chunks`` in order on one RECEIVE_AND_DELETE receiver. A chunk leaves the deque
-        only once its call returned, so when this raises ``chunks`` still holds every chunk not yet
-        deleted. Opening the receiver and its first call also retry a session held by another
-        receiver (``SessionCannotBeLockedError``)."""
+        """Delete ``group`` on one RECEIVE_AND_DELETE receiver in ascending chunks of
+        ``commit_chunk_size``, generated from its ranges one chunk at a time. ``progress`` moves past a
+        chunk only once its call returned, so when this raises ``group.tail(progress.next_seq)`` is
+        exactly what is not yet deleted. Opening the receiver and its first call also retry a session
+        held by another receiver (``SessionCannotBeLockedError``)."""
         receiver = with_transient_retry(
-            partial(self._open_receiver, client, ref, session_id), sleep=self._sleep, extra=_SESSION_LOCKED
+            partial(self._open_receiver, client, ref, group.session_id), sleep=self._sleep, extra=_SESSION_LOCKED
         )
         with closing(receiver):
             extra = _SESSION_LOCKED
-            while chunks:
-                received, gone = receive_deferred_bisect(receiver, chunks[0], sleep=self._sleep, extra=extra)
+            for chunk in batched(group.iter_sequence_numbers(), commit_chunk_size(group.max_body_bytes)):
+                received, gone = receive_deferred_bisect(receiver, list(chunk), sleep=self._sleep, extra=extra)
                 extra = ()
                 self._stats.committed += len(received)
                 self._stats.already_gone += len(gone)
-                chunks.popleft()
+                progress.next_seq = chunk[-1] + 1
 
     def _open_receiver(self, client: ServiceBusClient, ref: EntityRef, session_id: str | None) -> Any:
         """Open (attach) the group's receiver, so entity and session errors surface here. A sub-queue

@@ -170,6 +170,32 @@ class AdvancedConfig(BaseModel):
     recovery_wait_seconds: int = Field(0, ge=0, le=330)
 
 
+class SourceSelection(BaseModel):
+    """A row's ``source`` block as the sync actions that tolerate an incomplete row read it: the
+    form may still be half filled in, so only ``topic_name`` is typed and every other key is kept
+    as given (it still tells a configured source from an empty one)."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+    topic_name: str | None = None
+
+
+class SyncActionConfiguration(AuthConfiguration):
+    """Partial model for ``testConnection`` (row vs root, spec §5.4) and ``listSubscriptions`` (the
+    selected topic): the auth block plus a possibly partial ``source``, never a validated row."""
+
+    source: SourceSelection | None = None
+
+    @property
+    def source_configured(self) -> bool:
+        """A non-empty ``source`` block: a row-level call. The root-level ``testConnection`` has none."""
+        return self.source is not None and bool(self.source.model_fields_set)
+
+    @property
+    def topic_name(self) -> str | None:
+        return self.source.topic_name if self.source is not None else None
+
+
 class Configuration(AuthConfiguration):
     """The full row configuration: root auth fields plus the row's sections."""
 

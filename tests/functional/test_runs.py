@@ -10,7 +10,7 @@ from pathlib import Path
 
 from azure.servicebus.exceptions import ServiceBusServerBusyError
 
-from state import from_ranges
+from state import iter_ranges
 from tests.functional.conftest import run_case, run_twice, summary
 
 EXPECTED = Path(__file__).resolve().parent / "expected"
@@ -36,7 +36,7 @@ def pending_state(ranges: list[list[int]], *, max_body_bytes: int = 1) -> dict:
 def pending_seqs(state: dict | None) -> list[int]:
     assert state is not None
     return sorted(
-        seq for entity in state["pending_commit"] for g in entity["groups"] for seq in from_ranges(g["ranges"])
+        seq for entity in state["pending_commit"] for g in entity["groups"] for seq in iter_ranges(g["ranges"])
     )
 
 

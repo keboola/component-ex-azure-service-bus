@@ -11,6 +11,7 @@ from configuration import (
     PrimaryKey,
     SettlementMode,
     SubQueue,
+    SyncActionConfiguration,
     UnreadablePolicy,
 )
 
@@ -120,3 +121,23 @@ def test_auth_configuration_partial_ignores_row_fields():
 def test_bad_enum_value_is_user_exception():
     with pytest.raises(UserException, match="settlement_mode"):
         cfg(source={**SOURCE, "settlement_mode": "delete_everything"})
+
+
+def sync_cfg(**parameters) -> SyncActionConfiguration:
+    return SyncActionConfiguration(**{"#connection_string": SAS, **parameters})  # ty: ignore[invalid-argument-type]
+
+
+def test_sync_action_configuration_tells_root_from_row():
+    assert not sync_cfg().source_configured  # root-level action: no row fields at all
+    assert not sync_cfg(source=None).source_configured
+    assert not sync_cfg(source={}).source_configured
+    assert sync_cfg(source={"entity_type": "queue"}).source_configured  # partial rows count as rows
+    assert sync_cfg(source={"topic_name": None}).source_configured
+
+
+def test_sync_action_configuration_reads_a_partial_source():
+    assert sync_cfg(source={"entity_type": "subscription", "topic_name": "t"}).topic_name == "t"
+    assert sync_cfg(source={"entity_type": "subscription"}).topic_name is None
+    assert sync_cfg().topic_name is None
+    with pytest.raises(UserException, match="source"):
+        sync_cfg(source="not-an-object")

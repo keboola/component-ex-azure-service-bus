@@ -23,7 +23,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, NamedTuple
 from uuid import UUID
 
 from configuration import BodyFormat
@@ -49,6 +49,14 @@ class NotJsonError(Exception):
 
 class BodyTooLargeError(Exception):
     """An encoded cell would exceed ``CELL_LIMIT_BYTES`` (spec §6.6)."""
+
+
+class SplitFields(NamedTuple):
+    """One flattened row split by ``FlattenRegistry.split``: the input-registry column values and
+    the ``body_unmapped`` cell (compact JSON, empty when every field has a column)."""
+
+    values: dict[str, str]
+    unmapped: str
 
 
 @dataclass
@@ -274,7 +282,7 @@ class FlattenRegistry:
     def to_state(self) -> list[FlattenColumn]:
         return [FlattenColumn(path_sha1=h, column=column) for h, column in self._by_hash.items()]
 
-    def split(self, fields: dict[tuple[str, ...], str]) -> tuple[dict[str, str], str]:
+    def split(self, fields: dict[tuple[str, ...], str]) -> SplitFields:
         """Values for the input-registry columns, plus the ``body_unmapped`` cell for every other
         field (this run's new and provisional columns), keyed by the name ``register`` gave each
         path. Every path must already be registered -- by the caller, before calling ``split`` --
@@ -299,7 +307,7 @@ class FlattenRegistry:
         unmapped_json = compact_json(unmapped) if unmapped else ""
         if len(unmapped_json.encode("utf-8")) > CELL_LIMIT_BYTES:
             raise BodyTooLargeError(f"the body_unmapped cell exceeds the {CELL_LIMIT_BYTES}-byte cell limit")
-        return values, unmapped_json
+        return SplitFields(values, unmapped_json)
 
 
 def _check_field_sizes(fields: dict[tuple[str, ...], str]) -> None:

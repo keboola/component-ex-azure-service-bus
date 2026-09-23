@@ -206,6 +206,7 @@ def test_split_keys_unmapped_by_column_name():
     assert values == {"body_x": "1"}
     assert json.loads(unmapped) == {"body_a_b": "2", "body_a_b_2": "3", "body_value": "[1]"}
     assert reg.split({("x",): "9"}) == ({"body_x": "9"}, "")
+    assert reg.split({("x",): "9"}).values == {"body_x": "9"} and reg.split({("x",): "9"}).unmapped == ""
 
 
 def test_split_raises_when_unmapped_cell_exceeds_the_cap(monkeypatch):

@@ -23,6 +23,7 @@ tests/functional/*/source/data/in/
 docs/factory-prep/
 docs/superpowers/*-lifecycle.md
 docs/superpowers/research/
+.superpowers/
 .claude/loop.md
 secrets.json
 .env

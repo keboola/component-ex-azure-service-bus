@@ -7,11 +7,11 @@ from azure.servicebus import ServiceBusMessageState
 from azure.servicebus.exceptions import ServiceBusError
 from keboola.component.exceptions import UserException
 
-import receiver as receiver_mod
+import peek as peek_mod
 from client import ServiceBusConnector
 from configuration import AuthConfiguration, Configuration
 from entity import EntityInfo, EntityRef
-from receiver import PeekPager, is_pending_activation
+from peek import PeekPager, is_pending_activation
 from settlement import BatchProcessor, UnreadableHandler, make_settler
 from state import PeekCursor
 from stats import RunStats
@@ -302,7 +302,7 @@ def peek_ops(receiver):
 
 
 def test_peek_only_peeks_and_pages_explicitly(broker, monkeypatch):
-    monkeypatch.setattr(receiver_mod, "PEEK_PAGE_SIZE", 2)
+    monkeypatch.setattr(peek_mod, "PEEK_PAGE_SIZE", 2)
     q = broker.add_queue("q")
     seqs = [q.send(b"m") for _ in range(5)]
     p, sink, stats = pager(broker)
@@ -362,7 +362,7 @@ def test_max_messages_cuts_a_page_and_the_cursor(broker):
 
 
 def test_max_duration_stops_between_pages(broker, monkeypatch):
-    monkeypatch.setattr(receiver_mod, "PEEK_PAGE_SIZE", 1)
+    monkeypatch.setattr(peek_mod, "PEEK_PAGE_SIZE", 1)
     q = broker.add_queue("q")
     seqs = [q.send(b"m") for _ in range(3)]
     p, sink, stats = pager(broker, limits={"max_duration_seconds": 60})
@@ -395,7 +395,7 @@ def test_a_pending_retry_caps_the_cursor(broker):
 
 
 def test_peek_error_recycles_without_duplicates(broker, monkeypatch):
-    monkeypatch.setattr(receiver_mod, "PEEK_PAGE_SIZE", 1)
+    monkeypatch.setattr(peek_mod, "PEEK_PAGE_SIZE", 1)
     q = broker.add_queue("q")
     seqs = [q.send(b"m") for _ in range(3)]
     broker.inject_peek_error(ServiceBusError(message="link detached"), on_call=2)
@@ -424,7 +424,7 @@ def test_auth_error_in_peek_is_user_exception(broker):
 
 
 def test_partitioned_full_fetch_pages_in_cursor_mode(broker, monkeypatch):
-    monkeypatch.setattr(receiver_mod, "PEEK_PAGE_SIZE", 1)
+    monkeypatch.setattr(peek_mod, "PEEK_PAGE_SIZE", 1)
     pq = broker.add_queue("q", partitioned=True)
     seqs = [pq.send(b"m", partition=n) for n in (0, 3, 7)]
     p, sink, stats = pager(broker, fetch_mode="full_fetch", info=EntityInfo(partitioned=True))
@@ -436,7 +436,7 @@ def test_partitioned_full_fetch_pages_in_cursor_mode(broker, monkeypatch):
 
 
 def test_full_fetch_switches_to_cursor_mode_when_the_heuristic_flips(broker, monkeypatch):
-    monkeypatch.setattr(receiver_mod, "PEEK_PAGE_SIZE", 2)
+    monkeypatch.setattr(peek_mod, "PEEK_PAGE_SIZE", 2)
     pq = broker.add_queue("q", partitioned=True)
     seqs = [pq.send(b"m", partition=n) for n in (0, 1, 2)]
     info = EntityInfo()  # no management access: partitioning is unknown
@@ -450,7 +450,7 @@ def test_full_fetch_switches_to_cursor_mode_when_the_heuristic_flips(broker, mon
 
 
 def test_cursor_mode_recycle_drops_processed_messages(broker, monkeypatch):
-    monkeypatch.setattr(receiver_mod, "PEEK_PAGE_SIZE", 1)
+    monkeypatch.setattr(peek_mod, "PEEK_PAGE_SIZE", 1)
     pq = broker.add_queue("q", partitioned=True)
     seqs = [pq.send(b"m", partition=n) for n in (0, 1, 2)]
     broker.inject_peek_error(ServiceBusError(message="link detached"), on_call=3)

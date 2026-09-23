@@ -3,7 +3,7 @@
 One config row extracts one Service Bus entity -- a queue, a subscription or one of their
 dead-letter sub-queues -- into one Storage table. ``run()`` is a thin orchestrator over the modules
 that own the logic: ``commit.py`` deletes the previous defer-commit run's pending set and reconciles
-deferrals, ``receiver.py`` drives the destructive receive loop or the peek pager, ``settlement.py``
+deferrals, ``receiver.py`` drives the destructive receive loop and ``peek.py`` the peek pager, ``settlement.py``
 writes each batch before settling it, ``output.py`` streams the CSV and its manifest, ``state.py``
 holds the row state. The sync actions (spec §5.4) read the management plane or peek the entity; they
 never settle or lock a message.
@@ -13,7 +13,7 @@ import logging
 import sys
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple
 
 from azure.servicebus import NEXT_AVAILABLE_SESSION, ServiceBusReceiveMode
 from azure.servicebus.exceptions import OperationTimeoutError, ServiceBusError
@@ -25,7 +25,14 @@ from body import FlattenRegistry
 from client import ServiceBusConnector, configure_logging, redact_secrets, to_user_exception
 from columns import format_timestamp, metadata_column_names, render_preview, utc_now
 from commit import ForeignDeferralProbe, OrphanScanner, PendingCommitter
-from configuration import AuthConfiguration, BodyFormat, Configuration, FetchMode, SettlementMode
+from configuration import (
+    AuthConfiguration,
+    BodyFormat,
+    Configuration,
+    FetchMode,
+    SettlementMode,
+    SyncActionConfiguration,
+)
 from entity import (
     EntityInfo,
     EntityRef,
@@ -36,7 +43,8 @@ from entity import (
     probe_management,
 )
 from output import OutputTable
-from receiver import SESSION_ACCEPT_WAIT_SECONDS, PeekPager, ReceiveLoop
+from peek import PeekPager
+from receiver import SESSION_ACCEPT_WAIT_SECONDS, ReceiveLoop
 from settlement import BatchProcessor, UnreadableHandler, make_settler
 from state import ExtractorState, PeekCursor, PendingSetBuilder
 from stats import RunStats, log_effective_settings
@@ -57,6 +65,14 @@ PREVIEW_MESSAGE_COUNT = 10
 
 # The modes that arm write_always (spec §6.9): the legacy job queue drops that safety net for them.
 _WRITE_ALWAYS_MODES = frozenset({SettlementMode.COMPLETE, SettlementMode.RECEIVE_AND_DELETE})
+
+
+class _PeekedEntity(NamedTuple):
+    """What a sync action peeked: the row's entity and its first messages (``None``: a session entity
+    had no session with an available message)."""
+
+    entity: EntityRef
+    messages: list[Any] | None
 
 
 @dataclass
@@ -262,7 +278,7 @@ class Component(ComponentBase):
     def _peek(self, config: Configuration, run: RunContext, processor: BatchProcessor) -> None:
         """C4 (spec §6.7): export by peeking; a pending set left by an earlier C2 period is carried
         forward untouched (spec §6.1)."""
-        carried = sum(len(group.sequence_numbers()) for entity in run.state.pending_commit for group in entity.groups)
+        carried = sum(group.count for entity in run.state.pending_commit for group in entity.groups)
         if carried:
             run.stats.warn(
                 "pending_carried",
@@ -307,15 +323,15 @@ class Component(ComponentBase):
     def test_connection(self) -> ValidationResult:
         """Row: peek one message of the configured entity (auth + Listen + entity). Root (no source):
         a management listing (service principal / Manage connection string)."""
-        if not self.configuration.parameters.get("source"):
+        if not self._sync_configuration().source_configured:
             probe_management(self._connector)
             return ValidationResult("Connected to the Service Bus namespace.", MessageType.SUCCESS)
-        entity, messages = self._peek_row_entity(1)
-        if messages is None:
+        peeked = self._peek_row_entity(1)
+        if peeked.messages is None:
             return ValidationResult(
                 "Connected to Azure Service Bus. No session with messages is available right now.", MessageType.SUCCESS
             )
-        return ValidationResult(f"Connected to Azure Service Bus and read '{entity.path}'.", MessageType.SUCCESS)
+        return ValidationResult(f"Connected to Azure Service Bus and read '{peeked.entity.path}'.", MessageType.SUCCESS)
 
     @sync_action("listQueues")
     def list_queues(self) -> list[SelectElement]:
@@ -327,14 +343,13 @@ class Component(ComponentBase):
 
     @sync_action("listSubscriptions")
     def list_subscriptions(self) -> list[SelectElement]:
-        source = self.configuration.parameters.get("source")
-        topic_name = source.get("topic_name") if isinstance(source, dict) else None
+        topic_name = self._sync_configuration().topic_name
         return self._select_elements("subscriptions", topic_name)  # no topic -> "Select a topic first."
 
     @sync_action("previewMessages")
     def preview_messages(self) -> ValidationResult:
         """A markdown table of up to ten peeked messages; nothing is locked or settled."""
-        _, messages = self._peek_row_entity(PREVIEW_MESSAGE_COUNT)
+        messages = self._peek_row_entity(PREVIEW_MESSAGE_COUNT).messages
         if not messages:
             return ValidationResult("The entity has no messages to preview.", MessageType.INFO)
         return ValidationResult(render_preview(messages), MessageType.TABLE)
@@ -344,15 +359,19 @@ class Component(ComponentBase):
         entity = EntityRef.from_source(Configuration(**self.configuration.parameters).source)
         return ValidationResult(describe_entity(self._connector, entity), MessageType.INFO)
 
+    def _sync_configuration(self) -> SyncActionConfiguration:
+        """The partial model of the sync actions that must work before the row is complete."""
+        return SyncActionConfiguration(**self.configuration.parameters)
+
     def _select_elements(
         self, kind: Literal["queues", "topics", "subscriptions"], topic_name: str | None = None
     ) -> list[SelectElement]:
         return [SelectElement(value=name, label=name) for name in list_entity_names(self._connector, kind, topic_name)]
 
-    def _peek_row_entity(self, max_message_count: int) -> tuple[EntityRef, list[Any] | None]:
+    def _peek_row_entity(self, max_message_count: int) -> _PeekedEntity:
         """Peek the row's entity from its first message on a PEEK_LOCK receiver with the thread-free
-        profile (spec §6.2); a session entity takes the next available session for a moment. Returns
-        the messages, or ``None`` when a session entity has no session with an available message."""
+        profile (spec §6.2); a session entity takes the next available session for a moment. The
+        messages are ``None`` when a session entity has no session with an available message."""
         config = Configuration(**self.configuration.parameters)
         entity = EntityRef.from_source(config.source)
         sessions = config.source.session_enabled
@@ -366,10 +385,10 @@ class Component(ComponentBase):
             kwargs |= {"session_id": NEXT_AVAILABLE_SESSION, "max_wait_time": SESSION_ACCEPT_WAIT_SECONDS}
         try:
             with self._connector.receive_client() as client, entity.open_receiver(client, **kwargs) as receiver:
-                return entity, receiver.peek_messages(max_message_count)
+                return _PeekedEntity(entity, receiver.peek_messages(max_message_count))
         except OperationTimeoutError as e:
             if sessions:
-                return entity, None
+                return _PeekedEntity(entity, None)
             raise to_user_exception(e, entity.path, self._connector.secrets) from e
         except ServiceBusError as e:
             raise to_user_exception(e, entity.path, self._connector.secrets) from e
