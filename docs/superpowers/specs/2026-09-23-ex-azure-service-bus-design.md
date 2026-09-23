@@ -714,14 +714,20 @@ another application's deferrals.
   prefetch_count + 1, max_wait_time=1)` drains the local buffer: C1/C2 **abandon** those messages
   (immediately available again, instead of after lock expiry — 7.14.3 does not release them on
   close [live]); **C3 writes them** (they are already deleted on the broker [source: receiver
-  docstring]), even past `max_messages`.
+  docstring]), even past `max_messages`. The same drain runs **before the run raises** the
+  batch processor's own `UserException` (`fail` policy, flatten cap, abort share — §6.6, §6.10):
+  C3 writes the buffered, already-deleted messages (a further failure while processing that drained
+  batch is swallowed — its rows are already written — and never masks the original error), C1 / C2
+  abandon them; then the original exception propagates.
 - **Connection recycling (J2):** any exception from receive / peek / settle that is not a config,
   auth or entity error (§6.11) closes the receiver and receive client and opens fresh ones, then
   continues. Cap **5 connection recoveries per run**; **no-progress guard:** if a connection failure
   happens and no progress was made since the previous one, the run fails — *progress* = at least one
   row written **or** one unreadable-body disposition (dead-lettered / left / skipped). Recycles
   requested by the unreadable-body retry (§6.6) are **not** connection failures: they have their own
-  budget, never count toward the 5 and never trip the guard. Exhausted → a `ServiceBusError`
+  budget, never count toward the 5 and never trip the guard. Nor is the batch processor's own
+  `UserException` (`fail` policy, flatten cap, abort share): it is never recycled or counted as a
+  recovery — it ends the run after the stop drain above (C4: it propagates directly). Exhausted → a `ServiceBusError`
   becomes a `UserException` ("Lost the connection to Service Bus N times in this run (limit 5, or twice without writing a row or disposing an unreadable message in between); last error: <redacted>. Messages that were not settled redeliver on the next run."); anything else
   re-raises (exit 2). Messages of an interrupted batch stay locked until lock expiry and redeliver
   with `delivery_count + 1` [live]; the PK deduplicates. **Optional catch-up (D6):** with
@@ -747,7 +753,10 @@ another application's deferrals.
   never raise inside the per-message loop. The failure is recorded; the batch's readable rows are
   written and settled first; only then does the run raise — the same pattern as the abort share.
   In C1 / C2 the failing message itself is left unsettled (its lock lapses and it redelivers); in C3
-  it was already deleted.
+  it was already deleted. Before the exception leaves the receive loop, the stop drain (§6.5) runs:
+  in C3 the messages already in the local receive buffer — deleted on the broker — are written too,
+  so no deleted message other than the unreadable one itself is lost. The exception is never
+  treated as a connection failure (§6.5).
 - **Sub-queue sources:** dead-lettering a DLQ message is rejected by the broker (silently on
   7.14.3 [live]) → on sub-queues `dead_letter` degrades to `leave` with a WARNING.
 - A message `leave`-d once that redelivers later in the same run (its lock lapsed) is left again
@@ -879,11 +888,15 @@ another application's deferrals.
   body format rows stream straight into the output CSV (the flatten column set is fixed when the run
   starts, §6.10); the file is flushed per batch and closed in a `finally` block, and a failure while
   closing is logged and never masks the original error.
-- **Legacy-queue fallback:** keboola-component 1.11.0 omits `write_always` from the manifest when
-  `is_legacy_queue` is true (a project without the `queuev2` feature) [source: `interface.py`]. The
-  component's manifest writer therefore re-opens the manifest the library wrote and sets
-  `write_always` explicitly whenever `is_legacy_queue` is true, so the switch is never silently
-  dropped; the Phase-7 manifest check stays.
+- **Legacy job queue (Phase-4 amendment 3):** keboola-component 1.11 **deliberately** omits
+  `write_always` from the manifest when `is_legacy_queue` is true (a project without the `queuev2`
+  feature) [source: `interface.py` `is_legacy_queue`, `dao.py` `OUTPUT_MANIFEST_LEGACY_EXCLUDES`].
+  **[inferred]** the reason is that the legacy queue's output mapping does not support the key. The
+  component does **not** override the library (no manifest post-processing). Instead, a C1 / C3 run
+  on the legacy queue logs a WARNING that the failed-run upload safety net is unavailable on this
+  project — a job that fails after it deleted messages uploads nothing and those messages are lost —
+  and recommends `defer_commit`. C2 / C4 never arm the switch, so they are unaffected. The Phase-7
+  manifest check stays (cf-dev runs on the new queue).
 
   | Mode | `write_always` | Job fails before anything was deleted | Job fails after ≥ 1 deleted batch — `incremental_load` | Job fails after ≥ 1 deleted batch — `full_load` |
   |---|---|---|---|---|
@@ -920,7 +933,10 @@ another application's deferrals.
     not start or end with `_` / `-` [docs]; dashes are also replaced for BigQuery-backed projects
     [inferred]); names longer than 64 characters → first 55 + `_` + 8 hex of SHA-1 of the path
     [inferred cap, verified in Phase 7]. The `body_` prefix keeps flattened keys from colliding with
-    the metadata columns (`message_id`, `subject`, …). The maintainer's dot-path (`order.customer.id`)
+    most metadata columns (`message_id`, `subject`, …) but **not all**: the metadata column
+    `body_type` shares the prefix, so a JSON key `type` would map onto it. The registry therefore
+    reserves **every** metadata column name (plus `body_unmapped`), and the key `type` becomes
+    `body_type_2` (Phase-4 amendment 5, pinned by a unit test). The maintainer's dot-path (`order.customer.id`)
     is the logical path; Storage forbids `.` in column names, so it lands as
     `body_order_customer_id`.
   - **Collisions** (two distinct paths → one name, e.g. key `"a.b"` vs nested `a` → `b`): the path
@@ -955,10 +971,13 @@ another application's deferrals.
     discovered by a failed run are not saved, so they are in `body_unmapped` for one more run;
     values already written to `body_unmapped` stay there (rows are never rewritten).
   - **Cap:** 1,000 registered columns per row. With the registry full, a newly seen key is not
-    registered; its value still goes to `body_unmapped`, keyed by the name `column_name_for` would
-    give it (suffixed `_2`, `_3`, … within the row if needed). The batch is written and settled like
-    any other, and only then does the run fail with a `UserException` suggesting `text` (write first,
-    fail after — §6.6), so nothing is lost in C3.
+    registered; its value still goes to `body_unmapped`, keyed by a **provisional** name — the name
+    `column_name_for` would give it, suffixed `_2`, `_3`, … if taken — which is **reused for the same
+    path hash for the rest of the run** (Phase-4 amendment 4), so every row of the run keys that path
+    identically; provisional names are never saved. The batch is written and settled like any other,
+    and only then does the run fail with a `UserException` suggesting `text` (write first, fail after
+    — §6.6); before it propagates, the C3 stop drain writes the buffered, already-deleted messages
+    (§6.5), so nothing is lost in C3.
   - **Streaming write:** the column set is fixed when the run starts (fixed columns + the input
     registry's columns + `body_unmapped`), so flattened rows stream straight into the output CSV like
     the text format — no staging file, no rewrite at close.
@@ -978,6 +997,7 @@ another application's deferrals.
 | missing Listen / Data Receiver | `ServiceBusAuthorizationError` | `UserException` naming the right |
 | missing subscription | `MessagingEntityNotFoundError` | `UserException` |
 | entity `ReceiveDisabled` | `MessagingEntityDisabledError` | `UserException` |
+| management call denied (SP without Data Receiver, SAS without Manage) / unknown topic | `ClientAuthenticationError`, `HttpResponseError` 401 / 403 / `ResourceNotFoundError` (azure.core) | `UserException` naming the Data Receiver role / Manage rights, or "not found" (a Listen-only SAS listing returns `[]` instead, §5.4) |
 | unknown namespace host | `ServiceBusConnectionError` at connect | `UserException` "cannot reach namespace" |
 | SP wrong secret | `ServiceBusError` "Authentication failed: AADSTS…" | `UserException` (redacted) |
 | session entity without `session_enabled` (or the reverse) | `ServiceBusError` text / L2 mismatch | `UserException` "enable / disable Sessions" |
@@ -1035,7 +1055,7 @@ state):
 | `src/state.py` | `ExtractorState` Pydantic model (§6.8): load / defaults / version check, merge rule, range encoding, budget measurement, `to_dict()`. |
 | `src/body.py` | `decode_body` (DATA / VALUE / SEQUENCE, charset, text / base64), `flatten_json`, `FlattenRegistry` (naming, collisions, cap), errors `BodyDecodeError` / `NotJsonError` / `BodyTooLargeError`. |
 | `src/columns.py` | fixed column catalogue (name → base type), message → metadata row mapping (E1–E25), value formatting (timestamps, JSON, bytes), `previewMessages` markdown rendering. |
-| `src/output.py` | `OutputTable` — one streaming CSV writer for every body format (flatten: fixed columns + input-registry columns + `body_unmapped`, §6.10); manifest (schema, PK, incremental, `has_header`, `write_always` false until `arm_write_always()`, legacy-queue fallback) via a callback into `ComponentBase.write_manifest`; context manager that flushes and closes on exit, including on exceptions. |
+| `src/output.py` | `OutputTable` — one streaming CSV writer for every body format (flatten: fixed columns + input-registry columns + `body_unmapped`, §6.10); manifest (schema, PK, incremental, `has_header`, `write_always` false until `arm_write_always()`; on the legacy queue the library omits the key and the component only warns, §6.9) via a callback into `ComponentBase.write_manifest`; context manager that flushes and closes on exit, including on exceptions. |
 | `src/stats.py` | `RunStats` counters, effective-settings line, summary, WARNING aggregation. |
 | `src/component.py` | `Component(ComponentBase)`: `__init__` parses `AuthConfiguration` and builds the `ServiceBusConnector` (lazy — no network in `__init__`); `run()` ≤ 30 lines delegating to `_load_run_config`, `_guard_dev_branch`, `_open_output`, `_commit_pending`, `_reconcile_deferrals`, `_consume`, `_peek`, `_finish`; `@sync_action`s (§5.4); the scaffold's `__main__` guard (`UserException` → exit 1 with redacted message, else exit 2). |
 
@@ -1212,9 +1232,11 @@ No blockers. Ranked risks:
 4. **[inferred]** `write_always` read from the component manifest is honoured on failed jobs (source
    read, not live-injected); the terminated-job case uploads nothing. The manifest is rewritten when
    the switch flips; the platform reads whatever manifest exists when the container exits.
-   keboola-component 1.11.0 drops `write_always` from the manifest on the legacy job queue (a
-   project without the `queuev2` feature) [source: `interface.py` `is_legacy_queue`]; the component
-   re-writes the key itself in that case (§6.9 fallback), and the Phase-7 manifest check stays.
+   keboola-component 1.11 deliberately drops `write_always` from the manifest on the legacy job
+   queue (a project without the `queuev2` feature) [source: `interface.py` `is_legacy_queue`,
+   `dao.py` `OUTPUT_MANIFEST_LEGACY_EXCLUDES`] — **[inferred]** the legacy queue does not honour it;
+   the component does not override the library and warns in C1 / C3 on such projects (§6.9), and
+   the Phase-7 manifest check stays.
 5. **[inferred]** a peeked `SCHEDULED` message's `enqueued_time_utc` may be its future scheduled
    time — hence the watermark ignores `SCHEDULED` messages (Phase-7 probe).
 6. **[inferred]** `scheduled_enqueue_time_utc` persists after activation (H3 skip rule) — Phase-7
@@ -1324,7 +1346,7 @@ The maintainer delegated approval to the Component Factory lead, who approved th
 | 3 | WARNING on every C2 run where orphan recovery is best-effort (partitioned, sub-queues) or impossible (sessions), plus "incomplete" when the page cap is hit | §6.4, §6.12 |
 | 4 | Orphan-scan page cap 20 pages (5,000 messages); K = max(100, 2 × (batch_size + prefetch_count + 1)) | §6.4 |
 | 5 | Commit byte cap 16 MiB per deferred-receive call | §6.3 |
-| 6 | Flattening: `body_` prefix, Storage-safe normalisation (ASCII fold, `[A-Za-z0-9_]`, ≤ 64 chars with hash), `_2`/`_3` collision suffixes with a path→column registry in row state, monotonic column set, all flattened columns STRING, arrays as JSON, top-level non-object → `body_value`, 1,000-column cap; documented state-reset / shared-table limit, defer-commit recommended | §6.10 |
+| 6 | Flattening: `body_` prefix, Storage-safe normalisation (ASCII fold, `[A-Za-z0-9_]`, ≤ 64 chars with hash), `_2`/`_3` collision suffixes with a `path_sha1 → column` registry in row state, monotonic column set, all flattened columns STRING, arrays as JSON, top-level non-object → `body_value`, 1,000-column cap; documented state-reset / shared-table limit, defer-commit recommended | §6.10 |
 | 7 | Entity dropdowns for SP (Data Receiver) and Manage SAS; a Listen-only SAS gets an empty list and types the name | §5.4, §5.6 |
 | N1 | `write_always` in the manifest, manifest before the first settle (the switch rule was refined by G1 below; flatten now streams like text, cycle 2) | §2.1, §6.9 |
 | N2 | C4 `incremental_fetch` refused on partitioned, session and sub-queue entities (`full_fetch` allowed) | §2.4, §6.7 |
@@ -1356,7 +1378,8 @@ differ):**
   path; flatten rows stream like text rows (the column set is fixed at run start); C3 arms
   `write_always` at the first receive that returns messages; the C4 cursor is the highest processed
   sequence number; C4 full fetch on partitioned / session entities does not retry an unreadable body
-  (the next full fetch re-reads it); the legacy-queue `write_always` fallback.
+  (the next full fetch re-reads it); the legacy-queue `write_always` fallback (superseded by
+  Phase-4 amendment 3 below: no override, WARNING instead).
 - Unreadable retry budget = 50 recycles per run; when exhausted, first failures take the final
   disposition directly.
 - C4 re-peek after an unreadable retry resumes at the first unreadable sequence number and skips
@@ -1364,3 +1387,15 @@ differ):**
 - `SESSION_ACCEPT_WAIT_SECONDS = 5` for every session receiver outside the destructive receive loop.
 - `ValueError` is mapped only at its two known sources (connection-string parse, `EntityPath`
   mismatch); elsewhere it is a bug (exit 2).
+
+**Amendments carried into Phase 4 (lead, from the Phase-3 gate, 2026-09-23):**
+
+| # | Decision | Where |
+|---|---|---|
+| P4-1 | Before the batch processor's `fail` / flatten-cap / abort-share `UserException` leaves the receive loop, the stop drain runs; in C3 the buffered, already-deleted messages are written, so "nothing is lost in C3" holds | §6.5, §6.6, §6.10 |
+| P4-2 | That `UserException` is never recycled as a connection failure (no recovery counted; C4 propagates it directly) | §6.5 |
+| P4-3 | Legacy job queue: the library's deliberate omission of `write_always` is respected (no manifest override); C1 / C3 log a WARNING that the failed-run safety net is unavailable; platform reason labelled [inferred] | §6.9, §10 |
+| P4-4 | Over-cap provisional flatten names are reused per path hash for the whole run | §6.10 |
+| P4-5 | JSON key `type` vs metadata column `body_type`: the registry reserves every metadata name, so `type` → `body_type_2` (unit-tested); the prefix claim is corrected | §6.10 |
+| P4-6 | Approval item 6 wording: `path_sha1 → column` registry | §15 |
+| P4-R3 | `to_user_exception` also maps management-plane `AzureError`s (denied → names the Data Receiver role / Manage rights; `ResourceNotFoundError` → not found) | §6.11 |
