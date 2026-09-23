@@ -1,0 +1,1 @@
+https://github.com/keboola/component-ex-azure-service-bus/blob/master/README.md

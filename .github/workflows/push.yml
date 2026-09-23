@@ -1,0 +1,19 @@
+name: Keboola Component Build & Deploy Pipeline
+on:
+  push:
+    branches-ignore:
+      - main
+    tags:
+      - "*"
+
+concurrency: ci-${{ github.ref }}
+
+jobs:
+  ci:
+    uses: keboola/component-ci/.github/workflows/component-pipeline.yml@master
+    with:
+      app_id: keboola.ex-azure-service-bus
+      vendor: keboola
+      test_build_target: test
+      docker_build_target: production
+    secrets: inherit
