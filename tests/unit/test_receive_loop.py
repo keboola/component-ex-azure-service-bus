@@ -463,6 +463,9 @@ def test_session_handed_out_again_ends_the_loop(broker):
     )
     assert loop.run() is StopReason.SESSION_REVISITED
     assert len(sink.rows) == 1 and s.sequence_numbers() == [*seqs[1:], seqs[-1] + 1]
+    # drained (abandoned) once at A's watermark; the receiver that got A again never received: no drain
+    assert [s.delivery_count(seq) for seq in seqs[1:]] == [1, 1]
+    assert [op for op, _ in broker.receivers[1].operations] == []
 
 
 def test_session_recycle_continues_the_interrupted_session(broker):
