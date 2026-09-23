@@ -4,17 +4,17 @@ dynamic = ["version"]
 readme = "README.md"
 requires-python = "~=3.14.0"
 dependencies = [
-    "keboola-component>=1.10.0",
-    "keboola-http-client>=1.0.1",
-    "keboola-utils>=1.1.0",
+    # capped <7.15: 7.15.0 removes uamqp_transport; this component is pyamqp-only (spec §3.1).
+    "azure-servicebus>=7.14.3,<7.15",
+    "azure-identity>=1.19,<2",
+    # >=1.11: manifest write_always + has_header support as read in 1.11.0 (spec §6.9).
+    "keboola-component>=1.11",
     "pydantic>=2.11.7",
 ]
 
 [dependency-groups]
 dev = [
-    "freezegun>=1.5.1",
     "keboola.datadirtest>=2.2.0",
-    "mock>=5.2.0",
     "pre-commit>=4.5.0",
     "pytest>=9.0.2",
     "ruff>=0.16.0",
@@ -23,6 +23,7 @@ dev = [
 
 [tool.ruff]
 line-length = 120
+extend-exclude = ["docs"]
 
 [tool.ruff.lint]
 extend-select = [
