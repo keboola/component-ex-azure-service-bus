@@ -2,12 +2,7 @@
   "storage": {
     "input": {
       "files": [],
-      "tables": [
-        {
-          "source": "in.c-example.example",
-          "destination": "example.csv"
-        }
-      ]
+      "tables": []
     },
     "output": {
       "files": [],
@@ -15,7 +10,30 @@
     }
   },
   "parameters": {
-    "#api_token": "your-secret-token",
-    "debug": false
+    "auth_type": "connection_string",
+    "#connection_string": "Endpoint=sb://ns.servicebus.windows.net/;SharedAccessKeyName=listen;SharedAccessKey=c2VjcmV0",
+    "source": {
+      "entity_type": "queue",
+      "queue_name": "orders",
+      "sub_queue": "none",
+      "session_enabled": false,
+      "settlement_mode": "complete",
+      "idle_timeout_seconds": 10
+    },
+    "limits": {
+      "max_messages": 0,
+      "max_duration_seconds": 3600,
+      "stop_at_job_start": true
+    },
+    "body": {
+      "body_format": "text",
+      "unreadable_body": "dead_letter"
+    },
+    "destination": {
+      "table_name": "",
+      "load_type": "incremental_load",
+      "primary_key": "sequence_number"
+    },
+    "advanced_options": false
   }
 }
