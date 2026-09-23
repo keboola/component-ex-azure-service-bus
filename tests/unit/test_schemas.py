@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+from pydantic import BaseModel
+
 import configuration
 from component import Component
 
@@ -95,3 +97,32 @@ def test_ui_options():
 
 def test_root_schema_not_empty():
     assert ROOT_SCHEMA.get("properties")
+
+
+def _model_paths(model: type[BaseModel], prefix: str = "") -> set[str]:
+    paths: set[str] = set()
+    for name, field in model.model_fields.items():
+        key = f"{prefix}{field.alias or name}"
+        if isinstance(field.annotation, type) and issubclass(field.annotation, BaseModel):
+            paths |= _model_paths(field.annotation, f"{key}.")
+        else:
+            paths.add(key)
+    return paths
+
+
+def test_schema_fields_match_model():
+    # Every user-facing model field has exactly one schema field (root + row) and vice versa;
+    # only the hidden debug-mode override stays out of the schemas.
+    schema_paths = {
+        path
+        for path, prop, _ in list(walk(ROOT_SCHEMA)) + list(walk(ROW_SCHEMA))
+        if prop.get("type") not in ("object", "button")
+    }
+    assert schema_paths == _model_paths(configuration.Configuration) - {"destructive_in_branch"}
+
+
+def test_portal_urls_point_at_main():
+    repo = "https://github.com/keboola/component-ex-azure-service-bus"
+    assert (ROOT / "sourceCodeUrl.md").read_text().strip() == repo
+    assert (ROOT / "documentationUrl.md").read_text().strip() == f"{repo}/blob/main/README.md"
+    assert (ROOT / "licenseUrl.md").read_text().strip() == f"{repo}/blob/main/LICENSE.md"

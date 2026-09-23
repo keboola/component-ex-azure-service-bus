@@ -83,8 +83,9 @@ Limits
 
 - **Max messages** — stop after this many messages (`0` = no limit).
 - **Max duration** — stop after this many seconds (60–43,200; default 3,600).
-- **Stop at job start** — stop once every message of the current batch was already enqueued when
-  the job started, instead of also draining messages that arrive mid-run.
+- **Stop at job start** — stop once a batch holds only messages enqueued after the job started,
+  instead of also draining messages that arrive mid-run (approximate on partitioned and
+  session-enabled entities).
 
 Body
 ----
