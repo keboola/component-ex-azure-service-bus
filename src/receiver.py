@@ -327,9 +327,9 @@ class ReceiveLoop:
         if self._mode is SettlementMode.DEFER_COMMIT and self._state_size() >= STATE_BUDGET_BYTES:
             self._stats.warn(
                 "state_budget",
-                f"The state this defer-commit run would save reached {STATE_BUDGET_BYTES // 1024} KiB (Keboola "
-                "keeps about 1 MB of state per configuration), so the run stopped receiving early; the next run "
-                "deletes this run's deferrals first and continues.",
+                f"The state this defer-commit run would save reached the {STATE_BUDGET_BYTES // 1024} KiB state "
+                "budget (Keboola keeps about 1 MB of state per configuration), so the run stopped receiving early; "
+                "the next run deletes this run's deferrals first and continues.",
             )
             return StopReason.STATE_BUDGET
         if catch_up_until is not None and now >= catch_up_until:

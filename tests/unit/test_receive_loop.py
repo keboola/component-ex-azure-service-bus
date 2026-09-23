@@ -144,6 +144,7 @@ def test_state_budget_stops_c2(broker):
         state_size=lambda: 10**9,
     )
     assert loop.run() is StopReason.STATE_BUDGET and "state_budget" in stats.warnings
+    assert "reached the 256 KiB state budget" in stats.warnings["state_budget"]
 
 
 def test_recycle_on_receive_error(broker):

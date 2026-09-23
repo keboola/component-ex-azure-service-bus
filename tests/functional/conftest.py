@@ -235,3 +235,9 @@ def csv_header(result: CaseResult, table: str = "q.csv") -> list[str]:
     """The header row of an output CSV (``tables`` holds only its data rows)."""
     with (result.out_dir / "tables" / table).open(newline="", encoding="utf-8") as handle:
         return next(csv.reader(handle))
+
+
+def summary(result: CaseResult) -> dict[str, str]:
+    """The run summary line's ``name=value`` tokens (spec §6.12), e.g. ``{"committed": "3", ...}``."""
+    (line,) = [line for line in result.stdout.splitlines() if line.startswith("mode=")]
+    return dict(token.split("=", 1) for token in line.split())
