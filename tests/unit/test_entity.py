@@ -72,6 +72,19 @@ def test_load_entity_info_from_management(broker):
     assert info.counts["active"] == 1  # ty: ignore[not-subscriptable] -- non-None: the row above loaded successfully
 
 
+def test_load_entity_info_from_management_subscription(broker):
+    # regression: SubscriptionRuntimeProperties has no scheduled_message_count (7.14.3); reading it
+    # unconditionally used to raise and get swallowed here, silently discarding every management value.
+    broker.add_subscription("t", "s", sessions=True, partitioned=True, lock_seconds=45, max_delivery_count=7)
+    ref = EntityRef.from_source(SourceConfig(entity_type="subscription", topic_name="t", subscription_name="s"))
+    info = load_entity_info(connector(), ref)
+    assert info.requires_session is True
+    assert info.partitioned is True
+    assert info.lock_duration_seconds == 45
+    assert info.max_delivery_count == 7
+    assert info.counts == {"active": 0, "dead_letter": 0, "scheduled": 0, "transfer_dead_letter": 0}
+
+
 def test_load_entity_info_falls_back_when_denied(broker):
     broker.add_queue("q")
     broker.management_denied = True
@@ -102,6 +115,15 @@ def test_describe_entity_denied(broker):
     broker.management_denied = True
     with pytest.raises(UserException, match="Manage"):
         describe_entity(connector(), EntityRef.from_source(SourceConfig(entity_type="queue", queue_name="q")))
+
+
+def test_describe_entity_subscription_lists_rules(broker):
+    # regression: the same missing-attribute bug used to raise AttributeError (exit 2) for every
+    # subscription, uncaught, before the markdown could be built.
+    broker.add_subscription("t", "s").add_rule("big", "amount > 100")
+    ref = EntityRef.from_source(SourceConfig(entity_type="subscription", topic_name="t", subscription_name="s"))
+    markdown = describe_entity(connector(), ref)
+    assert "big: amount > 100" in markdown
 
 
 def test_open_receiver_entity_path_mismatch(broker):

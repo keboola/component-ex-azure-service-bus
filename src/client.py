@@ -219,6 +219,11 @@ class ServiceBusConnector:
         self.client_identifier = client_identifier
         self.secrets: tuple[str, ...] = tuple(s for s in (auth.connection_string, auth.client_secret) if s)
 
+    @property
+    def auth_type(self) -> AuthType:
+        """The auth method this connector was built with (SAS vs. service-principal wording)."""
+        return self._auth.auth_type
+
     def receive_client(self) -> ServiceBusClient:
         """The data-plane client used for every receive / peek / settle (SDK default retries)."""
         return self._data_client({})

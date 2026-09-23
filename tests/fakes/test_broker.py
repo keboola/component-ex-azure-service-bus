@@ -673,3 +673,17 @@ def test_injection_waits_for_a_call_that_reaches_the_broker(broker):
     with pytest.raises(TypeError, match="boom"):
         receiver.receive_messages()
     assert len(receiver.receive_messages()) == 1
+
+
+# --- fix round 2 (Task 5 review: subscription runtime-properties fidelity) -------------------------
+
+
+def test_subscription_runtime_properties_has_no_scheduled_message_count(broker):
+    # SubscriptionRuntimeProperties has no scheduled_message_count on the real SDK (verified 7.14.3);
+    # QueueRuntimeProperties does. The fake used to share one type for both, hiding an AttributeError
+    # in entity.py that only ever surfaced against a subscription.
+    broker.add_queue("q")
+    broker.add_subscription("t", "s")
+    admin = client_mod.ServiceBusAdministrationClient.from_connection_string(SAS)
+    assert hasattr(admin.get_queue_runtime_properties("q"), "scheduled_message_count")
+    assert not hasattr(admin.get_subscription_runtime_properties("t", "s"), "scheduled_message_count")

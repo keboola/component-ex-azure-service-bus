@@ -840,16 +840,35 @@ class FakeEntity:
                 del self._sessions[session_id]
         self._sweep()
 
-    def _runtime_properties(self, name: str) -> FakeRuntimeProperties:
+    def _message_counts(self) -> tuple[int, int, int, int]:
+        """(active, dead_letter, scheduled, transfer_dead_letter), swept first."""
         self._sweep()
         now = self._broker.clock.now()
         scheduled = sum(1 for r in self._records.values() if r.state(now) is ServiceBusMessageState.SCHEDULED)
+        active = len(self._records) - scheduled
+        dead_letter = len(self.dead_letter.sequence_numbers())
+        transfer_dead_letter = len(self.transfer_dead_letter.sequence_numbers())
+        return active, dead_letter, scheduled, transfer_dead_letter
+
+    def _queue_runtime_properties(self, name: str) -> FakeRuntimeProperties:
+        active, dead_letter, scheduled, transfer_dead_letter = self._message_counts()
         return FakeRuntimeProperties(
             name=name,
-            active_message_count=len(self._records) - scheduled,
-            dead_letter_message_count=len(self.dead_letter.sequence_numbers()),
+            active_message_count=active,
+            dead_letter_message_count=dead_letter,
             scheduled_message_count=scheduled,
-            transfer_dead_letter_message_count=len(self.transfer_dead_letter.sequence_numbers()),
+            transfer_dead_letter_message_count=transfer_dead_letter,
+        )
+
+    def _subscription_runtime_properties(self, name: str) -> FakeSubscriptionRuntimeProperties:
+        # SubscriptionRuntimeProperties has no scheduled_message_count (verified 7.14.3); a scheduled
+        # message sits at the topic until it activates, so it never appears in a subscription's own count.
+        active, dead_letter, _scheduled, transfer_dead_letter = self._message_counts()
+        return FakeSubscriptionRuntimeProperties(
+            name=name,
+            active_message_count=active,
+            dead_letter_message_count=dead_letter,
+            transfer_dead_letter_message_count=transfer_dead_letter,
         )
 
 
@@ -1171,6 +1190,16 @@ class FakeRuntimeProperties:
     transfer_dead_letter_message_count: int
 
 
+@dataclass(frozen=True)
+class FakeSubscriptionRuntimeProperties:  # no scheduled_message_count, like SubscriptionRuntimeProperties [live,
+    # verified 7.14.3]: scheduled messages are held by the topic until they activate, so a subscription's own
+    # runtime properties never report a scheduled count.
+    name: str
+    active_message_count: int
+    dead_letter_message_count: int
+    transfer_dead_letter_message_count: int
+
+
 @dataclass
 class _Topic:
     name: str
@@ -1261,13 +1290,14 @@ class FakeAdminClient:
 
     def get_queue_runtime_properties(self, queue_name: str, **kwargs: Any) -> FakeRuntimeProperties:
         self._call("get_queue_runtime_properties", queue_name)
-        return self._broker._find_queue(queue_name)._runtime_properties(queue_name)
+        return self._broker._find_queue(queue_name)._queue_runtime_properties(queue_name)
 
     def get_subscription_runtime_properties(
         self, topic_name: str, subscription_name: str, **kwargs: Any
-    ) -> FakeRuntimeProperties:
+    ) -> FakeSubscriptionRuntimeProperties:
         self._call("get_subscription_runtime_properties", f"{topic_name}/Subscriptions/{subscription_name}")
-        return self._broker._find_subscription(topic_name, subscription_name)._runtime_properties(subscription_name)
+        subscription = self._broker._find_subscription(topic_name, subscription_name)
+        return subscription._subscription_runtime_properties(subscription_name)
 
     def close(self) -> None:
         self.closed = True

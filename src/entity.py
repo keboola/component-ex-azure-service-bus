@@ -14,7 +14,7 @@ import logging
 import re
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple
 
 from azure.core.exceptions import AzureError
 from azure.servicebus import ServiceBusClient, ServiceBusReceiver, ServiceBusSubQueue
@@ -119,6 +119,9 @@ class EntityRef:
                 topic_name=self.topic_name or "", subscription_name=self.subscription_name or "", **extra
             )
         except ValueError as e:
+            # `str(e)` is the SDK's own client-side message (it names the mismatched EntityPath, never
+            # echoes the connection string), so `redact_secrets` needs no `secrets=` list here -- unlike
+            # `to_user_exception`, which redacts raw SDK-error text that can quote request details.
             raise UserException(
                 f"The connection string is scoped to another entity (EntityPath) than '{self.path}'. Use a "
                 f"namespace-level connection string or select the entity named in it. (details: {redact_secrets(str(e))})"
@@ -162,50 +165,73 @@ class EntityInfo:
         return self.max_delivery_count - 1
 
 
+class _EntityMetadata(NamedTuple):
+    """The management fields both ``load_entity_info`` and ``describe_entity`` need. Built by the
+    entity-type-specific loader below so each stays responsible for its own runtime-properties shape
+    (a subscription's has no ``scheduled_message_count``, §4-L)."""
+
+    requires_session: bool | None
+    partitioned: bool | None
+    lock_duration_seconds: float
+    max_delivery_count: int
+    counts: dict[str, int]
+
+
 def _lock_duration_seconds(lock_duration: timedelta | str | None) -> float:
     """The management client always hands back a ``timedelta`` for a value read from the server;
     the ``str`` arm of the SDK's type only matters for values a caller is about to *write*."""
     return lock_duration.total_seconds() if isinstance(lock_duration, timedelta) else _DEFAULT_LOCK_DURATION_SECONDS
 
 
-def _load_queue_metadata(
-    admin: ServiceBusAdministrationClient, entity: EntityRef
-) -> tuple[bool | None, bool | None, float, int, Any]:
+def _count(value: int | None) -> int:
+    """Every ``*_message_count`` on the SDK's runtime-properties types is ``Optional[int]``; a
+    missing count reads as zero rather than widening every consumer's type to ``int | None``."""
+    return value or 0
+
+
+def _load_queue_metadata(admin: ServiceBusAdministrationClient, entity: EntityRef) -> _EntityMetadata:
     queue_name = entity.queue_name or ""
     props = admin.get_queue(queue_name)
     runtime = admin.get_queue_runtime_properties(queue_name)
-    return (
-        props.requires_session,
-        props.enable_partitioning,
-        _lock_duration_seconds(props.lock_duration),
-        props.max_delivery_count or _DEFAULT_MAX_DELIVERY_COUNT,
-        runtime,
+    return _EntityMetadata(
+        requires_session=props.requires_session,
+        partitioned=props.enable_partitioning,
+        lock_duration_seconds=_lock_duration_seconds(props.lock_duration),
+        max_delivery_count=props.max_delivery_count or _DEFAULT_MAX_DELIVERY_COUNT,
+        counts={
+            "active": _count(runtime.active_message_count),
+            "dead_letter": _count(runtime.dead_letter_message_count),
+            "scheduled": _count(runtime.scheduled_message_count),
+            "transfer_dead_letter": _count(runtime.transfer_dead_letter_message_count),
+        },
     )
 
 
-def _load_subscription_metadata(
-    admin: ServiceBusAdministrationClient, entity: EntityRef
-) -> tuple[bool | None, bool | None, float, int, Any]:
+def _load_subscription_metadata(admin: ServiceBusAdministrationClient, entity: EntityRef) -> _EntityMetadata:
     topic_name, subscription_name = entity.topic_name or "", entity.subscription_name or ""
     props = admin.get_subscription(topic_name, subscription_name)
     topic = admin.get_topic(topic_name)
     runtime = admin.get_subscription_runtime_properties(topic_name, subscription_name)
-    return (
-        props.requires_session,
-        topic.enable_partitioning,
-        _lock_duration_seconds(props.lock_duration),
-        props.max_delivery_count or _DEFAULT_MAX_DELIVERY_COUNT,
-        runtime,
+    return _EntityMetadata(
+        requires_session=props.requires_session,
+        partitioned=topic.enable_partitioning,
+        lock_duration_seconds=_lock_duration_seconds(props.lock_duration),
+        max_delivery_count=props.max_delivery_count or _DEFAULT_MAX_DELIVERY_COUNT,
+        counts={
+            "active": _count(runtime.active_message_count),
+            "dead_letter": _count(runtime.dead_letter_message_count),
+            # SubscriptionRuntimeProperties has no scheduled_message_count (verified 7.14.3): a
+            # scheduled message sits at the topic until it activates, so a subscription never holds one.
+            "scheduled": 0,
+            "transfer_dead_letter": _count(runtime.transfer_dead_letter_message_count),
+        },
     )
 
 
-def _runtime_counts(runtime: Any) -> dict[str, int]:
-    return {
-        "active": runtime.active_message_count,
-        "dead_letter": runtime.dead_letter_message_count,
-        "scheduled": runtime.scheduled_message_count,
-        "transfer_dead_letter": runtime.transfer_dead_letter_message_count,
-    }
+def _load_metadata(admin: ServiceBusAdministrationClient, entity: EntityRef) -> _EntityMetadata:
+    if entity.entity_type is EntityType.QUEUE:
+        return _load_queue_metadata(admin, entity)
+    return _load_subscription_metadata(admin, entity)
 
 
 def load_entity_info(connector: ServiceBusConnector, entity: EntityRef) -> EntityInfo:
@@ -214,20 +240,13 @@ def load_entity_info(connector: ServiceBusConnector, entity: EntityRef) -> Entit
     to the heuristic defaults instead of failing the row."""
     try:
         with connector.admin_client() as admin:
-            if entity.entity_type is EntityType.QUEUE:
-                requires_session, partitioned, lock_seconds, max_delivery_count, runtime = _load_queue_metadata(
-                    admin, entity
-                )
-            else:
-                requires_session, partitioned, lock_seconds, max_delivery_count, runtime = _load_subscription_metadata(
-                    admin, entity
-                )
+            metadata = _load_metadata(admin, entity)
             return EntityInfo(
-                requires_session=requires_session,
-                partitioned=partitioned,
-                lock_duration_seconds=lock_seconds,
-                max_delivery_count=max_delivery_count,
-                counts=_runtime_counts(runtime),
+                requires_session=metadata.requires_session,
+                partitioned=metadata.partitioned,
+                lock_duration_seconds=metadata.lock_duration_seconds,
+                max_delivery_count=metadata.max_delivery_count,
+                counts=metadata.counts,
             )
     except Exception as e:  # noqa: BLE001 -- management access is optional for a run; any failure (denied
         # rights, an entity not yet visible, a transient error, or a bug in the unpacking above) falls back
@@ -276,7 +295,7 @@ def list_entity_names(
                 names = [item.name for item in admin.list_subscriptions(topic_name or "")]
         return sorted(names)
     except AzureError as e:
-        if is_management_denied(e) and connector._auth.auth_type == AuthType.CONNECTION_STRING:
+        if is_management_denied(e) and connector.auth_type == AuthType.CONNECTION_STRING:
             return []
         raise to_user_exception(e, topic_name, connector.secrets) from e
 
@@ -288,7 +307,7 @@ def probe_management(connector: ServiceBusConnector) -> None:
             next(iter(admin.list_queues()), None)
     except AzureError as e:
         if is_management_denied(e):
-            if connector._auth.auth_type == AuthType.CONNECTION_STRING:
+            if connector.auth_type == AuthType.CONNECTION_STRING:
                 raise UserException(
                     "A connection string with only Listen rights can be tested only from a row that has a "
                     "source selected."
@@ -310,16 +329,12 @@ def describe_entity(connector: ServiceBusConnector, entity: EntityRef) -> str:
     """The ``entityInfo`` sync action: a markdown bullet list of the entity's management metadata."""
     try:
         with connector.admin_client() as admin:
-            if entity.entity_type is EntityType.QUEUE:
-                requires_session, partitioned, lock_seconds, max_delivery_count, runtime = _load_queue_metadata(
-                    admin, entity
-                )
-                rules = None
-            else:
-                requires_session, partitioned, lock_seconds, max_delivery_count, runtime = _load_subscription_metadata(
-                    admin, entity
-                )
-                rules = list(admin.list_rules(entity.topic_name or "", entity.subscription_name or ""))
+            metadata = _load_metadata(admin, entity)
+            rules = (
+                list(admin.list_rules(entity.topic_name or "", entity.subscription_name or ""))
+                if entity.entity_type is EntityType.SUBSCRIPTION
+                else None
+            )
     except AzureError as e:
         if is_management_denied(e):
             raise UserException(
@@ -328,12 +343,12 @@ def describe_entity(connector: ServiceBusConnector, entity: EntityRef) -> str:
             ) from e
         raise to_user_exception(e, entity.path, connector.secrets) from e
 
-    counts = _runtime_counts(runtime)
+    counts = metadata.counts
     lines = [
-        f"- Requires session: {requires_session}",
-        f"- Partitioned: {partitioned}",
-        f"- Lock duration: {lock_seconds} seconds",
-        f"- Max delivery count: {max_delivery_count}",
+        f"- Requires session: {metadata.requires_session}",
+        f"- Partitioned: {metadata.partitioned}",
+        f"- Lock duration: {metadata.lock_duration_seconds} seconds",
+        f"- Max delivery count: {metadata.max_delivery_count}",
         f"- Active messages: {counts['active']}",
         f"- Dead-lettered messages: {counts['dead_letter']}",
         f"- Scheduled messages: {counts['scheduled']}",

@@ -14,7 +14,7 @@ from keboola.component.exceptions import UserException
 
 import client as client_mod
 from client import USER_AGENT, ServiceBusConnector, is_management_denied, redact_secrets, to_user_exception
-from configuration import AuthConfiguration
+from configuration import AuthConfiguration, AuthType
 
 SAS = "Endpoint=sb://ns.servicebus.windows.net/;SharedAccessKeyName=k;SharedAccessKey=c2VjcmV0"
 
@@ -93,6 +93,11 @@ def test_malformed_connection_string_admin_client():
 
 def test_secrets_tuple():
     assert ServiceBusConnector(sp_auth(), "id").secrets == ("s3cr3t",)
+
+
+def test_auth_type_property():
+    assert ServiceBusConnector(sas_auth(), "id").auth_type is AuthType.CONNECTION_STRING
+    assert ServiceBusConnector(sp_auth(), "id").auth_type is AuthType.SERVICE_PRINCIPAL
 
 
 @pytest.mark.parametrize(
