@@ -708,5 +708,443 @@
       },
       "storage": {}
     }
+  },
+  {
+    "name": "46_run_body_base64",
+    "description": "base64 body format: DATA bytes as base64.",
+    "config": {
+      "action": "run",
+      "parameters": {
+        "auth_type": "connection_string",
+        "#connection_string": "Endpoint=sb://ns.servicebus.windows.net/;SharedAccessKeyName=listen;SharedAccessKey=ZmFrZWtleWZha2VrZXlmYWtla2V5ZmFrZWtleTEyMzQ1Njc4OTA=",
+        "source": {
+          "entity_type": "queue",
+          "queue_name": "q"
+        },
+        "body": {
+          "body_format": "base64"
+        }
+      },
+      "storage": {}
+    }
+  },
+  {
+    "name": "47_run_body_value_sequence",
+    "description": "text body format: VALUE and SEQUENCE bodies as compact JSON.",
+    "config": {
+      "action": "run",
+      "parameters": {
+        "auth_type": "connection_string",
+        "#connection_string": "Endpoint=sb://ns.servicebus.windows.net/;SharedAccessKeyName=listen;SharedAccessKey=ZmFrZWtleWZha2VrZXlmYWtla2V5ZmFrZWtleTEyMzQ1Njc4OTA=",
+        "source": {
+          "entity_type": "queue",
+          "queue_name": "q"
+        }
+      },
+      "storage": {}
+    }
+  },
+  {
+    "name": "48_run_body_charset_multisection",
+    "description": "text body format: DATA sections joined, decoded with the content-type charset.",
+    "config": {
+      "action": "run",
+      "parameters": {
+        "auth_type": "connection_string",
+        "#connection_string": "Endpoint=sb://ns.servicebus.windows.net/;SharedAccessKeyName=listen;SharedAccessKey=ZmFrZWtleWZha2VrZXlmYWtla2V5ZmFrZWtleTEyMzQ1Njc4OTA=",
+        "source": {
+          "entity_type": "queue",
+          "queue_name": "q"
+        }
+      },
+      "storage": {}
+    }
+  },
+  {
+    "name": "49_run_flatten_json",
+    "description": "C1 json_flatten over two runs: keys go to body_unmapped first, then become columns.",
+    "config": {
+      "action": "run",
+      "parameters": {
+        "auth_type": "connection_string",
+        "#connection_string": "Endpoint=sb://ns.servicebus.windows.net/;SharedAccessKeyName=listen;SharedAccessKey=ZmFrZWtleWZha2VrZXlmYWtla2V5ZmFrZWtleTEyMzQ1Njc4OTA=",
+        "source": {
+          "entity_type": "queue",
+          "queue_name": "q"
+        },
+        "body": {
+          "body_format": "json_flatten"
+        }
+      },
+      "storage": {}
+    }
+  },
+  {
+    "name": "50_run_flatten_new_keys_second_run",
+    "description": "C2 json_flatten over three runs: a key new in run 2 is a column from run 3.",
+    "config": {
+      "action": "run",
+      "parameters": {
+        "auth_type": "connection_string",
+        "#connection_string": "Endpoint=sb://ns.servicebus.windows.net/;SharedAccessKeyName=listen;SharedAccessKey=ZmFrZWtleWZha2VrZXlmYWtla2V5ZmFrZWtleTEyMzQ1Njc4OTA=",
+        "source": {
+          "entity_type": "queue",
+          "queue_name": "q",
+          "settlement_mode": "defer_commit"
+        },
+        "body": {
+          "body_format": "json_flatten"
+        }
+      },
+      "storage": {}
+    }
+  },
+  {
+    "name": "51_run_flatten_not_json",
+    "description": "C1 json_flatten dead-letters a body that is not JSON (NotJson).",
+    "config": {
+      "action": "run",
+      "parameters": {
+        "auth_type": "connection_string",
+        "#connection_string": "Endpoint=sb://ns.servicebus.windows.net/;SharedAccessKeyName=listen;SharedAccessKey=ZmFrZWtleWZha2VrZXlmYWtla2V5ZmFrZWtleTEyMzQ1Njc4OTA=",
+        "source": {
+          "entity_type": "queue",
+          "queue_name": "q"
+        },
+        "body": {
+          "body_format": "json_flatten"
+        }
+      },
+      "storage": {}
+    }
+  },
+  {
+    "name": "52_run_unreadable_body_two_connections",
+    "description": "C1 retries an unreadable body on a fresh connection, then dead-letters it (UnreadableBody).",
+    "config": {
+      "action": "run",
+      "parameters": {
+        "auth_type": "connection_string",
+        "#connection_string": "Endpoint=sb://ns.servicebus.windows.net/;SharedAccessKeyName=listen;SharedAccessKey=ZmFrZWtleWZha2VrZXlmYWtla2V5ZmFrZWtleTEyMzQ1Njc4OTA=",
+        "source": {
+          "entity_type": "queue",
+          "queue_name": "q"
+        }
+      },
+      "storage": {}
+    }
+  },
+  {
+    "name": "53_run_unreadable_on_dlq_degrades",
+    "description": "On a dead-letter sub-queue the dead_letter policy degrades to leave.",
+    "config": {
+      "action": "run",
+      "parameters": {
+        "auth_type": "connection_string",
+        "#connection_string": "Endpoint=sb://ns.servicebus.windows.net/;SharedAccessKeyName=listen;SharedAccessKey=ZmFrZWtleWZha2VrZXlmYWtla2V5ZmFrZWtleTEyMzQ1Njc4OTA=",
+        "source": {
+          "entity_type": "queue",
+          "queue_name": "q",
+          "sub_queue": "dead_letter"
+        }
+      },
+      "storage": {}
+    }
+  },
+  {
+    "name": "54_run_unreadable_share_abort",
+    "description": "Unreadable bodies above the abort share fail the run (exit 1).",
+    "config": {
+      "action": "run",
+      "parameters": {
+        "auth_type": "connection_string",
+        "#connection_string": "Endpoint=sb://ns.servicebus.windows.net/;SharedAccessKeyName=listen;SharedAccessKey=ZmFrZWtleWZha2VrZXlmYWtla2V5ZmFrZWtleTEyMzQ1Njc4OTA=",
+        "source": {
+          "entity_type": "queue",
+          "queue_name": "q"
+        },
+        "body": {
+          "unreadable_body": "leave"
+        }
+      },
+      "storage": {}
+    }
+  },
+  {
+    "name": "55_run_receive_failure_recycle",
+    "description": "A receive failure recycles the connection; every message is written once.",
+    "config": {
+      "action": "run",
+      "parameters": {
+        "auth_type": "connection_string",
+        "#connection_string": "Endpoint=sb://ns.servicebus.windows.net/;SharedAccessKeyName=listen;SharedAccessKey=ZmFrZWtleWZha2VrZXlmYWtla2V5ZmFrZWtleTEyMzQ1Njc4OTA=",
+        "source": {
+          "entity_type": "queue",
+          "queue_name": "q"
+        },
+        "advanced_options": true,
+        "advanced": {
+          "batch_size": 1
+        }
+      },
+      "storage": {}
+    }
+  },
+  {
+    "name": "56_run_recoveries_exhausted",
+    "description": "Two receive failures without progress end the run (exit 2).",
+    "config": {
+      "action": "run",
+      "parameters": {
+        "auth_type": "connection_string",
+        "#connection_string": "Endpoint=sb://ns.servicebus.windows.net/;SharedAccessKeyName=listen;SharedAccessKey=ZmFrZWtleWZha2VrZXlmYWtla2V5ZmFrZWtleTEyMzQ1Njc4OTA=",
+        "source": {
+          "entity_type": "queue",
+          "queue_name": "q"
+        }
+      },
+      "storage": {}
+    }
+  },
+  {
+    "name": "57_run_watermark_stop",
+    "description": "Messages enqueued after the job start stay on the entity (watermark stop).",
+    "config": {
+      "action": "run",
+      "parameters": {
+        "auth_type": "connection_string",
+        "#connection_string": "Endpoint=sb://ns.servicebus.windows.net/;SharedAccessKeyName=listen;SharedAccessKey=ZmFrZWtleWZha2VrZXlmYWtla2V5ZmFrZWtleTEyMzQ1Njc4OTA=",
+        "source": {
+          "entity_type": "queue",
+          "queue_name": "q"
+        },
+        "advanced_options": true,
+        "advanced": {
+          "batch_size": 2
+        }
+      },
+      "storage": {}
+    }
+  },
+  {
+    "name": "58_run_max_messages",
+    "description": "max_messages bounds the run.",
+    "config": {
+      "action": "run",
+      "parameters": {
+        "auth_type": "connection_string",
+        "#connection_string": "Endpoint=sb://ns.servicebus.windows.net/;SharedAccessKeyName=listen;SharedAccessKey=ZmFrZWtleWZha2VrZXlmYWtla2V5ZmFrZWtleTEyMzQ1Njc4OTA=",
+        "source": {
+          "entity_type": "queue",
+          "queue_name": "q"
+        },
+        "limits": {
+          "max_messages": 2
+        }
+      },
+      "storage": {}
+    }
+  },
+  {
+    "name": "59_run_empty_entity",
+    "description": "An empty entity yields a header-only table and a manifest (exit 0).",
+    "config": {
+      "action": "run",
+      "parameters": {
+        "auth_type": "connection_string",
+        "#connection_string": "Endpoint=sb://ns.servicebus.windows.net/;SharedAccessKeyName=listen;SharedAccessKey=ZmFrZWtleWZha2VrZXlmYWtla2V5ZmFrZWtleTEyMzQ1Njc4OTA=",
+        "source": {
+          "entity_type": "queue",
+          "queue_name": "q"
+        }
+      },
+      "storage": {}
+    }
+  },
+  {
+    "name": "60_run_full_load_composite_pk",
+    "description": "full_load with the composite primary key: manifest incremental false.",
+    "config": {
+      "action": "run",
+      "parameters": {
+        "auth_type": "connection_string",
+        "#connection_string": "Endpoint=sb://ns.servicebus.windows.net/;SharedAccessKeyName=listen;SharedAccessKey=ZmFrZWtleWZha2VrZXlmYWtla2V5ZmFrZWtleTEyMzQ1Njc4OTA=",
+        "source": {
+          "entity_type": "queue",
+          "queue_name": "q"
+        },
+        "destination": {
+          "load_type": "full_load",
+          "primary_key": "source_entity_sequence_number"
+        }
+      },
+      "storage": {}
+    }
+  },
+  {
+    "name": "61_run_dev_branch_guard",
+    "description": "A destructive mode in a dev branch fails and names destructive_in_branch.",
+    "config": {
+      "action": "run",
+      "parameters": {
+        "auth_type": "connection_string",
+        "#connection_string": "Endpoint=sb://ns.servicebus.windows.net/;SharedAccessKeyName=listen;SharedAccessKey=ZmFrZWtleWZha2VrZXlmYWtla2V5ZmFrZWtleTEyMzQ1Njc4OTA=",
+        "source": {
+          "entity_type": "queue",
+          "queue_name": "q"
+        }
+      },
+      "storage": {}
+    }
+  },
+  {
+    "name": "62_run_dev_branch_override",
+    "description": "destructive_in_branch lets a destructive mode run in a dev branch.",
+    "config": {
+      "action": "run",
+      "parameters": {
+        "auth_type": "connection_string",
+        "#connection_string": "Endpoint=sb://ns.servicebus.windows.net/;SharedAccessKeyName=listen;SharedAccessKey=ZmFrZWtleWZha2VrZXlmYWtla2V5ZmFrZWtleTEyMzQ1Njc4OTA=",
+        "source": {
+          "entity_type": "queue",
+          "queue_name": "q"
+        },
+        "destructive_in_branch": true
+      },
+      "storage": {}
+    }
+  },
+  {
+    "name": "63_run_dev_branch_peek",
+    "description": "Peek runs in a dev branch without the override.",
+    "config": {
+      "action": "run",
+      "parameters": {
+        "auth_type": "connection_string",
+        "#connection_string": "Endpoint=sb://ns.servicebus.windows.net/;SharedAccessKeyName=listen;SharedAccessKey=ZmFrZWtleWZha2VrZXlmYWtla2V5ZmFrZWtleTEyMzQ1Njc4OTA=",
+        "source": {
+          "entity_type": "queue",
+          "queue_name": "q",
+          "settlement_mode": "peek"
+        }
+      },
+      "storage": {}
+    }
+  },
+  {
+    "name": "64_run_missing_creds",
+    "description": "A connection-string config without the connection string fails validation (exit 1).",
+    "config": {
+      "action": "run",
+      "parameters": {
+        "auth_type": "connection_string",
+        "source": {
+          "entity_type": "queue",
+          "queue_name": "q"
+        }
+      },
+      "storage": {}
+    }
+  },
+  {
+    "name": "65_run_failure_write_always_per_mode",
+    "description": "A failing run leaves write_always per the spec 6.9 table; the test sets the settlement mode per variant.",
+    "config": {
+      "action": "run",
+      "parameters": {
+        "auth_type": "connection_string",
+        "#connection_string": "Endpoint=sb://ns.servicebus.windows.net/;SharedAccessKeyName=listen;SharedAccessKey=ZmFrZWtleWZha2VrZXlmYWtla2V5ZmFrZWtleTEyMzQ1Njc4OTA=",
+        "source": {
+          "entity_type": "queue",
+          "queue_name": "q"
+        },
+        "advanced_options": true,
+        "advanced": {
+          "batch_size": 1
+        }
+      },
+      "storage": {}
+    }
+  },
+  {
+    "name": "66_run_flatten_failed_run_new_keys",
+    "description": "C2 json_flatten: keys found by a failed run are not saved (three runs).",
+    "config": {
+      "action": "run",
+      "parameters": {
+        "auth_type": "connection_string",
+        "#connection_string": "Endpoint=sb://ns.servicebus.windows.net/;SharedAccessKeyName=listen;SharedAccessKey=ZmFrZWtleWZha2VrZXlmYWtla2V5ZmFrZWtleTEyMzQ1Njc4OTA=",
+        "source": {
+          "entity_type": "queue",
+          "queue_name": "q",
+          "settlement_mode": "defer_commit"
+        },
+        "body": {
+          "body_format": "json_flatten"
+        }
+      },
+      "storage": {}
+    }
+  },
+  {
+    "name": "67_run_flatten_cross_row_state_discard",
+    "description": "C4 json_flatten: a run whose state is discarded never adds a column the next run misses.",
+    "config": {
+      "action": "run",
+      "parameters": {
+        "auth_type": "connection_string",
+        "#connection_string": "Endpoint=sb://ns.servicebus.windows.net/;SharedAccessKeyName=listen;SharedAccessKey=ZmFrZWtleWZha2VrZXlmYWtla2V5ZmFrZWtleTEyMzQ1Njc4OTA=",
+        "source": {
+          "entity_type": "queue",
+          "queue_name": "q",
+          "settlement_mode": "peek",
+          "fetch_mode": "full_fetch"
+        },
+        "body": {
+          "body_format": "json_flatten"
+        }
+      },
+      "storage": {}
+    }
+  },
+  {
+    "name": "68_run_unreadable_fail_writes_rest_first",
+    "description": "C3 fail policy: the readable rows are written first, then exit 1.",
+    "config": {
+      "action": "run",
+      "parameters": {
+        "auth_type": "connection_string",
+        "#connection_string": "Endpoint=sb://ns.servicebus.windows.net/;SharedAccessKeyName=listen;SharedAccessKey=ZmFrZWtleWZha2VrZXlmYWtla2V5ZmFrZWtleTEyMzQ1Njc4OTA=",
+        "source": {
+          "entity_type": "queue",
+          "queue_name": "q",
+          "settlement_mode": "receive_and_delete"
+        },
+        "body": {
+          "unreadable_body": "fail"
+        }
+      },
+      "storage": {}
+    }
+  },
+  {
+    "name": "69_run_flatten_cap_writes_rest_first",
+    "description": "C3 flatten cap reached mid-batch: the batch is written, then exit 1.",
+    "config": {
+      "action": "run",
+      "parameters": {
+        "auth_type": "connection_string",
+        "#connection_string": "Endpoint=sb://ns.servicebus.windows.net/;SharedAccessKeyName=listen;SharedAccessKey=ZmFrZWtleWZha2VrZXlmYWtla2V5ZmFrZWtleTEyMzQ1Njc4OTA=",
+        "source": {
+          "entity_type": "queue",
+          "queue_name": "q",
+          "settlement_mode": "receive_and_delete"
+        },
+        "body": {
+          "body_format": "json_flatten"
+        }
+      },
+      "storage": {}
+    }
   }
 ]

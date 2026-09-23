@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from azure.servicebus import ServiceBusSubQueue
 
 import columns
 from client import RedactingFilter
@@ -40,6 +41,9 @@ CONFIGS: dict[str, dict] = {case["name"]: case["config"] for case in json.loads(
 JOB_START_DELAY_SECONDS = 1
 DUMMY_SAS_KEY = "ZmFrZWtleWZha2VrZXlmYWtla2V5ZmFrZWtleTEyMzQ1Njc4OTA="
 DUMMY_CLIENT_SECRET = "dummy-secret"
+DUMMY_CONNECTION_STRING = (
+    f"Endpoint=sb://ns.servicebus.windows.net/;SharedAccessKeyName=listen;SharedAccessKey={DUMMY_SAS_KEY}"
+)
 
 # Platform variables a developer shell (or CI) may carry: a case sets the ones it needs through `env`.
 _PLATFORM_ENV = (
@@ -235,6 +239,15 @@ def csv_header(result: CaseResult, table: str = "q.csv") -> list[str]:
     """The header row of an output CSV (``tables`` holds only its data rows)."""
     with (result.out_dir / "tables" / table).open(newline="", encoding="utf-8") as handle:
         return next(csv.reader(handle))
+
+
+def peek_stored(queue: str, sub_queue: ServiceBusSubQueue | None = None) -> list[Any]:
+    """Every message stored on a queue (or one of its sub-queues), peeked through the fake SDK, for
+    assertions on properties the broker set (e.g. a dead-letter reason). Call it after the run: it
+    adds a client and a receiver to the broker's records."""
+    client = FakeServiceBusClient.from_connection_string(DUMMY_CONNECTION_STRING)
+    with client, client.get_queue_receiver(queue, sub_queue=sub_queue) as receiver:
+        return receiver.peek_messages(250, sequence_number=1)
 
 
 def summary(result: CaseResult) -> dict[str, str]:
