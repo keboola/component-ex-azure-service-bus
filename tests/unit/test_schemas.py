@@ -19,7 +19,7 @@ def walk(schema: dict, path: str = ""):
             yield from walk(prop, f"{path}{name}.")
 
 
-def test_hidden_parameter_absent():
+def test_removed_dev_branch_override_absent():
     text = json.dumps(ROOT_SCHEMA) + json.dumps(ROW_SCHEMA)
     assert "destructive_in_branch" not in text
 
@@ -111,14 +111,13 @@ def _model_paths(model: type[BaseModel], prefix: str = "") -> set[str]:
 
 
 def test_schema_fields_match_model():
-    # Every user-facing model field has exactly one schema field (root + row) and vice versa;
-    # only the hidden debug-mode override stays out of the schemas.
+    # Every model field has exactly one schema field (root + row) and vice versa.
     schema_paths = {
         path
         for path, prop, _ in list(walk(ROOT_SCHEMA)) + list(walk(ROW_SCHEMA))
         if prop.get("type") not in ("object", "button")
     }
-    assert schema_paths == _model_paths(configuration.Configuration) - {"destructive_in_branch"}
+    assert schema_paths == _model_paths(configuration.Configuration)
 
 
 def test_portal_urls_point_at_main():

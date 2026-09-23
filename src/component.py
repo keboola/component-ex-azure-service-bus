@@ -51,11 +51,6 @@ from stats import RunStats, log_effective_settings
 
 logger = logging.getLogger(__name__)
 
-DEV_BRANCH_MESSAGE = (
-    "Settlement mode '{mode}' deletes or hides messages on the production Service Bus entity, and this job runs "
-    "in a development branch. Use Peek mode in branches, or, to consume production messages from this branch on "
-    'purpose, open the configuration in debug mode and add "destructive_in_branch": true under parameters.'
-)
 LEGACY_QUEUE_WARNING = (
     "This project runs on the legacy job queue, which does not support write_always: if this job fails after "
     "messages were deleted, the rows written so far are not uploaded and those messages are lost. Use "
@@ -106,7 +101,6 @@ class Component(ComponentBase):
     def run(self) -> None:
         """Extract one Service Bus entity per row into one Storage table (spec §6.1)."""
         config = self._load_run_config()
-        self._guard_dev_branch(config)
         run = self._start_run(config)
         with self._open_output(config, run) as output:
             processor = self._build_processor(config, run, output)
@@ -128,14 +122,6 @@ class Component(ComponentBase):
 
     def _load_run_config(self) -> Configuration:
         return Configuration(**self.configuration.parameters)
-
-    def _guard_dev_branch(self, config: Configuration) -> None:
-        """Destructive modes consume production messages, so a dev-branch run refuses them unless the
-        hidden ``destructive_in_branch`` override is set (spec §2.5). ``KBC_BRANCHID`` is set only in
-        dev-branch runs."""
-        mode = config.source.settlement_mode
-        if mode.is_destructive and self.environment_variables.branch_id and not config.destructive_in_branch:
-            raise UserException(DEV_BRANCH_MESSAGE.format(mode=mode.value))
 
     def _start_run(self, config: Configuration) -> RunContext:
         """T0, the row state, the metadata pre-check with its counts line and the effective-settings

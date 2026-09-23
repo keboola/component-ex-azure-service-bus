@@ -34,4 +34,4 @@ Each row reads one queue, one topic subscription, or one of their dead-letter / 
 
 Batch size, prefetch count, and an optional post-recovery catch-up wait. The defaults suit most entities; lower the batch size when messages carry large bodies.
 
-Destructive settlement modes (everything except `peek`) refuse to run in a development branch unless the configuration has `"destructive_in_branch": true` added under `parameters` via debug mode — they consume and remove production messages, so test them on a separate entity rather than overriding the guard on a production one.
+Development branches read the same production Service Bus entity as the default branch: a destructive settlement mode (everything except `peek`) run in a branch consumes and removes production messages. Use Peek Only in branches, or point the branch configuration at a separate test entity. Project admins can enable the `dev-branch-configuration-unsafe` feature to have the platform guard branch runs.

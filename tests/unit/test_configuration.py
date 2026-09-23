@@ -35,7 +35,6 @@ def test_defaults():
     assert c.destination.load_type is LoadType.INCREMENTAL_LOAD and c.destination.incremental
     assert c.destination.primary_key is PrimaryKey.SEQUENCE_NUMBER
     assert (c.advanced.batch_size, c.advanced.prefetch_count, c.advanced.recovery_wait_seconds) == (100, 1, 0)
-    assert c.destructive_in_branch is False
 
 
 def test_queue_requires_queue_name():
@@ -103,8 +102,9 @@ def test_service_principal_requires_fields():
         Configuration(auth_type="service_principal", tenant_id="t", client_id="c", source=SOURCE)
 
 
-def test_hidden_destructive_in_branch_accepted():
-    assert cfg(destructive_in_branch=True).destructive_in_branch is True
+def test_removed_destructive_in_branch_key_is_ignored():
+    # the removed dev-branch override: a config that still carries it keeps validating
+    assert not hasattr(cfg(destructive_in_branch=True), "destructive_in_branch")
 
 
 def test_primary_key_columns():

@@ -81,20 +81,19 @@ def test_run_c1_writes_table_manifest_and_state(broker, tmp_path, monkeypatch):
     assert json.loads((tmp_path / "out/state.json").read_text())["pending_commit"] == []
 
 
-def test_dev_branch_guard(broker, tmp_path, monkeypatch):
-    broker.add_queue("q").send(b"x")
+@pytest.mark.parametrize("mode", ["complete", "defer_commit", "receive_and_delete", "peek"])
+def test_every_mode_runs_when_branch_id_is_set(broker, tmp_path, monkeypatch, mode):
+    # KBC_BRANCHID is set for default-branch jobs too on current stacks, so it must never block a run
+    q = broker.add_queue("q")
+    seq = q.send(b"x")
     monkeypatch.setenv("KBC_BRANCHID", "123")
-    comp = component(tmp_path, monkeypatch, PARAMS)
-    with pytest.raises(UserException, match="destructive_in_branch"):
-        comp.execute_action()
-
-
-def test_dev_branch_override_and_peek(broker, tmp_path, monkeypatch):
-    broker.add_queue("q").send(b"x")
-    monkeypatch.setenv("KBC_BRANCHID", "123")
-    component(tmp_path / "a", monkeypatch, {**PARAMS, "destructive_in_branch": True}).execute_action()
-    peek = {**PARAMS, "source": {**PARAMS["source"], "settlement_mode": "peek"}}
-    component(tmp_path / "b", monkeypatch, peek).execute_action()
+    params = {**PARAMS, "source": {**PARAMS["source"], "settlement_mode": mode}}
+    component(tmp_path, monkeypatch, params).execute_action()
+    assert (tmp_path / "out/tables/q.csv").read_text().splitlines()[1].endswith(",x")
+    assert (
+        q.state_of(seq)
+        == {"complete": None, "defer_commit": "DEFERRED", "receive_and_delete": None, "peek": "ACTIVE"}[mode]
+    )
 
 
 def test_list_queues_returns_select_elements(broker, tmp_path, monkeypatch, capsys):
@@ -187,18 +186,6 @@ def out_state(tmp_path: Path) -> dict:
 
 def warnings_logged(caplog) -> list[str]:
     return [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
-
-
-def test_dev_branch_message_names_mode_and_override(broker, tmp_path, monkeypatch):
-    from component import DEV_BRANCH_MESSAGE
-
-    broker.add_queue("q").send(b"x")
-    monkeypatch.setenv("KBC_BRANCHID", "123")
-    comp = component(tmp_path, monkeypatch, with_source(settlement_mode="defer_commit"))
-    with pytest.raises(UserException) as excinfo:
-        comp.execute_action()
-    assert str(excinfo.value) == DEV_BRANCH_MESSAGE.format(mode="defer_commit")
-    assert broker.calls == []  # guarded before anything touched the entity
 
 
 def test_client_identifier_from_platform_ids(broker, tmp_path, monkeypatch):
@@ -501,12 +488,11 @@ def run_main(tmp_path, monkeypatch, parameters) -> str | int | None:
 
 
 def test_main_user_error_exits_1_with_a_logged_message(broker, tmp_path, monkeypatch, caplog):
-    broker.add_queue("q").send(b"x")
-    monkeypatch.setenv("KBC_BRANCHID", "123")
+    broker.add_queue("q", sessions=True).send(b"x", session_id="A")  # the row does not enable Sessions
     with caplog.at_level(logging.ERROR):
         assert run_main(tmp_path, monkeypatch, PARAMS) == 1
     (record,) = [r for r in caplog.records if r.levelno == logging.ERROR]
-    assert "destructive_in_branch" in record.getMessage()
+    assert "enable Sessions" in record.getMessage()
 
 
 def test_main_unexpected_error_exits_2(broker, tmp_path, monkeypatch, caplog):

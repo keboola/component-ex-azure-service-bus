@@ -982,8 +982,8 @@
     }
   },
   {
-    "name": "61_run_dev_branch_guard",
-    "description": "A destructive mode in a dev branch fails and names destructive_in_branch.",
+    "name": "61_run_branch_id_c1",
+    "description": "KBC_BRANCHID is set on every job on current stacks (default branch included): a destructive mode runs.",
     "config": {
       "action": "run",
       "parameters": {
@@ -998,8 +998,8 @@
     }
   },
   {
-    "name": "62_run_dev_branch_override",
-    "description": "destructive_in_branch lets a destructive mode run in a dev branch.",
+    "name": "62_run_removed_override_key_ignored",
+    "description": "A config that still carries the removed destructive_in_branch key runs; the key is ignored.",
     "config": {
       "action": "run",
       "parameters": {
@@ -1016,7 +1016,7 @@
   },
   {
     "name": "63_run_dev_branch_peek",
-    "description": "Peek runs in a dev branch without the override.",
+    "description": "Peek runs with KBC_BRANCHID set.",
     "config": {
       "action": "run",
       "parameters": {

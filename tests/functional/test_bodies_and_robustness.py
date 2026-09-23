@@ -1,5 +1,5 @@
 """Functional cases 46-69 (spec §8): body formats, JSON flattening with ``body_unmapped`` promotion,
-unreadable bodies, connection recycling, run bounds, dev branches and the ``write_always`` switch.
+unreadable bodies, connection recycling, run bounds, branch runs and the ``write_always`` switch.
 
 Every case runs the real component against the FakeBroker (see ``conftest.py``).
 """
@@ -218,22 +218,21 @@ def test_60_run_full_load_composite_pk(fake_broker, tmp_path, monkeypatch, capsy
     assert sorted(primary_key) == sorted(["source_entity", "sequence_number"])
 
 
-# --- dev branches (J11) ----------------------------------------------------------------------------------
+# --- branches (J11: no automatic guard -- the platform gives no dev-branch signal, spec §2.5) --------------
 
 
-def test_61_run_dev_branch_guard(fake_broker, tmp_path, monkeypatch, capsys):
+def test_61_run_branch_id_c1(fake_broker, tmp_path, monkeypatch, capsys):
     q = fake_broker.add_queue("q")
     q.send(b"x")
-    result = run_case("61_run_dev_branch_guard", tmp_path, monkeypatch, capsys, env={"KBC_BRANCHID": "1"})
-    assert result.exit_code == 1
-    assert "destructive_in_branch" in result.stderr
-    assert q.state_of(1) == "ACTIVE" and q.delivery_count(1) == 0 and fake_broker.calls == []
+    result = run_case("61_run_branch_id_c1", tmp_path, monkeypatch, capsys, env={"KBC_BRANCHID": "1"})
+    assert result.exit_code == 0
+    assert len(result.tables["q.csv"]) == 1 and q.sequence_numbers() == []
 
 
-def test_62_run_dev_branch_override(fake_broker, tmp_path, monkeypatch, capsys):
+def test_62_run_removed_override_key_ignored(fake_broker, tmp_path, monkeypatch, capsys):
     q = fake_broker.add_queue("q")
     q.send(b"x")
-    result = run_case("62_run_dev_branch_override", tmp_path, monkeypatch, capsys, env={"KBC_BRANCHID": "1"})
+    result = run_case("62_run_removed_override_key_ignored", tmp_path, monkeypatch, capsys, env={"KBC_BRANCHID": "1"})
     assert result.exit_code == 0
     assert len(result.tables["q.csv"]) == 1 and q.sequence_numbers() == []
 

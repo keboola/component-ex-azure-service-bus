@@ -138,18 +138,27 @@ import succeeded.
   × `incremental_load` = accumulate; C4 `incremental_fetch` × `full_load` = delta of newly peeked
   messages (deliberate staging table).
 
-### 2.5 Dev branches (maintainer decision)
+### 2.5 Dev branches (lead decision, Phase 7 — supersedes the original guard)
 
-Destructive modes (C1/C2/C3) **fail in a dev branch** — `KBC_BRANCHID` is set only in dev-branch
-runs [keboola-context: environment-variables] — with a `UserException` telling the user to open
-debug mode and add `"destructive_in_branch": true` under `parameters`. That parameter is accepted by
-the config model and deliberately **absent from the UI schema**. C4 always runs. Stated plainly:
-**a dev-branch destructive run consumes production messages.** A C2 run in a branch with the
-override is a *second consumer* of the production entity: its deferrals live in the branch's state,
-the production config's orphan scan may recover them (re-extract into the production table and
-delete them on its next run), **or** the branch's next run may delete them first — in which case
-those messages only ever reach the branch's table. Branch testing of destructive modes belongs on a
-separate entity.
+**Every mode runs in every branch; there is no automatic dev-branch guard.** The original design
+refused destructive modes (C1/C2/C3) when `KBC_BRANCHID` was set, relying on the keboola-context
+claim that the variable is absent on the default branch. That claim is **wrong on current stacks**
+(storage branches / queue v2): the Queue sets `KBC_BRANCHID` for default-branch jobs too [live,
+Phase 7: a default-branch job was refused; an environment dump in the default branch and in a dev
+branch showed the same 12 `KBC_*` variables, differing only in the `KBC_BRANCHID` value]. No branch
+type, name or default flag is exposed, and without `forward_token` (§2.2) the component cannot ask
+the API which id is the default branch — so no reliable check exists, and the guard (with its hidden
+`destructive_in_branch` override) was removed. A config that still carries the key keeps validating
+(`extra="ignore"`).
+
+Documented instead (README, `configuration_description.md`, the `settlement_mode` tooltip):
+**a dev branch reads the same production entity**, so a destructive run in a branch consumes and
+removes production messages, which then reach only the branch's table — use Peek or a separate test
+entity in branches; project admins can enable the platform feature
+`dev-branch-configuration-unsafe` to have the platform guard branch runs. A C2 run in a branch is a
+*second consumer* of the production entity: its deferrals live in the branch's state, the production
+config's orphan scan may recover them (re-extract into the production table and delete them on its
+next run), **or** the branch's next run may delete them first.
 
 ## 3. Authentication, connection & provisioning
 
@@ -367,7 +376,7 @@ failing (§6.9), and unused columns simply stay empty.
 | J8. Delivery-count high-water mark in the run summary | **In scope** | §6.12. |
 | J9. Run summary log | **In scope** | §6.12. |
 | J10. Refuse unsafe combinations up front | **In scope** | refused: C3 + prefetch > 1; C4 `incremental_fetch` on partitioned / session / sub-queue entities. C2 is never refused — WARNING where orphan recovery is best-effort / impossible [decided]. |
-| J11. Dev-branch guard (`KBC_BRANCHID`) | **In scope** [decided] | §2.5. |
+| J11. Dev-branch guard (`KBC_BRANCHID`) | **Excluded** (Phase-7 lead decision) — the platform gives no dev-branch signal (`KBC_BRANCHID` is set on default-branch jobs too); documented instead | §2.5. |
 
 ### K. Transport / client options
 
@@ -454,8 +463,8 @@ described here, not written as JSON.
 - `prefetch_count` — integer 1–1,000, default 1.
 - `recovery_wait_seconds` — integer 0–330, default 0.
 
-**Hidden (model only, never in any schema):** `destructive_in_branch` — boolean, default `false`, at
-the top level of `parameters` (§2.5).
+No hidden parameters: the former `destructive_in_branch` override was removed with the dev-branch
+guard (§2.5); a leftover key is ignored.
 
 ### 5.3 Validation rules (Pydantic `model_validator`s, raised as `UserException` exit 1)
 
@@ -513,7 +522,6 @@ the top level of `parameters` (§2.5).
 | `destination.primary_key` | row | no | user-facing enum | `sequence_number` | yes — visible |
 | `advanced_options` | row | no | user-facing checkbox | `false` | yes — visible |
 | `advanced.batch_size` / `prefetch_count` / `recovery_wait_seconds` | row | no | user-facing, gated `advanced_options = true` | 100 / 1 / 0 | only once `advanced_options` is on |
-| `destructive_in_branch` | root-level of `parameters` | no | **internal — hidden, not in any schema** | `false` | **never** (set only via debug mode) |
 | transport, receiver `keep_alive=0`, SDK retry, recovery cap, orphan-scan K and page cap, commit byte cap, state budget, unreadable abort share | — | — | **internal constants — not in any schema** | §6 | never |
 
 Gated fields rely on the generic UI dropping values of fields whose `options.dependencies` are
@@ -546,7 +554,7 @@ exists at all.)
 
 ### 6.1 Run sequence (destructive modes C1/C2/C3)
 
-1. Parse and validate the config; guard the dev branch (§2.5).
+1. Parse and validate the config (every mode runs in every branch — §2.5).
 2. Load the row state (§6.8); T0 = now (UTC) for the D4 watermark.
 3. Optional metadata pre-check + counts log (L1/L2) via the management client; any management
    failure → DEBUG log + heuristics (§6.7).
@@ -615,7 +623,7 @@ client** with `retry_total=0` (client level — `get_*_receiver(retry_total=…)
 live]): any C2 run whose state is lost or never written — the job failed anywhere incl. the Storage
 import (the case C2 exists for); the config was deleted or its state reset; a **failed final C2 run
 followed by a switch to C1/C3/C4** (that run's deferrals are in no state, and no scan runs outside
-C2); a dev-branch run with `destructive_in_branch` (branch-scoped state, §2.5); two concurrent jobs
+C2); a C2 run in a dev branch (branch-scoped state, §2.5); two concurrent jobs
 of one config (last state writer wins [keboola-context: config-rows]).
 
 **H3 on plain entities** (non-partitioned queue or subscription, no sessions, not a sub-queue),
@@ -1025,7 +1033,6 @@ another application's deferrals.
 | unknown namespace host | `ServiceBusConnectionError` at connect | `UserException` "cannot reach namespace" |
 | SP wrong secret | `ServiceBusError` "Authentication failed: AADSTS…" | `UserException` (redacted) |
 | session entity without `session_enabled` (or the reverse) | `ServiceBusError` text / L2 mismatch | `UserException` "enable / disable Sessions" |
-| destructive mode in a dev branch without the override | component check | `UserException` naming `destructive_in_branch` + debug mode |
 | refused combinations (J10), state version, table name, flatten cap, unreadable share, commit retries exhausted, recoveries exhausted on a `ServiceBusError` | component checks | `UserException` |
 | `MessageLockLostError` on settle; `SessionCannotBeLockedError`; `OperationTimeoutError` (no session) | — | counted / skipped / normal end |
 | receive-path `TypeError` / `BufferError` (multi-frame symptoms) and other unexpected errors | — | recycle (§6.5); exhausted → exit 2 |
@@ -1071,7 +1078,7 @@ state):
 
 | Module | Responsibility |
 |---|---|
-| `src/configuration.py` | Pydantic v2 models: `AuthConfiguration` (flat root auth fields, writer's `_validate_auth`), `SourceConfig`, `LimitsConfig`, `BodyConfig`, `DestinationConfig`, `AdvancedConfig`, `Configuration` (merged root + row + hidden `destructive_in_branch`); `StrEnum`s for every enum; `extra="ignore"`; `ValidationError` → `UserException` with field paths; §5.3 validators. Partial models: `AuthConfiguration` (list actions, root `testConnection`), `SyncActionConfiguration` (auth + a possibly partial `source`: `testConnection`'s root-vs-row branch, `listSubscriptions`' topic), `Configuration` (run and row actions). |
+| `src/configuration.py` | Pydantic v2 models: `AuthConfiguration` (flat root auth fields, writer's `_validate_auth`), `SourceConfig`, `LimitsConfig`, `BodyConfig`, `DestinationConfig`, `AdvancedConfig`, `Configuration` (merged root + row); `StrEnum`s for every enum; `extra="ignore"`; `ValidationError` → `UserException` with field paths; §5.3 validators. Partial models: `AuthConfiguration` (list actions, root `testConnection`), `SyncActionConfiguration` (auth + a possibly partial `source`: `testConnection`'s root-vs-row branch, `listSubscriptions`' topic), `Configuration` (run and row actions). |
 | `src/client.py` | `ServiceBusConnector` — credential factory (SAS / SP), `receive_client()`, `commit_client()` (`retry_total=0`), `admin_client()`, `user_agent`; `redact_secrets`, `to_user_exception` (§6.11). Pyamqp only. |
 | `src/entity.py` | `EntityRef` (entity type, names, sub-queue → receiver kwargs, entity path, derived table name, state key); `EntityInfo` (L2 metadata or heuristics: sessions, partitioning, lock duration, max delivery count); `partition_of(seq)`; management helpers for the dropdowns and `entityInfo`. |
 | `src/receiver.py` | `ReceiveLoop` — batches, sessions loop, stop conditions, lock renewal, stop drain, recycling with cap + no-progress guard, catch-up wait; the helpers it shares with the peek pager: `RecoveryTracker`, `StopReason`, receiver profile (§6.2), open / close / session-renew helpers, the watermark test. |
@@ -1083,7 +1090,7 @@ state):
 | `src/columns.py` | fixed column catalogue (name → base type), message → metadata row mapping (E1–E25), value formatting (timestamps, JSON, bytes), `previewMessages` markdown rendering. |
 | `src/output.py` | `OutputTable` — one streaming CSV writer for every body format (flatten: fixed columns + input-registry columns + `body_unmapped`, §6.10); manifest (schema, PK, incremental, `has_header`, `write_always` false until `arm_write_always()`; on the legacy queue the library omits the key and the component only warns, §6.9) via a callback into `ComponentBase.write_manifest`; context manager that flushes and closes on exit, including on exceptions. |
 | `src/stats.py` | `RunStats` counters, effective-settings line, summary, WARNING aggregation. |
-| `src/component.py` | `Component(ComponentBase)`: `__init__` parses `AuthConfiguration` and builds the `ServiceBusConnector` (lazy — no network in `__init__`); `run()` ≤ 30 lines delegating to `_load_run_config`, `_guard_dev_branch`, `_open_output`, `_commit_pending`, `_reconcile_deferrals`, `_consume`, `_peek`, `_finish`; `@sync_action`s (§5.4, read through the typed partial models); the scaffold's `__main__` guard (`UserException` → exit 1 with redacted message, else exit 2). |
+| `src/component.py` | `Component(ComponentBase)`: `__init__` parses `AuthConfiguration` and builds the `ServiceBusConnector` (lazy — no network in `__init__`); `run()` ≤ 30 lines delegating to `_load_run_config`, `_start_run`, `_open_output`, `_commit_pending`, `_reconcile_deferrals`, `_consume`, `_peek`, `_finish`; `@sync_action`s (§5.4, read through the typed partial models); the scaffold's `__main__` guard (`UserException` → exit 1 with redacted message, else exit 2). |
 
 - **Typing:** built-in generics, `collections.abc` iterators, full hints, `@staticmethod` where
   `self` is unused; ruff with `I`, `UP`, `G` (template config); PEP 758 `except A, B:` is valid on
@@ -1183,9 +1190,9 @@ only dummies may appear, and surfaced errors must be redacted.
 | `58_run_max_messages` | run | D1 |
 | `59_run_empty_entity` | run edge | G5 header-only table, exit 0 |
 | `60_run_full_load_composite_pk` | run | G2 / G3 manifest |
-| `61_run_dev_branch_guard` | run fail | J11 message names `destructive_in_branch` |
-| `62_run_dev_branch_override` | run | override runs |
-| `63_run_dev_branch_peek` | run | C4 runs in a branch without the override |
+| `61_run_branch_id_c1` | run | `KBC_BRANCHID` set (as on every job on current stacks): C1 runs and consumes (§2.5) |
+| `62_run_removed_override_key_ignored` | run | a config still carrying `destructive_in_branch` runs; the key is ignored |
+| `63_run_dev_branch_peek` | run | C4 runs with `KBC_BRANCHID` set |
 | `64_run_missing_creds` | run fail | auth validation |
 | `65_run_failure_write_always_per_mode` | run fail | the §6.9 table: C1 / C3 failing after one settled batch leave the CSV + a `write_always: true` manifest; C1 failing before the first complete, C3 failing before any receive returned messages, C2 failing mid-run and C4 failing mid-run (peek-error injection) leave `write_always: false` |
 | `66_run_flatten_failed_run_new_keys` | three-run (C2) | run 1 fails after writing rows with key `a` → CSV has no `body_a`, `body_unmapped` filled, no state; run 2 (from run 1's input state) succeeds → still no `body_a`, `body_unmapped` filled, registry saved; run 3 → `body_a` is a column |
@@ -1228,7 +1235,7 @@ encrypted `#` values in the cf-dev configs.
   8. Flatten on a JSON-body entity, two runs with new keys — columns appended, import succeeds; and
      the Storage import checks the spec relies on (extra columns added; typed TIMESTAMP / INTEGER /
      FLOAT / BOOLEAN columns load; header vs `has_header`).
-  9. Dev-branch guard: a C1 run in a dev branch fails with the `destructive_in_branch` message.
+  9. (Removed: the dev-branch guard — §2.5. A default-branch job carries `KBC_BRANCHID` too.)
   10. Probes for [inferred] items (§10): an activated scheduled message keeps
       `scheduled_enqueue_time_utc`; the `enqueued_time_utc` a peeked `SCHEDULED` message reports
       (scheduled time or original enqueue time); repeated deferred receives near MaxDeliveryCount;
@@ -1238,7 +1245,7 @@ encrypted `#` values in the cf-dev configs.
       `out/files` contains no secret (grep for the SAS key, `sig=`, the client secret).
 - **Fresh-config UI acceptance (runtime gate):** create a new config + row in the cf-dev UI, save,
   read the stored parameters back — only user-set values and visible defaults (§5.5), gated fields
-  absent while hidden, `destructive_in_branch` absent, every enum stores its value, `rows ≥ 1`.
+  absent while hidden, every enum stores its value, `rows ≥ 1`.
 - **Sync actions** become exercisable from the UI only once a release makes the portal default tag
   carry them (writer lesson); Phase 6/7 records that.
 - **Teardown:** purge the `ex-*` entities (incl. deferred leftovers); `ex-test-sub` stays until the
@@ -1333,7 +1340,9 @@ this spec against it. Every `corrected:` item is folded into the sections cited.
   (§2.1, §6.9, §6.10, §7).
 - `[exit-codes.md]` → correct — `UserException` → exit 1, unexpected → exit 2, `__main__` guard
   (§6.11, §7).
-- `[environment-variables.md]` → correct — `KBC_BRANCHID` present only in branches (§2.5),
+- `[environment-variables.md]` → correct at spec time; **corrected in Phase 7**: its claim that `KBC_BRANCHID` is
+  absent on the default branch is wrong on current stacks (it is set for default-branch jobs too), so the
+  dev-branch guard was removed (§2.5);
   `KBC_CONFIGROWID` absent on non-row runs (§6.12), `KBC_CONFIGID` may be a hash (§6.12),
   `KBC_DATA_TYPE_SUPPORT` handled by the library (§6.9); no `forward_token` (§2.2).
 - `[telemetry.md]` → N/A — about querying usage telemetry, not runtime behaviour.
@@ -1430,3 +1439,4 @@ differ):**
 | P4-6 | Approval item 6 wording: `path_sha1 → column` registry | §15 |
 | P4-R3 | `to_user_exception` also maps management-plane `AzureError`s (denied → names the Data Receiver role / Manage rights; `ResourceNotFoundError` → not found) | §6.11 |
 | P4-7 | (After the Phase-7 probe: activation gives a scheduled message a new sequence number.) C4, both fetch modes, skips `SCHEDULED` messages pending activation, counts them as `skipped_scheduled` and exports them once active, under their new sequence number; the `state` column keeps the broker-reported value | §4-A7, §6.5, §6.7, §6.9, §6.12, §10 |
+| P4-8 | (Phase 7: `KBC_BRANCHID` is set on default-branch jobs too on current stacks — a default-branch C3 job was refused; the platform exposes no branch type / name / default flag and, without `forward_token`, the default branch id cannot be resolved.) The automatic dev-branch guard and the hidden `destructive_in_branch` override are removed; every mode runs in every branch. Documented instead: a dev branch reads the same production entity — use Peek or a separate test entity in branches; admins can enable `dev-branch-configuration-unsafe`. The keboola-context `environment-variables.md` claim "absent on the default branch" is wrong on current stacks | §2.5, §4-J11, §5.2, §5.5, §6.1, §6.11, §8, §9, §12 |

@@ -151,14 +151,18 @@ so the message is exported exactly once, under that new sequence number.
 Dev branches
 ------------
 
-Destructive settlement modes (everything except `peek`) **refuse to run in a development branch**
-with a `UserException`, because they would consume and remove **production** messages. Peek mode
-always runs. To deliberately consume production messages from a branch, open the configuration in
-debug mode and add `"destructive_in_branch": true` under `parameters` — this parameter is accepted
-by the configuration but is not exposed in the configuration form. Branch testing of destructive
-modes belongs on a separate entity: a `defer_commit` run in a branch is a second consumer of the
-production entity, and either the production config's orphan scan or the branch's own next run may
-delete its deferrals first.
+Every settlement mode runs in every branch. A development branch reads the **same production
+Service Bus entity** as the default branch: a destructive mode (everything except `peek`) run in a
+branch consumes and removes production messages, which then reach only the branch's table. Use
+**Peek Only** in branches, or point the branch configuration at a separate test entity. A
+`defer_commit` run in a branch is a second consumer of the production entity: its deferrals live in
+the branch's state, and either the production configuration's orphan scan or the branch's own next
+run may delete them first.
+
+The component does not block destructive modes in branches: the platform gives a job no signal that
+tells a development branch from the default one (`KBC_BRANCHID` is set for default-branch jobs as
+well), so such a check would also refuse production runs. Project admins who want the platform to
+guard branch runs can enable the `dev-branch-configuration-unsafe` feature.
 
 Output
 ======

@@ -205,7 +205,6 @@ class Configuration(AuthConfiguration):
     destination: DestinationConfig = Field(default_factory=DestinationConfig)
     advanced: AdvancedConfig = Field(default_factory=AdvancedConfig)
     advanced_options: bool = False
-    destructive_in_branch: bool = False
 
     @model_validator(mode="after")
     def _normalise_source(self) -> Self:

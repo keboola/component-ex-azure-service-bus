@@ -8,6 +8,6 @@ Configuration is row-based: the connection to the namespace is set once at the c
 
 **Body & destination** — read the body as raw text, base64, or flatten a JSON body into columns; load incrementally (upsert, default) or fully replace the table each run; pick the primary key that fits how the table is used.
 
-Destructive settlement modes refuse to run in a development branch unless explicitly overridden in debug mode, since they consume and remove production messages.
+Development branches read the same production entity: in a branch, use Peek Only or a separate test entity, since the other modes consume and remove production messages.
 
 Use the **Test Connection**, **Preview Messages**, and **Show Entity Details** actions to verify credentials, inspect sample messages, and check entity properties before running. The source entity must already exist in the namespace — the extractor does not create it.
