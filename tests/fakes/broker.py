@@ -18,7 +18,8 @@ Modelling notes beyond the Task-4 table:
   closing a session receiver, or letting its session lock lapse, releases the session together
   with its unsettled messages.
 - Receivers open on ``__enter__`` or on their first operation, as the SDK does; that is where
-  auth, entity and session errors surface.
+  entity and session errors surface (``auth_failure`` also fails every operation of an open one).
+- A lock is lapsed when ``locked_until <= now``, the SDK's client-side rule.
 - Settles are pre-settled as on 7.14.3: the SDK's client-side checks raise; anything the broker
   would reject (a stale lock token, dead-lettering a sub-queue message) is silently ignored.
 - A DATA or SEQUENCE ``body`` is a fresh generator of sections on every access, as in the SDK.
@@ -28,6 +29,7 @@ Modelling notes beyond the Task-4 table:
   it is read from ``get_topic``).
 """
 
+import copy
 import itertools
 import warnings
 from collections import defaultdict, deque
@@ -311,8 +313,8 @@ class FakeReceivedMessage:
     def lock_token(self) -> UUID | None:
         return None if self._settled else self._lock_token
 
-    def _lapsed(self, now: datetime) -> bool:
-        return self._locked_until is not None and self._locked_until < now
+    def _lapsed(self, now: datetime) -> bool:  # the SDK: locked_until_utc <= utc_now()
+        return self._locked_until is not None and self._locked_until <= now
 
     def _raw(self, amqp: dict[str, Any], annotations: dict[Any, Any] | None) -> AmqpAnnotatedMessage:
         ttl_ms = None if self.time_to_live is None else self.time_to_live // timedelta(milliseconds=1)
@@ -610,10 +612,13 @@ class FakeEntity:
         holder = record.holder
         if holder is not None and holder.session is not None:  # a session message: the session lock
             return self._sessions.get(record.session_id or "") is holder
-        return record.locked_until is not None and not record.locked_until < now
+        return record.locked_until is not None and record.locked_until > now
 
     def _sweep(self) -> None:
-        """Expire lapsed session and message locks (the broker's timers, observed lazily)."""
+        """Expire lapsed session and message locks (the broker's timers, observed lazily). A sub-queue
+        sweeps its parent first: a lapse there can dead-letter into it (the parent never sweeps a child)."""
+        if self._parent is not None:
+            self._parent._sweep()
         now = self._broker.clock.now()
         for session_id, holder in list(self._sessions.items()):
             if holder.closed or holder.session is None or holder.session._lapsed(now):
@@ -666,7 +671,7 @@ class FakeEntity:
             "state": record.state(self._broker.clock.now()),
         }
         return FakeReceivedMessage(
-            record.body,
+            copy.deepcopy(record.body),
             body_type=record.body_type,
             sequence_number=record.seq,
             attrs=attrs,
@@ -865,8 +870,8 @@ class FakeSession:
     def locked_until_utc(self) -> datetime | None:
         return self._locked_until
 
-    def _lapsed(self, now: datetime) -> bool:
-        return self._locked_until is not None and self._locked_until < now
+    def _lapsed(self, now: datetime) -> bool:  # the SDK: locked_until_utc <= utc_now()
+        return self._locked_until is not None and self._locked_until <= now
 
     def renew_lock(self, *, timeout: float | None = None, **kwargs: Any) -> datetime:
         receiver = self._receiver
@@ -933,15 +938,13 @@ class FakeReceiver:
     ) -> list[FakeReceivedMessage]:
         """Never waits: an empty entity returns ``[]`` at once."""
         self._record("receive_messages", max_message_count=max_message_count, max_wait_time=max_wait_time)
-        injected = self._broker._injected("receive")
         self._check_live()
         if max_wait_time is not None and max_wait_time <= 0:
             raise ValueError("The max_wait_time must be greater than 0.")
         if max_message_count is not None and max_message_count <= 0:
             raise ValueError("The max_message_count must be greater than 0")
         entity = self._open()
-        if injected is not None:
-            raise injected
+        self._broker._raise_injected("receive")
         messages = entity._receive(self, max_message_count or self.prefetch_count)
         self._cursor = messages[-1].sequence_number if messages else self._cursor
         return messages
@@ -950,7 +953,6 @@ class FakeReceiver:
         self, max_message_count: int = 1, *, sequence_number: int = 0, timeout: float | None = None, **kwargs: Any
     ) -> list[FakeReceivedMessage]:
         self._record("peek_messages", max_message_count=max_message_count, sequence_number=sequence_number)
-        injected = self._broker._injected("peek")
         _warn_unsupported(kwargs)
         self._check_live()
         _check_timeout(timeout)
@@ -958,8 +960,7 @@ class FakeReceiver:
         if int(max_message_count) < 0:
             raise ValueError("max_message_count must be 1 or greater.")
         entity = self._open()
-        if injected is not None:
-            raise injected
+        self._broker._raise_injected("peek")
         messages = entity._peek(self, start, min(max_message_count, PEEK_PAGE_MAX))
         self._cursor = messages[-1].sequence_number if messages else self._cursor
         return messages
@@ -1021,6 +1022,8 @@ class FakeReceiver:
     def _check_live(self) -> None:
         if self.closed:
             raise ValueError(_SHUTDOWN)
+        if self._broker.auth_failure:  # also on an open link: set mid-run, the next operation fails
+            raise ServiceBusAuthenticationError(message=_UNAUTHORIZED.format(self.entity_path))
         if self._session is not None and self._session._lapsed(self._broker.clock.now()):
             raise SessionLockLostError()
 
@@ -1326,7 +1329,7 @@ class FakeBroker:
 
     def __init__(self, clock: FakeClock | None = None) -> None:
         self.clock = clock or FakeClock()
-        self.auth_failure = False  # data-plane receivers fail to open with ServiceBusAuthenticationError
+        self.auth_failure = False  # data-plane receivers raise ServiceBusAuthenticationError (open or not)
         self.management_denied = False  # admin calls raise ClientAuthenticationError
         self.management_error: Exception | None = None  # admin calls raise this
         self.calls: list[tuple[str, str]] = []  # (data-plane operation, entity path)
@@ -1411,11 +1414,13 @@ class FakeBroker:
         return self._entities[path]
 
     def inject_receive_error(self, error: Exception, *, on_call: int) -> None:
-        """The ``on_call``-th ``receive_messages`` (1-based, across all receivers) raises ``error`` once."""
+        """The ``on_call``-th ``receive_messages`` that reaches the broker (1-based, across all receivers)
+        raises ``error`` once."""
         self._injections["receive"][on_call] = error
 
     def inject_peek_error(self, error: Exception, *, on_call: int) -> None:
-        """The ``on_call``-th ``peek_messages`` (1-based, across all receivers) raises ``error`` once."""
+        """The ``on_call``-th ``peek_messages`` that reaches the broker (1-based, across all receivers)
+        raises ``error`` once."""
         self._injections["peek"][on_call] = error
 
     def inject_body_error(self, sequence_number: int, *, times: int) -> None:
@@ -1426,9 +1431,13 @@ class FakeBroker:
         """Successive RECEIVE_AND_DELETE ``receive_deferred_messages`` calls raise these first."""
         self._commit_errors.extend(errors)
 
-    def _injected(self, kind: Literal["receive", "peek"]) -> Exception | None:
+    def _raise_injected(self, kind: Literal["receive", "peek"]) -> None:
+        """Count a call that reached the broker (client-side rejections and failed opens do not count,
+        so an injection is never lost) and raise the injection registered for its number."""
         self._call_numbers[kind] += 1
-        return self._injections[kind].pop(self._call_numbers[kind], None)
+        injected = self._injections[kind].pop(self._call_numbers[kind], None)
+        if injected is not None:
+            raise injected
 
     def _consume_body_error(self, sequence_number: int) -> bool:
         if self._body_errors[sequence_number] <= 0:

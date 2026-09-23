@@ -607,3 +607,69 @@ def test_management_surface(broker):
     with pytest.raises(ClientAuthenticationError):
         admin.get_topic("t1")
     assert ("get_queue", "q") in broker.admin_calls
+
+
+# --- fix round 1 ----------------------------------------------------------------------------------
+
+
+def test_dlq_view_does_not_depend_on_call_order(broker):
+    q = broker.add_queue("q", max_delivery_count=1)
+    seq = q.send(b"a")
+    with sas_client().get_queue_receiver("q", prefetch_count=1, keep_alive=0) as r:
+        r.receive_messages()
+    broker.clock.advance(61)  # the lapse dead-letters it; nothing has looked at the main queue since
+    with sas_client().get_queue_receiver("q", sub_queue=DLQ, prefetch_count=1, keep_alive=0) as r:
+        [m] = r.receive_messages()
+    assert m.sequence_number == seq and m.dead_letter_reason == "MaxDeliveryCountExceeded"
+
+
+def test_lock_lapses_at_exactly_lock_seconds(broker):
+    q = broker.add_queue("q", lock_seconds=60)
+    seq = q.send(b"a")
+    with sas_client().get_queue_receiver("q", prefetch_count=1, keep_alive=0) as r:
+        m = r.receive_messages()[0]
+        broker.clock.advance(60)  # the SDK: locked_until_utc <= utc_now() means lapsed
+        with pytest.raises(MessageLockLostError):
+            r.complete_message(m)
+        again = r.receive_messages()[0]
+    assert again.sequence_number == seq and again.delivery_count == 1
+
+
+def test_value_bodies_are_not_shared_between_deliveries(broker):
+    q = broker.add_queue("q")
+    q.send({"k": "v"}, body_type="VALUE")
+    with sas_client().get_queue_receiver("q", prefetch_count=1, keep_alive=0) as r:
+        first = r.peek_messages(1, sequence_number=1)[0]
+        first.body[b"k"] = b"changed"
+        assert r.peek_messages(1, sequence_number=1)[0].body == {b"k": b"v"}
+
+
+def test_auth_failure_hits_an_open_receiver(broker):
+    q = broker.add_queue("q")
+    q.send(b"a")
+    q.send(b"b")
+    with sas_client().get_queue_receiver("q", prefetch_count=1, keep_alive=0) as r:
+        m = r.receive_messages()[0]
+        broker.auth_failure = True
+        with pytest.raises(ServiceBusAuthenticationError):
+            r.receive_messages()
+        with pytest.raises(ServiceBusAuthenticationError):
+            r.complete_message(m)
+
+
+def test_injection_waits_for_a_call_that_reaches_the_broker(broker):
+    broker.add_queue("q").send(b"a")
+    broker.inject_receive_error(TypeError("boom"), on_call=1)
+    client = sas_client()
+    closed = client.get_queue_receiver("q", prefetch_count=1, keep_alive=0)
+    closed.close()
+    with pytest.raises(ValueError, match="shutdown"):  # rejected client-side: not counted
+        closed.receive_messages()
+    broker.auth_failure = True
+    receiver = client.get_queue_receiver("q", prefetch_count=1, keep_alive=0)
+    with pytest.raises(ServiceBusAuthenticationError):  # the open failed: not counted
+        receiver.receive_messages()
+    broker.auth_failure = False
+    with pytest.raises(TypeError, match="boom"):
+        receiver.receive_messages()
+    assert len(receiver.receive_messages()) == 1
