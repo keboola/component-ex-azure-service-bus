@@ -55,9 +55,10 @@ and the body as text, base64 or flattened JSON columns.
   write_always = true"; `src/Configuration/Table/Manifest.php` extends `BaseConfiguration`, which
   declares `write_always`, and the loader resolves the table configuration from the manifest plus
   the mapping].** The manifest is written with `write_always: false` and is **switched to `true`
-  immediately before the first destructive settle, in C1 and C3 only** — C1 just before the first
-  `complete_message`, C3 just before the first RECEIVE_AND_DELETE receive (the broker deletes on
-  delivery). It is never `true` in C2 (nothing is deleted before the next run's commit; a failed
+  at the first destructive settle, in C1 and C3 only** — C1 just before its first
+  `complete_message`, C3 as soon as a RECEIVE_AND_DELETE receive first **returns messages** (the
+  broker has deleted them by then; they are armed before anything is written, and a C3 run that
+  receives nothing never arms). It is never `true` in C2 (nothing is deleted before the next run's commit; a failed
   run's deferrals are recovered by the orphan scan) or in C4 (nothing is deleted). Without it, a
   C1/C3 run that fails after it has deleted messages would upload nothing and lose them; with it,
   the rows written so far still reach Storage — and a failed C2 / C4 run, or a C1 / C3 run that
@@ -99,7 +100,7 @@ and the body as text, base64 or flattened JSON columns.
 |---|---|---|---|---|
 | **C1 `complete`** (default) | PEEK_LOCK receive → write rows → `complete_message` per batch | right after the batch's rows are written locally | at-least-once for failures before a batch is settled; `write_always` is switched on just before the first complete, so the rows of already-settled batches are uploaded even if the run later fails | (a) a Storage import fails after the job (maintainer-accepted); (b) the job is terminated / cancelled / timed out; (c) a hard kill (OOM, SIGKILL) mid-write truncates the CSV so the import fails |
 | **C2 `defer_commit`** | PEEK_LOCK receive → write rows → `defer_message`; the deferred sequence numbers go to `out/state.json`; the **next** run deletes them by sequence number (RECEIVE_AND_DELETE deferred receive) before it receives anything | at the start of the next run, whose input state proves the previous import succeeded | **at-least-once end-to-end** (PK deduplicates re-extraction), within the limits in §6.4 | orphans: deferrals of a failed / lost-state run are recovered by the C2 orphan scan — best-effort on partitioned entities and sub-queues, impossible on session entities (run WARNING); exclusive-consumer requirement |
-| **C3 `receive_and_delete`** | RECEIVE_AND_DELETE receive → write rows | by the broker on delivery | **at-most-once**; `write_always` is switched on before the first receive | everything in C1 plus: a crash between receive and write loses that batch; the local receive buffer at close (drained best-effort) |
+| **C3 `receive_and_delete`** | RECEIVE_AND_DELETE receive → write rows | by the broker on delivery | **at-most-once**; `write_always` is switched on when the first receive returns messages | everything in C1 plus: a crash between receive and write loses that batch; the local receive buffer at close (drained best-effort) |
 | **C4 `peek`** | `peek_messages` pages, nothing locked or settled | never | non-destructive; a failed run is re-exported next run | messages removed by other consumers or TTL before the peek are never seen; the entity grows unless someone else consumes it |
 
 C5 (lock without settlement) is excluded (§4). Why C2 exists — the Kafka comparison
@@ -184,8 +185,9 @@ separate entity.
 
 - **Outbound AMQP 5671** from Keboola is verified on the GCP us-east4 stack (the writer's cf-dev jobs
   used the default transport) [live]; other stacks are **[inferred]** to allow it (§10).
-- **Test environment (CF):** dedicated `ex-*` entities in the CF test namespace (names and ids live in
-  the local, gitignored test-env note, not here): queues `ex-test-queue`, `ex-test-queue-session`
+- **Test environment (CF):** dedicated `ex-*` entities in the CF test namespace (the namespace name,
+  tenant and service-principal ids are not recorded in this repo; Phase 7 obtains SAS keys with `az`
+  and the service-principal secret from the writer's gitignored `secrets.json`): queues `ex-test-queue`, `ex-test-queue-session`
   (sessions), `ex-test-queue-large`, `ex-test-queue-partitioned`; topic `ex-test-topic` with
   subscriptions `ex-test-topic-sub` and `ex-test-topic-sub-session` (sessions); subscription
   `ex-test-sub` on the writer's test topic (writer → extractor round trip). The writer's own
@@ -317,7 +319,7 @@ failing (§6.9), and unused columns simply stay empty.
 | F3. VALUE / SEQUENCE → JSON (recursive bytes→str) | **In scope (automatic)** | by `body_type`. |
 | F4. Multi-section DATA → concatenated | **In scope (automatic)** | `b"".join(sections)`. |
 | F5. Charset from `content_type` | **In scope (automatic)** | `charset=` parameter; unknown charset → UTF-8. |
-| F6. JSON body flattening | **In scope** [decided] | `body_format = json_flatten`: nested dot-path columns, arrays stay JSON strings, **no raw `body` column** [decided], plus the reserved JSON column `body_unmapped` for keys not yet promoted to columns [gate-1 lead decision]; naming, promotion, drift and typing rules in §6.10. |
+| F6. JSON body flattening | **In scope** [decided] | `body_format = json_flatten`: nested dot-path columns, arrays stay JSON strings, **no raw `body` column** [decided], plus the reserved JSON column `body_unmapped` holding keys first seen in the current run — they become columns from the next run [gate lead decisions]; naming, drift and typing rules in §6.10. |
 | F7. Unreadable-body policy | **In scope** | `body.unreadable_body` = `dead_letter` (default) / `leave` / `fail`; also covers non-JSON bodies under F6 and oversize cells (§6.6). |
 | F8. Large bodies (Premium up to 100 MB) | **In scope** | memory bound = batch × body size (lower `advanced.batch_size` for large bodies — README guidance); a body whose output cell would exceed 16 MiB goes through the unreadable policy with reason `BodyTooLarge` (§6.6). |
 
@@ -549,12 +551,13 @@ exists at all.)
 3. Optional metadata pre-check + counts log (L1/L2) via the management client; any management
    failure → DEBUG log + heuristics (§6.7).
 4. Open the output table and write its manifest with `write_always: false` (§6.9) — before anything
-   is settled. C1 / C3 switch it to `true` just before their first destructive settle (§6.9).
+   is settled. C1 switches it to `true` just before its first complete, C3 when its first receive
+   returns messages (§6.9).
 5. **H5 — commit this config's stored pending set** (§6.3). Runs before any receive. A failure here
    fails the run with nothing extracted and the input state intact (next run retries).
 6. **C2 only — H3 orphan scan** (§6.4). **C1/C3 — foreign-deferral probe** (§6.4, detect-only).
 7. Receive loop (§6.5) with per-mode settlement.
-8. Close the output (materialise + manifest, also on failure — §6.9), write the new state (§6.8),
+8. Close the output (flush + close, also on failure — §6.9), write the new state (§6.8),
    log the run summary (§6.12).
 
 C4 runs 1–4, then the peek loop (§6.7) and 8. C4 never commits or deletes anything; a pending set
@@ -630,16 +633,22 @@ after H5, on the main thread:
    never scheduled) with no `DEFERRED` among them, or at the end of the entity.
    **K = max(100, 2 × (batch_size + prefetch_count + 1))** (carried item 2). Why this bound: a
    currently-locked message peeks exactly like a never-delivered one [live], so K must exceed the
-   largest cluster of locked messages a previous run can leave in front of its later deferrals. Each
-   interruption leaves at most one batch plus the local buffer locked (`batch_size + prefetch_count +
-   1`, link credit included), and the **no-progress guard** (§6.5) guarantees that between two
-   interruptions at least one batch completed — i.e. was deferred, which resets the consecutive
-   count. So no locked run exceeds `batch_size + prefetch_count + 1`; the factor 2 is margin.
-   Unreadable bodies do not add to the cluster: they are abandoned (unlocked) or left only after a
-   retry (§6.6). Invariant [inferred from in-order delivery on a non-partitioned entity with a
-   single consumer]: every deferral was made on a message delivered earlier, so K never-delivered
-   messages lie after every deferral. Residual edge [inferred]: a larger locked cluster makes the
-   scan stop early; the orphans behind it surface on a later run — delayed, not lost.
+   largest cluster of locked messages a previous run can leave in front of its later deferrals.
+   Each connection interruption leaves at most one batch plus the local buffer locked
+   (`batch_size + prefetch_count + 1`, link credit included). The no-progress guard (§6.5) counts
+   **written rows and unreadable dispositions** as progress. In C2 every written row is deferred,
+   which breaks a locked cluster, so whenever the progress between two interruptions includes a
+   written row, no locked cluster exceeds `batch_size + prefetch_count + 1` and the factor 2 is
+   margin. Of the dispositions, `dead_letter` removes the message (a gap, not a lock) and an
+   unreadable retry abandons it (unlocked at once), but **`leave`** — chosen by policy, or reached
+   after the retry budget is spent (§6.6) — keeps the message locked until its lock lapses, and a
+   locked message looks never-delivered. When the only progress between interruptions was `leave`
+   dispositions, or left messages sit next to an interrupted batch, a cluster can exceed the bound:
+   the scan may then stop early, and the orphans behind it surface on a later run once the locks
+   lapse (≤ the entity lock duration, 5 min max) — **delayed recovery, not loss**. Invariant
+   [inferred from in-order delivery on a non-partitioned entity with a single consumer]: every
+   deferral was made on a message delivered earlier, so K never-delivered messages lie after every
+   deferral.
 5. **Page cap: 20 pages (5,000 messages)** → WARNING "orphan scan incomplete" — never a silent pass.
    Steady-state cost: 1–2 peek calls.
 
@@ -681,8 +690,8 @@ another application's deferrals.
   and flushed; then each message is settled — C1 `complete_message`, C2 `defer_message` + add to the
   pending set (only after the call returned), C3 nothing (already deleted). Before settling, a
   message whose `locked_until_utc` is within 10 s is renewed from the main thread (D10). **`write_always`
-  switch (§6.9):** C1 arms it just before its first `complete_message`, C3 just before its first
-  receive call; C2 never.
+  switch (§6.9):** C1 arms it just before its first `complete_message`, C3 as soon as a receive call
+  (the stop drain included) first returns messages, before writing them; C2 never.
 - **Stop conditions (checked between batches):** empty receive (idle); `max_messages` reached;
   `max_duration_seconds` elapsed; **watermark** — every message of the batch has
   `enqueued_time_utc ≥ T0` (the batch is still processed; redelivered messages keep their original
@@ -730,10 +739,15 @@ another application's deferrals.
 
 | Case | C1 / C2 | C3 | C4 |
 |---|---|---|---|
-| **Body access / decode raises** (not text replacement — `errors='replace'` never fails) | 1st failure: `abandon_message`, remember (sequence number, connection generation), recycle the connection after the batch; the message redelivers at once on the new connection. 2nd failure on a **different** connection → policy: `dead_letter` → `dead_letter_message(reason="UnreadableBody", error_description=<exception class>)`; `leave` → not settled (the lock lapses; it redelivers later); `fail` → `UserException` after the rest of the batch is settled | the message is already deleted — the row cannot be written: WARNING with sequence number + message id (at-most-once); `fail` → `UserException` | 1st failure: recycle, then re-peek from the first unreadable message's sequence number, skipping sequence numbers already written in this run (no duplicate rows); 2nd: skipped with WARNING, cursor advances; `fail` → `UserException`, cursor stays |
-| **`NotJson`** — `json_flatten` and the body is not valid JSON in its charset (deterministic → no retry) | `dead_letter` (reason `NotJson`) / `leave` / `fail` | skipped + WARNING / `fail` | skipped + WARNING / `fail` |
-| **`BodyTooLarge`** — the encoded output cell would exceed 16 MiB (Storage cell limit [inferred: the Snowflake VARCHAR maximum; verified against a typed import in Phase 7]) | `dead_letter` (reason `BodyTooLarge`) / `leave` / `fail` | skipped + WARNING / `fail` | skipped + WARNING / `fail` |
+| **Body access / decode raises** (not text replacement — `errors='replace'` never fails) | 1st failure: `abandon_message`, remember (sequence number, connection generation), recycle the connection after the batch; the message redelivers at once on the new connection. 2nd failure on a **different** connection → policy: `dead_letter` → `dead_letter_message(reason="UnreadableBody", error_description=<exception class>)`; `leave` → not settled (the lock lapses; it redelivers later); `fail` → `UserException` after the rest of the batch is settled | the message is already deleted — the row cannot be written: WARNING with sequence number + message id (at-most-once); `fail` → the readable rest of the batch is written, then `UserException` | incremental fetch (plain entities): 1st failure → recycle, then re-peek from the first unreadable message's sequence number, skipping sequence numbers already written in this run (no duplicate rows); 2nd → skipped with WARNING and the cursor moves past it. Full fetch on partitioned or session entities: the 1st failure is final (skipped with WARNING) — cursor-mode and per-session peeks cannot resume at a sequence number, and a full fetch re-reads the message next run anyway. `fail` → the readable rest of the page is written, then `UserException` (state is not saved, so the cursor stays) |
+| **`NotJson`** — `json_flatten` and the body is not valid JSON in its charset (deterministic → no retry) | `dead_letter` (reason `NotJson`) / `leave` / `fail` (after the batch) | skipped + WARNING / `fail` (after the batch) | skipped + WARNING / `fail` (after the page) |
+| **`BodyTooLarge`** — the encoded output cell would exceed 16 MiB (Storage cell limit [inferred: the Snowflake VARCHAR maximum; verified against a typed import in Phase 7]) | `dead_letter` (reason `BodyTooLarge`) / `leave` / `fail` (after the batch) | skipped + WARNING / `fail` (after the batch) | skipped + WARNING / `fail` (after the page) |
 
+- **Write first, fail after (gate cycle 2):** the `fail` policy and the flatten column cap (§6.10)
+  never raise inside the per-message loop. The failure is recorded; the batch's readable rows are
+  written and settled first; only then does the run raise — the same pattern as the abort share.
+  In C1 / C2 the failing message itself is left unsettled (its lock lapses and it redelivers); in C3
+  it was already deleted.
 - **Sub-queue sources:** dead-lettering a DLQ message is rejected by the broker (silently on
   7.14.3 [live]) → on sub-queues `dead_letter` degrades to `leave` with a WARNING.
 - A message `leave`-d once that redelivers later in the same run (its lock lapsed) is left again
@@ -760,7 +774,10 @@ another application's deferrals.
   duration 60 s; max delivery count 10.
 - **`incremental_fetch`:** `peek_messages(250, sequence_number=cursor + 1)` until an empty page,
   `max_messages`, `max_duration_seconds`, or (with `stop_at_job_start`) the first non-`SCHEDULED`
-  message enqueued at or after T0 (not exported; `SCHEDULED` messages never stop the peek, §6.5). The cursor becomes the highest sequence number written. A partitioned
+  message enqueued at or after T0 (not exported; `SCHEDULED` messages never stop the peek, §6.5).
+  The cursor becomes the highest sequence number **processed** — written, skipped as unreadable
+  (§6.6) or skipped as expired — so a skipped last message is not re-peeked forever; messages
+  after a watermark / limit stop were not processed and are peeked again next run. A partitioned
   entity detected mid-run (heuristic) → `UserException` "use Full Fetch" (peek is non-destructive,
   so aborting is safe; the cursor stays).
 - **`full_fetch`:** plain entities peek from sequence 1 with explicit paging; partitioned entities use
@@ -795,7 +812,7 @@ another application's deferrals.
   ],
   "peek_cursor": {"entity_path": "orders", "last_sequence_number": 12345},
   "flatten_columns": [
-    {"path": ["order", "customer", "id"], "column": "body_order_customer_id"}
+    {"path_sha1": "ab92721575f7721ca4f4199f83f11a59f6bb9c88", "column": "body_order_customer_id"}
   ]
 }
 ```
@@ -808,9 +825,12 @@ another application's deferrals.
   user to reset state (no silent reinterpretation). Timestamps UTC.
 - Written once, at the end of the run, via `write_state_file`; it becomes durable only if the job
   succeeds (§2.1) — which is exactly the C2 commit marker.
-- **Budget:** the whole serialised state (pending set, cursor, flatten registry — at most ~1,000
-  entries — and carried keys) is kept ≤ 256 KiB; C2 measures the projected output state before each
-  batch and stops receiving at the budget (§6.5);
+- **Budget:** the whole serialised state (pending set, cursor, flatten registry and carried keys)
+  is kept ≤ 256 KiB; C2 measures the projected output state before each batch and stops receiving
+  at the budget (§6.5). The registry is capped by construction — ≤ 1,000 entries of
+  `{path_sha1 (40 hex), column (≤ 64 chars)}`, ≤ 133 bytes each, so ≤ ~130 KiB — which always
+  leaves ≥ ~126 KiB for the pending set: a large registry can never stop a C2 run before its first
+  batch;
   ranges keep normal pending sets tiny (a non-partitioned single-consumer entity defers contiguous
   runs).
 
@@ -841,7 +861,7 @@ another application's deferrals.
   `amqp_content_encoding`, `amqp_creation_time_utc` TIMESTAMP, `amqp_absolute_expiry_time_utc`
   TIMESTAMP, `amqp_group_sequence` INTEGER, `amqp_reply_to_group_id`, `source_entity`,
   `settlement_mode`, `extracted_at_utc` TIMESTAMP, then **`body`** (text / base64 modes) **or** the
-  materialised flattened `body_*` columns followed by `body_unmapped` (flatten mode, §6.10). Unlisted types are STRING. Types are native only for
+  input registry's flattened `body_*` columns followed by `body_unmapped` (flatten mode, §6.10). Unlisted types are STRING. Types are native only for
   broker-assigned values whose Python types were observed [live]; producer-controlled content (body,
   flattened keys, property maps) is STRING, per the native-types rule for unverified types.
 - **Value formats:** timestamps `YYYY-MM-DD HH:MM:SS.ffffff` in UTC (verified against a typed
@@ -853,24 +873,30 @@ another application's deferrals.
   flattened into scalar columns (E24).
 - **Durability on failure (`write_always`, lead decision gate 1):** the manifest is first written
   with `write_always: false`; C1 rewrites it with `true` immediately before its first
-  `complete_message`, C3 immediately before its first RECEIVE_AND_DELETE receive; C2 and C4 never
-  set it. The H5 commit does not switch it on (it deletes messages whose rows the previous,
-  successful job already imported), nor do dead-lettering or abandoning (nothing is lost). In text /
-  base64 modes rows stream straight into the output CSV; in flatten mode they stage in `/tmp`
-  (§6.10) and the output file + manifest are materialised in a `finally` block — also when the run
-  is failing; a failure inside that materialisation is logged and never masks the original error.
+  `complete_message`, C3 as soon as a RECEIVE_AND_DELETE receive first returns messages (before
+  writing them); C2 and C4 never set it. The H5 commit does not switch it on (it deletes messages whose rows the previous,
+  successful job already imported), nor do dead-lettering or abandoning (nothing is lost). In every
+  body format rows stream straight into the output CSV (the flatten column set is fixed when the run
+  starts, §6.10); the file is flushed per batch and closed in a `finally` block, and a failure while
+  closing is logged and never masks the original error.
+- **Legacy-queue fallback:** keboola-component 1.11.0 omits `write_always` from the manifest when
+  `is_legacy_queue` is true (a project without the `queuev2` feature) [source: `interface.py`]. The
+  component's manifest writer therefore re-opens the manifest the library wrote and sets
+  `write_always` explicitly whenever `is_legacy_queue` is true, so the switch is never silently
+  dropped; the Phase-7 manifest check stays.
 
   | Mode | `write_always` | Job fails before anything was deleted | Job fails after ≥ 1 deleted batch — `incremental_load` | Job fails after ≥ 1 deleted batch — `full_load` |
   |---|---|---|---|---|
-  | C1 `complete` | `false` → `true` just before the first complete | nothing uploaded, table unchanged; locked messages redeliver | rows written so far are upserted (flatten: keys not yet promoted land in `body_unmapped`, §6.10) | the table is replaced by the rows written so far — this run's delta, the only copy of the deleted messages |
+  | C1 `complete` | `false` → `true` just before the first complete | nothing uploaded, table unchanged; locked messages redeliver | rows written so far are upserted (flatten: keys first seen in this run are in `body_unmapped`, §6.10) | the table is replaced by the rows written so far — this run's delta, the only copy of the deleted messages |
   | C2 `defer_commit` | never | nothing uploaded, table unchanged | nothing uploaded, table unchanged; the deferrals become orphans recovered by the next C2 run (not on sessions, §6.4) | same — a failed run never truncates a full-load table |
-  | C3 `receive_and_delete` | `false` → `true` just before the first receive | nothing uploaded, table unchanged | rows written so far are upserted | the table is replaced by the rows written so far |
+  | C3 `receive_and_delete` | `false` → `true` when the first receive returns messages | nothing uploaded, table unchanged (no receive has returned messages, so it was never armed) | rows written so far are upserted | the table is replaced by the rows written so far |
   | C4 `peek` | never | nothing uploaded, table unchanged; the next run re-peeks from the saved cursor | n/a (nothing is deleted) | n/a |
 
-  A successful job always uploads the table (`write_always` is irrelevant then). Because state is
-  persisted all-or-nothing per job (§2.1), **another row failing in the same job** puts this row on
-  the same path: its `write_always` table is uploaded while its output state is discarded — which
-  is why the flatten column promotion rule in §6.10 is keyed to the `write_always` switch.
+  A successful job always uploads the table (`write_always` is irrelevant then). Separately, and
+  **independently of `write_always`**: output imports are queued per row and state is saved
+  all-or-nothing per job (§2.1), so a row that succeeds while **another row of the same job fails**
+  can have its table imported while its output state is discarded [lead reading of the source,
+  §2.1] — the reason for the flatten column rule in §6.10, which holds in every mode.
 - **Empty run (G5):** header-only CSV + manifest; succeeds. With `full_load` this empties the table
   (mirror / delta semantics, §2.4).
 - **Rows sharing one table:** fixed-schema rows may share a table name (use the composite PK when
@@ -898,38 +924,44 @@ another application's deferrals.
     is the logical path; Storage forbids `.` in column names, so it lands as
     `body_order_customer_id`.
   - **Collisions** (two distinct paths → one name, e.g. key `"a.b"` vs nested `a` → `b`): the path
-    registered first keeps the name; later ones get `_2`, `_3`, … The **registry** (`path` as a key
-    list — lossless — → `column`) is persisted in state, so names are stable across runs.
+    registered first keeps the name; later ones get `_2`, `_3`, … The **registry** (SHA-1 of the
+    path's key list → column name) is persisted in state, so names are stable across runs. Storing
+    the hash instead of the path bounds an entry to ≤ 133 bytes — ≤ ~130 KiB at the 1,000-column
+    cap (§6.8).
   - **Why the column set must track saved state:** Storage adds new columns on import [docs] but
     rejects an import that misses an existing table column ("Some columns are missing in the CSV
     file" [docs]). So a table must never gain a column that the registry of the *saved* state does
-    not contain — otherwise the next run (starting from that state) would omit it and every later
-    import would fail, while C1 / C3 keep deleting messages.
-  - **Reserved column `body_unmapped`** (STRING, JSON; lead decision gate 1): always present in flatten
-    mode, last in the column order, reserved in the registry (a JSON key `unmapped` becomes
-    `body_unmapped_2`). It holds, per row, a compact JSON object `{"<dot.path>": "<value>", …}` of the
-    row's keys that are **not** materialised as columns in this run; empty when there are none.
-  - **Promotion rule (which keys are columns in a run):** the registry *loaded from the input state*
-    is always materialised (every one of its columns is written in every run, empty when absent). A
-    key first seen in this run is registered (name assigned, cap checked) and saved in the output
-    state's registry, and it becomes a real column **in this same run only if the run succeeds and
-    the table was never switched to `write_always`** (C2, C4, or a C1 / C3 run that deleted nothing).
-    Otherwise — the run is failing, **or** the table is armed for `write_always` (C1 / C3 after the
-    first settle, where another row's failure could upload this table while discarding this row's
-    state, §6.9) — its values go into `body_unmapped` and the key becomes a column from the **next**
-    run, whose input state proves the registry was saved. Invariant: a table that a failed job can
-    upload never contains a column outside the registry of the state that job started from.
-  - **Resulting behaviour (README "known behaviour"):** the first-ever failed run puts every key in
-    `body_unmapped`; a failed run with new keys adds no columns and fills `body_unmapped`; in C2 / C4
-    the next successful run adds the columns; in C1 / C3 a key's first successful run still lands in
-    `body_unmapped` and the column appears from the following run. Values already written to
-    `body_unmapped` stay there (rows are not rewritten).
-  - **Cap:** 1,000 flattened columns per row (input registry + new keys); a batch that would exceed it
-    is abandoned (not written, not settled) and the run fails with a `UserException` suggesting
-    `text`.
-  - **Two-pass write:** flattened rows are staged as JSON lines in `/tmp` holding their paths and
-    values; the output CSV (header = fixed columns + the materialised registry columns +
-    `body_unmapped`) is built at close — including on failure (§6.9) — after the promotion decision.
+    not contain — otherwise the next run (starting from that state) omits it and every later import
+    fails, while C1 / C3 keep deleting messages. A run cannot know whether its state will be saved:
+    its own job may fail after a `write_always` upload (§6.9), and — independently of
+    `write_always` — another row of the same job may fail after this row's import was queued (§2.1).
+  - **Reserved column `body_unmapped`** (STRING, JSON): always present in flatten mode, last in the
+    column order, reserved in the registry (a JSON key `unmapped` becomes `body_unmapped_2`). Per
+    row it holds a compact JSON object `{"<column name>": "<value>", …}` keyed by the **registry
+    column name** each key has been assigned — so `"a.b"` and nested `a → b` stay distinct as
+    `body_a_b` / `body_a_b_2` — for the row's keys that are not columns in this run; empty when there
+    are none.
+  - **Column rule (lead decision, gate cycle 2) — identical in every mode:** a run materialises
+    **exactly** the columns of the registry loaded from its **input** state, plus `body_unmapped`;
+    every such column is written in every run (empty when absent). A key first seen in this run is
+    registered (name assigned, cap checked), its values go to `body_unmapped`, and it is saved in the
+    output state's registry; it becomes a real column from the **next** run. Invariant: no job adds a
+    column that is outside the registry it started from, and saved registries only grow, so the
+    latest saved registry always covers every column of the table — whatever the job outcome and
+    whatever the other rows do.
+  - **Resulting behaviour (README "known behaviour"):** every key lands in `body_unmapped` in the run
+    that first sees it and is a column from the next run (a one-run column lag in every mode); the
+    first-ever run, and the first run after a state reset, put every key in `body_unmapped`; keys
+    discovered by a failed run are not saved, so they are in `body_unmapped` for one more run;
+    values already written to `body_unmapped` stay there (rows are never rewritten).
+  - **Cap:** 1,000 registered columns per row. With the registry full, a newly seen key is not
+    registered; its value still goes to `body_unmapped`, keyed by the name `column_name_for` would
+    give it (suffixed `_2`, `_3`, … within the row if needed). The batch is written and settled like
+    any other, and only then does the run fail with a `UserException` suggesting `text` (write first,
+    fail after — §6.6), so nothing is lost in C3.
+  - **Streaming write:** the column set is fixed when the run starts (fixed columns + the input
+    registry's columns + `body_unmapped`), so flattened rows stream straight into the output CSV like
+    the text format — no staging file, no rewrite at close.
   - **Known limits (tooltip + README):** resetting state, or sharing the output table between
     flatten rows, can make an import miss previously seen columns and fail — in `complete` /
     `receive_and_delete` modes that failed import loses the run's messages, so drop the table when
@@ -1003,7 +1035,7 @@ state):
 | `src/state.py` | `ExtractorState` Pydantic model (§6.8): load / defaults / version check, merge rule, range encoding, budget measurement, `to_dict()`. |
 | `src/body.py` | `decode_body` (DATA / VALUE / SEQUENCE, charset, text / base64), `flatten_json`, `FlattenRegistry` (naming, collisions, cap), errors `BodyDecodeError` / `NotJsonError` / `BodyTooLargeError`. |
 | `src/columns.py` | fixed column catalogue (name → base type), message → metadata row mapping (E1–E25), value formatting (timestamps, JSON, bytes), `previewMessages` markdown rendering. |
-| `src/output.py` | `OutputTable` — streaming CSV (text / base64) or `/tmp` JSON-lines staging + materialise (flatten, with the §6.10 promotion rule and `body_unmapped`); manifest (schema, PK, incremental, `has_header`, `write_always` false until `arm_write_always()`) via a callback into `ComponentBase.write_manifest`; context manager that materialises on exit, including on exceptions (it knows whether the run is failing). |
+| `src/output.py` | `OutputTable` — one streaming CSV writer for every body format (flatten: fixed columns + input-registry columns + `body_unmapped`, §6.10); manifest (schema, PK, incremental, `has_header`, `write_always` false until `arm_write_always()`, legacy-queue fallback) via a callback into `ComponentBase.write_manifest`; context manager that flushes and closes on exit, including on exceptions. |
 | `src/stats.py` | `RunStats` counters, effective-settings line, summary, WARNING aggregation. |
 | `src/component.py` | `Component(ComponentBase)`: `__init__` parses `AuthConfiguration` and builds the `ServiceBusConnector` (lazy — no network in `__init__`); `run()` ≤ 30 lines delegating to `_load_run_config`, `_guard_dev_branch`, `_open_output`, `_commit_pending`, `_reconcile_deferrals`, `_consume`, `_peek`, `_finish`; `@sync_action`s (§5.4); the scaffold's `__main__` guard (`UserException` → exit 1 with redacted message, else exit 2). |
 
@@ -1015,7 +1047,7 @@ state):
   `pydantic`; remove the scaffold's unused `keboola-http-client` and `keboola-utils` unless the
   implementation uses `keboola.utils.header_normalizer` for §6.10 character normalisation (allowed if
   it matches the rules exactly). No `websocket-client` (K2 excluded).
-- Scratch files only under `/tmp` (flatten staging); nothing but the output table is written under
+- No scratch files at all (flatten streams too); nothing but the output table is written under
   `/data/out/tables/`.
 
 ## 8. Testing — enumerate the cases up front
@@ -1037,7 +1069,7 @@ no tenant ids in cassettes. Real AMQP behaviour is proven live in Phase 7.
 
 **Files:** `tests/fakes/broker.py` (the double) + `tests/conftest.py`; `tests/unit/test_*.py`;
 `tests/functional/` = `conftest.py` (datadir harness), `test_sync_actions.py` (cases 01–16),
-`test_runs.py` (20–45), `test_bodies_and_robustness.py` (46–67), `test_sanitisation.py`, `expected/`.
+`test_runs.py` (20–45), `test_bodies_and_robustness.py` (46–69), `test_sanitisation.py`, `expected/`.
 
 **Fixtures:** `tests/setup/configs.json` (wrapped format, dummy credentials only; real values only in
 the gitignored `secrets.json`); broker seeds are built per test via the fixture API; one golden
@@ -1093,8 +1125,8 @@ only dummies may appear, and surfaced errors must be redacted.
 | `46_run_body_base64` | run | F2 |
 | `47_run_body_value_sequence` | run | F3 |
 | `48_run_body_charset_multisection` | run | F4, F5 |
-| `49_run_flatten_json` | run | F6 columns, arrays as JSON, no `body`, registry in state, collisions |
-| `50_run_flatten_new_keys_second_run` | two-run | drift: old columns kept, new appended |
+| `49_run_flatten_json` | two-run (C1) | run 1: no `body` column, no `body_*` key columns yet, `body_unmapped` keyed by registry column names (`body_a_b` vs `body_a_b_2` for `"a.b"` / nested `a → b`), arrays as JSON, registry in state; run 2 (same body shape): those keys are real columns, `body_unmapped` empty |
+| `50_run_flatten_new_keys_second_run` | three-run (C2) | run 1 `{"x":1}`, run 2 `{"y":2}`, run 3 `{"y":3}`: run 2 header has `body_x` (empty) but not `body_y`, `body_unmapped` = `{"body_y":"2"}`; run 3 header has `body_x` and `body_y` |
 | `51_run_flatten_not_json` | run | `NotJson` dead-letter |
 | `52_run_unreadable_body_two_connections` | run | C6: abandon + recycle, dead-letter `UnreadableBody` on 2nd failure |
 | `53_run_unreadable_on_dlq_degrades` | run | dead-letter → leave on sub-queue + WARNING |
@@ -1109,22 +1141,26 @@ only dummies may appear, and surfaced errors must be redacted.
 | `62_run_dev_branch_override` | run | override runs |
 | `63_run_dev_branch_peek` | run | C4 runs in a branch without the override |
 | `64_run_missing_creds` | run fail | auth validation |
-| `65_run_failure_write_always_per_mode` | run fail | the §6.9 table: C1 / C3 failing after one settled batch leave the CSV + a `write_always: true` manifest; C1 failing before the first complete, C2 and C4 failing mid-run leave `write_always: false` |
-| `66_run_flatten_failed_run_new_keys` | two-run (C2) | run 1 fails after writing rows with new keys → materialised CSV has no new columns and `body_unmapped` filled, no state; run 2 succeeds → the columns are added, `body_unmapped` empty, registry saved |
-| `67_run_flatten_c1_promotion_lag` | three-run (C1) | run 1 fails (armed) → `body_unmapped` filled; run 2 succeeds (armed) → still `body_unmapped`, registry saved with the keys; run 3 → the keys are columns |
+| `65_run_failure_write_always_per_mode` | run fail | the §6.9 table: C1 / C3 failing after one settled batch leave the CSV + a `write_always: true` manifest; C1 failing before the first complete, C3 failing before any receive returned messages, C2 failing mid-run and C4 failing mid-run (peek-error injection) leave `write_always: false` |
+| `66_run_flatten_failed_run_new_keys` | three-run (C2) | run 1 fails after writing rows with key `a` → CSV has no `body_a`, `body_unmapped` filled, no state; run 2 (from run 1's input state) succeeds → still no `body_a`, `body_unmapped` filled, registry saved; run 3 → `body_a` is a column |
+| `67_run_flatten_cross_row_state_discard` | two-run (C4) | simulates another row failing: run 1 succeeds with new keys (header has no new columns); run 2 starts from run 1's **input** state (as if the job's state was discarded) → its header equals run 1's, so the next import can never miss a column |
+| `68_run_unreadable_fail_writes_rest_first` | run fail (C3) | policy `fail`, one unreadable body in a batch of 3 → the 2 readable rows are in the CSV (manifest `write_always: true`), then exit 1 |
+| `69_run_flatten_cap_writes_rest_first` | run fail (C3) | registry cap reached mid-batch → the whole batch is written (over-cap key in `body_unmapped`), then exit 1 |
 
 Plus **unit tests** per module (configuration validators; redaction, the log `RedactingFilter` and
 `configure_logging` levels (J7); entity paths, table names and the `EntityPath` `ValueError`
 mapping; the L1 counts log line; range encoding, state merge and whole-state budget; commit
 chunking / bisection / retry; K computation and scan skip rules; body decoding matrix; flatten
-naming / collisions / cap / promotion / `body_unmapped`; column mapping and formats; manifest
+naming / collisions / hashed registry / cap / input-registry column rule / `body_unmapped`; column mapping and formats; manifest
 fields incl. legacy vs authoritative and the `write_always` switch; unreadable retry budget and
 progress accounting; session lock renewal; peek re-peek dedupe; `SCHEDULED` watermark exclusion).
 
 ## 9. Deployment & validation (cf-dev, Phase 7)
 
-Strategy only — no secrets or concrete namespace / tenant / SP identifiers here (they stay in the
-local test-env note).
+Strategy only — no secrets or concrete namespace / tenant / SP identifiers here. Phase 7 obtains SAS
+connection strings with `az servicebus namespace authorization-rule keys list` and the
+service-principal secret from the writer's gitignored `secrets.json`, and stores them only as
+encrypted `#` values in the cf-dev configs.
 
 - **Image:** CI builds the `initial-implementation` branch; use the **newest** branch build tag and
   set it as **`runtime.tag` on each cf-dev config** (via kbagent) — never promote the default tag.
@@ -1177,8 +1213,8 @@ No blockers. Ranked risks:
    read, not live-injected); the terminated-job case uploads nothing. The manifest is rewritten when
    the switch flips; the platform reads whatever manifest exists when the container exits.
    keboola-component 1.11.0 drops `write_always` from the manifest on the legacy job queue (a
-   project without the `queuev2` feature) [source: `interface.py` `is_legacy_queue`]; current
-   projects run Queue v2 [inferred] — the Phase-7 manifest check confirms it on cf-dev.
+   project without the `queuev2` feature) [source: `interface.py` `is_legacy_queue`]; the component
+   re-writes the key itself in that case (§6.9 fallback), and the Phase-7 manifest check stays.
 5. **[inferred]** a peeked `SCHEDULED` message's `enqueued_time_utc` may be its future scheduled
    time — hence the watermark ignores `SCHEDULED` messages (Phase-7 probe).
 6. **[inferred]** `scheduled_enqueue_time_utc` persists after activation (H3 skip rule) — Phase-7
@@ -1240,7 +1276,7 @@ this spec against it. Every `corrected:` item is folded into the sections cited.
   plaintext in the container (§2.2).
 - `[default-bucket.md]` → correct — `defaultBucket: true`, no manifest `destination` (§2.2, §6.9).
 - `[output-mapping.md]` → correct — `write_always` switched on in C1 / C3 before the first
-  destructive settle, never in C2 / C4 (§6.9, gate-1 lead decision); scratch only in `/tmp`, nothing
+  destructive settle, never in C2 / C4 (§6.9, gate lead decisions); no scratch files at all, nothing
   but the output table under `/data/out/tables/`; incremental + PK = upsert; no sliced tables
   (§2.1, §6.9, §6.10, §7).
 - `[exit-codes.md]` → correct — `UserException` → exit 1, unexpected → exit 2, `__main__` guard
@@ -1290,7 +1326,7 @@ The maintainer delegated approval to the Component Factory lead, who approved th
 | 5 | Commit byte cap 16 MiB per deferred-receive call | §6.3 |
 | 6 | Flattening: `body_` prefix, Storage-safe normalisation (ASCII fold, `[A-Za-z0-9_]`, ≤ 64 chars with hash), `_2`/`_3` collision suffixes with a path→column registry in row state, monotonic column set, all flattened columns STRING, arrays as JSON, top-level non-object → `body_value`, 1,000-column cap; documented state-reset / shared-table limit, defer-commit recommended | §6.10 |
 | 7 | Entity dropdowns for SP (Data Receiver) and Manage SAS; a Listen-only SAS gets an empty list and types the name | §5.4, §5.6 |
-| N1 | `write_always` in the manifest, manifest before the first settle, flatten materialised in `finally` (the switch rule was refined by G1 below) | §2.1, §6.9 |
+| N1 | `write_always` in the manifest, manifest before the first settle (the switch rule was refined by G1 below; flatten now streams like text, cycle 2) | §2.1, §6.9 |
 | N2 | C4 `incremental_fetch` refused on partitioned, session and sub-queue entities (`full_fetch` allowed) | §2.4, §6.7 |
 | N3 | D4 watermark on partitioned entities is approximate → WARNING, not a refusal | §6.5 |
 | N4 | `application_properties` / `message_annotations` stay JSON; AMQP header / properties extras become scalar `amqp_*` columns; `to` → `to_address` | §4-E, §6.9 |
@@ -1306,16 +1342,21 @@ differ):**
 
 | # | Decision | Where |
 |---|---|---|
-| G1 | `write_always` starts `false`; C1 switches it on just before the first complete, C3 just before the first receive; never in C2 / C4; per-mode × load-type table | §2.1, §6.1, §6.9 |
-| G2 | Flatten mode carries the reserved JSON column `body_unmapped`; a run materialises the input-state registry columns + `body_unmapped`; new keys become columns only in a succeeding run, otherwise their values go to `body_unmapped` | §6.10 |
+| G1 | `write_always` starts `false`; C1 switches it on just before the first complete, C3 when its first receive returns messages (cycle-2 refinement); never in C2 / C4; per-mode × load-type table | §2.1, §6.1, §6.9 |
+| G2 | Flatten mode carries the reserved JSON column `body_unmapped`; a run materialises the input-state registry columns + `body_unmapped` — superseded in detail by G4 | §6.10 |
 | G3 | Unreadable-body retries have their own recycle budget; dispositions count as progress; the abort share is reachable before any cap | §6.5, §6.6 |
+| G4 (cycle 2) | In **every** mode a run writes exactly the input-state registry columns + `body_unmapped`; new keys always go to `body_unmapped` in the run that discovers them and are columns from the next run (the cross-row state discard is independent of `write_always`) | §6.9, §6.10 |
+| G5 (cycle 2) | `fail` policy and the flatten cap: record, write and settle the readable rest of the batch, then raise | §6.6, §6.10 |
 
 **Decisions the author made while applying them (flagged to the lead):**
-- G2 promotion is also deferred by one run on tables armed for `write_always` (C1 / C3 after the
-  first settle), because another row failing in the same job uploads such a table while discarding
-  this row's state — a case the component cannot detect. Result: in C2 / C4 the next successful run
-  adds the columns; in C1 / C3 they appear one successful run later (case 67).
-- `body_unmapped` holds `{"<dot.path>": "<value>"}` with the same string renderings as the columns.
+- (Cycle 1, superseded by G4) promotion deferred only on `write_always` tables.
+- `body_unmapped` is keyed by the registry column name (cycle 2; it was the dot-path, which let
+  `"a.b"` collide with nested `a → b`), with the same string renderings as the columns.
+- Cycle 2: the registry stores `path_sha1 → column` (bounded ≤ ~130 KiB at the cap) instead of the
+  path; flatten rows stream like text rows (the column set is fixed at run start); C3 arms
+  `write_always` at the first receive that returns messages; the C4 cursor is the highest processed
+  sequence number; C4 full fetch on partitioned / session entities does not retry an unreadable body
+  (the next full fetch re-reads it); the legacy-queue `write_always` fallback.
 - Unreadable retry budget = 50 recycles per run; when exhausted, first failures take the final
   disposition directly.
 - C4 re-peek after an unreadable retry resumes at the first unreadable sequence number and skips

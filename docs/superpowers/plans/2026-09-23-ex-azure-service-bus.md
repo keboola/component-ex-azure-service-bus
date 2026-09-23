@@ -20,8 +20,9 @@ Every task's requirements implicitly include these (values from the spec):
 - **Commit client:** `retry_total=0` on a dedicated `ServiceBusClient` (never as a `get_*_receiver` kwarg — `TypeError` on 7.14.3).
 - **Secrets:** `#connection_string`, `#client_secret` (`Field(alias="#…")`). Redact `SharedAccessKey=…`, `sig=…` and the literal secret values in every surfaced message and log line. Never log message bodies (sequence number + message id only).
 - **Config rows:** single merged `config.json`; rows sequential; state row-scoped; hidden `destructive_in_branch` (model only).
-- **Output:** `/data/out/tables/<table>.csv` **with a header row**; manifest `has_header=True`, native-type `schema`, `primary_key`, `incremental` from `load_type`, no `destination`; manifest written **before the first settle** with **`write_always=False`**, switched to `True` by `OutputTable.arm_write_always()` **immediately before the first destructive settle — C1 before its first `complete_message`, C3 before its first receive; never in C2 or C4** (spec §6.9 table); flatten staging only under `/tmp`.
-- **Flatten (spec §6.10):** reserved JSON column `body_unmapped` always present; a run materialises the **input-state** registry columns + `body_unmapped`; a new key becomes a column in the same run only if the run succeeds **and** the table was never armed for `write_always`; otherwise its values go to `body_unmapped` and the key (saved in the output registry) is a column from the next run.
+- **Output:** `/data/out/tables/<table>.csv` **with a header row**; manifest `has_header=True`, native-type `schema`, `primary_key`, `incremental` from `load_type`, no `destination`; manifest written **before the first settle** with **`write_always=False`**, switched to `True` by `OutputTable.arm_write_always()` **at the first destructive settle — C1 just before its first `complete_message`, C3 as soon as a receive first returns messages; never in C2 or C4** (spec §6.9 table); if `is_legacy_queue` the component re-sets `write_always` in the written manifest (1.11.0 drops it there); every body format streams into the CSV — no scratch files.
+- **Flatten (spec §6.10, lead decision gate cycle 2):** in **every** mode a run writes exactly the **input-state** registry columns + the reserved JSON column `body_unmapped`; a key first seen in a run always goes to `body_unmapped` (keyed by its registry column name), is saved in the output registry (`path_sha1 → column`) and is a real column from the next run.
+- **Write first, fail after:** the `fail` unreadable policy, the flatten cap and the abort share record the failure, let the batch's readable rows be written and settled, and only then raise.
 - **State:** `ExtractorState` version 1, written once at the end, merge rule (§6.8), budget 256 KiB.
 - **Constants (§6):** K = `max(100, 2 * (batch_size + prefetch_count + 1))`; orphan page 250, page cap 20; commit ≤ 250 seqs and ≤ 16 MiB per call; transient commit retries 3 with 2/4/8 s backoff; recoveries 5 per run + no-progress guard; lock renew margin 10 s; unreadable abort share > 10 % and ≥ 10; flatten cap 1,000 columns, column name ≤ 64 chars; body cell limit 16 MiB; orphan guard `delivery_count >= max_delivery_count - 1` (9 when unknown); unreadable-body retry budget `MAX_UNREADABLE_RECYCLES = 50` per run (separate from the 5 connection recoveries); `SESSION_ACCEPT_WAIT_SECONDS = 5` for every session receiver outside the destructive receive loop.
 - **Errors:** user-fixable → `UserException` (exit 1); unexpected → exit 2. Keep the scaffold `__main__` guard. `ValueError` is mapped to a `UserException` only at its two known sources — the connection-string parse (`ServiceBusConnector`) and the `EntityPath` mismatch (`EntityRef.open_receiver`); anywhere else it is a bug (exit 2).
@@ -40,7 +41,7 @@ Every task's requirements implicitly include these (values from the spec):
 | `src/state.py` | `ExtractorState` + range encoding + `PendingSetBuilder` |
 | `src/body.py` | body decoding, JSON flattening, `FlattenRegistry` |
 | `src/columns.py` | fixed column catalogue, message → metadata row, value formats, preview rendering |
-| `src/output.py` | `OutputTable` (streaming CSV or `/tmp` staging), manifest |
+| `src/output.py` | `OutputTable` (streaming CSV for every body format), manifest |
 | `src/stats.py` | `RunStats` |
 | `src/settlement.py` | settlers, `UnreadableHandler`, `BatchProcessor` |
 | `src/commit.py` | `PendingCommitter`, `OrphanScanner`, `ForeignDeferralProbe` |
@@ -50,7 +51,7 @@ Every task's requirements implicitly include these (values from the spec):
 | `tests/fakes/broker.py` | `FakeBroker` SDK double (data plane + management) |
 | `tests/conftest.py` | `broker` fixture installing the fakes |
 | `tests/unit/test_*.py` | unit tests per module |
-| `tests/functional/` | datadir suite: `conftest.py` (harness), `test_sync_actions.py` (cases 01–16), `test_runs.py` (20–45), `test_bodies_and_robustness.py` (46–67), `test_sanitisation.py`, `expected/20_run_c1_queue/` |
+| `tests/functional/` | datadir suite: `conftest.py` (harness), `test_sync_actions.py` (cases 01–16), `test_runs.py` (20–45), `test_bodies_and_robustness.py` (46–69), `test_sanitisation.py`, `expected/20_run_c1_queue/` |
 | `tests/setup/configs.json` | wrapped-format functional configs (dummy credentials) |
 
 ---
@@ -239,7 +240,7 @@ def test_bad_enum_value_is_user_exception():
   2. `_apply_advanced_gate` — if not `advanced_options`: `self.advanced = AdvancedConfig()`.
   3. `_refuse_unsafe` — `RECEIVE_AND_DELETE` and `advanced.prefetch_count > 1` → `ValueError("receive_and_delete requires prefetch_count 1: buffered messages are already deleted on the broker.")`; `PEEK` + `INCREMENTAL_FETCH` + (`session_enabled` or `sub_queue is not NONE`) → `ValueError("peek with incremental_fetch is not supported on session entities or sub-queues; use full_fetch.")`.
   4. `_validate_table_name` — non-empty `destination.table_name` must match `^[A-Za-z0-9](?:[A-Za-z0-9_-]*[A-Za-z0-9])?$`, else `ValueError("`destination.table_name` may contain only letters, digits, '-' and '_' and must not start or end with '-' or '_'.")`.
-  The `ValidationError` → `UserException` wrapper lives in `AuthConfiguration.__init__` (inherited): `loc = ".".join(str(p) for p in err["loc"]) or "configuration"`, message `f"Validation Error: {', '.join(f'{loc}: {msg}')}"`, `raise UserException(...) from e`.
+  The `ValidationError` → `UserException` wrapper lives in `AuthConfiguration.__init__` (inherited): `loc = ".".join(str(p) for p in err["loc"]) or "configuration"`, message `"Validation Error: " + ", ".join(f"{loc}: {err['msg']}" for loc, err in located)` where `located` is the list of `(loc, err)` pairs over `e.errors()`, then `raise UserException(message) from e`.
 - [ ] **Step 4:** Tests PASS; `uv run ruff check src tests` clean.
 - [ ] **Step 5:** Commit: `feat: pydantic configuration model (auth root, source/limits/body/destination rows, hidden branch override)`.
 
@@ -463,6 +464,7 @@ def test_configure_logging_levels_and_filter():
   - flags: `auth_failure: bool` (data-plane ops raise `ServiceBusAuthenticationError`), `management_denied: bool` (admin ops raise `ClientAuthenticationError`), `management_error: Exception | None`
   - `inject_receive_error(error: Exception, *, on_call: int) -> None` (the N-th `receive_messages`, 1-based, across receivers, raises once)
   - `inject_body_error(sequence_number: int, *, times: int) -> None` (`.body` raises `TypeError("injected decode failure")` that many times)
+  - `inject_peek_error(error: Exception, *, on_call: int) -> None` (the N-th `peek_messages`, 1-based, across receivers, raises once — the C4 counterpart of `inject_receive_error`)
   - `inject_commit_errors(errors: list[Exception]) -> None` (successive RAD `receive_deferred_messages` calls raise these first)
   - `calls: list[tuple[str, str]]` (operation, entity path); `clients: list[FakeServiceBusClient]`; `receivers: list[FakeReceiver]`
 - `FakeEntity`: `path`, `requires_session`, `partitioned`, `lock_seconds`, `max_delivery_count`, `dead_letter: FakeEntity`, `transfer_dead_letter: FakeEntity`;
@@ -812,7 +814,7 @@ def test_log_entity_counts(caplog):
 - Produces:
   - `STATE_VERSION = 1`, `STATE_BUDGET_BYTES = 256 * 1024`.
   - `to_ranges(seqs: Iterable[int]) -> list[list[int]]` (sorted, deduplicated, inclusive `[start, end]`); `from_ranges(ranges: list[list[int]]) -> list[int]`.
-  - Pydantic models: `PendingGroup(session_id: str | None, partition: int, max_body_bytes: int, ranges: list[list[int]])` with `sequence_numbers() -> list[int]`; `PendingEntity(entity: dict, groups: list[PendingGroup], deferred_at_utc: str)` with `entity_ref() -> EntityRef`; `PeekCursor(entity_path: str, last_sequence_number: int)`; `FlattenColumn(path: list[str], column: str)`; `ExtractorState(version: int = 1, pending_commit: list[PendingEntity] = [], peek_cursor: PeekCursor | None = None, flatten_columns: list[FlattenColumn] = [])` with `@classmethod load(raw: dict | None) -> ExtractorState` (empty → defaults; `version != 1` → `UserException(f"Unsupported state version {version}: this component understands state version 1. Reset the row state; the next run starts without a cursor, pending set or column registry.")`; unknown keys ignored), `to_dict() -> dict`, `size_bytes() -> int` (compact JSON length).
+  - Pydantic models: `PendingGroup(session_id: str | None, partition: int, max_body_bytes: int, ranges: list[list[int]])` with `sequence_numbers() -> list[int]`; `PendingEntity(entity: dict, groups: list[PendingGroup], deferred_at_utc: str)` with `entity_ref() -> EntityRef`; `PeekCursor(entity_path: str, last_sequence_number: int)`; `FlattenColumn(path_sha1: str, column: str)`; `ExtractorState(version: int = 1, pending_commit: list[PendingEntity] = [], peek_cursor: PeekCursor | None = None, flatten_columns: list[FlattenColumn] = [])` with `@classmethod load(raw: dict | None) -> ExtractorState` (empty → defaults; `version != 1` → `UserException(f"Unsupported state version {version}: this component understands state version 1. Reset the row state; the next run starts without a cursor, pending set or column registry.")`; unknown keys ignored), `to_dict() -> dict`, `size_bytes() -> int` (compact JSON length).
   - `class PendingSetBuilder`: `__init__(self)`; `add(entity: EntityRef, sequence_number: int, session_id: str | None, body_bytes: int) -> None`; `carry(entities: list[PendingEntity]) -> None`; `build(deferred_at_utc: str) -> list[PendingEntity]`; `count -> int`; `encoded_size(deferred_at_utc: str) -> int`.
 
 - [ ] **Step 1: Write the failing tests** — `tests/unit/test_state.py`:
@@ -901,7 +903,7 @@ def test_size_is_small_for_contiguous_ranges():
 - Consumes: `BodyFormat` (Task 2), `FlattenColumn` (Task 6), `make_message` (Task 4, tests).
 - Produces:
   - `CELL_LIMIT_BYTES = 16 * 1024 * 1024`, `MAX_FLATTEN_COLUMNS = 1000`, `MAX_COLUMN_NAME = 64`, `FLATTEN_PREFIX = "body_"`, `ROOT_VALUE_COLUMN = "body_value"`, `UNMAPPED_COLUMN = "body_unmapped"` (reserved; spec §6.10).
-  - Exceptions: `BodyDecodeError(Exception)` (body access / decoding raised — wraps the cause), `NotJsonError(Exception)`, `BodyTooLargeError(Exception)`, `FlattenColumnCapError(Exception)`.
+  - Exceptions: `BodyDecodeError(Exception)` (body access / decoding raised — wraps the cause), `NotJsonError(Exception)`, `BodyTooLargeError(Exception)`.
   - `@dataclass class EncodedBody`: `body_type: str`, `size_bytes: int`, `cell: str | None`, `fields: dict[tuple[str, ...], str] | None`.
   - `charset_of(content_type: str | None) -> str` (the `charset=` parameter if Python knows it, else `"utf-8"`).
   - `to_jsonable(value: object) -> object` (recursive: `bytes` → UTF-8 str with replacement, `dict` keys too; `datetime` → ISO-8601; `Decimal` kept; `uuid.UUID` → str; other non-JSON scalars → `str()`).
@@ -909,7 +911,8 @@ def test_size_is_small_for_contiguous_ranges():
   - `encode_body(message, body_format: BodyFormat) -> EncodedBody`.
   - `flatten_value(value: object) -> dict[tuple[str, ...], str]` (root non-object → `{(): compact_json(value)}`).
   - `column_name_for(path: tuple[str, ...]) -> str` (no collision handling).
-  - `class FlattenRegistry`: `__init__(self, existing: list[FlattenColumn], reserved: Iterable[str])` (`UNMAPPED_COLUMN` is always reserved); `register(path: tuple[str, ...]) -> str` (the stable name — existing or newly assigned; cap check); `input_columns -> list[str]` (the entries loaded from state, in order); `new_columns -> list[str]` (registered in this run); `columns -> list[str]` (input + new); `to_state() -> list[FlattenColumn]` (all, for the output state); `split(fields: dict[tuple[str, ...], str], *, promote: bool) -> tuple[dict[str, str], str]` — values for the materialised columns (input columns, plus new ones when `promote`) and the `body_unmapped` cell: compact JSON `{"<dot.path>": "<value>"}` of every other field (root path `()` → key `"$"`), `""` when none.
+  - `path_hash(path: tuple[str, ...]) -> str` — `hashlib.sha1(json.dumps(list(path), ensure_ascii=False).encode()).hexdigest()`.
+  - `class FlattenRegistry`: `__init__(self, existing: list[FlattenColumn], reserved: Iterable[str])` (`UNMAPPED_COLUMN` is always reserved); `register(path: tuple[str, ...]) -> str` — the stable name: existing, or newly assigned and recorded; with `MAX_FLATTEN_COLUMNS` entries already recorded a new path gets a **provisional** name (`column_name_for` + collision suffix, not recorded) and `overflowed` becomes `True`; `overflowed: bool`; `input_columns -> list[str]` (the entries loaded from state, in order — the only flatten columns a run ever writes); `new_columns -> list[str]` (recorded in this run); `columns -> list[str]` (input + new); `to_state() -> list[FlattenColumn]` (all recorded, for the output state; ≤ 133 bytes per entry); `split(fields: dict[tuple[str, ...], str]) -> tuple[dict[str, str], str]` — values for the input-registry columns and the `body_unmapped` cell: compact JSON `{"<column name>": "<value>"}` of every other field, keyed by the name `register` gave it, `""` when none.
 
 - [ ] **Step 1: Write the failing tests** — `tests/unit/test_body.py`:
 
@@ -923,13 +926,13 @@ import body as body_mod
 from body import (
     BodyDecodeError,
     BodyTooLargeError,
-    FlattenColumnCapError,
     FlattenRegistry,
     NotJsonError,
     charset_of,
     column_name_for,
     encode_body,
     flatten_value,
+    path_hash,
 )
 from configuration import BodyFormat
 from state import FlattenColumn
@@ -1031,8 +1034,16 @@ def test_registry_collisions_and_stability():
     assert restored.input_columns == ["body_a_b", "body_a_b_2"] and restored.new_columns == []
 
 
+def test_registry_state_is_hashed_and_bounded():
+    reg = FlattenRegistry([], reserved=set())
+    reg.register(("k" * 5000,))
+    entry = reg.to_state()[0]
+    assert entry.path_sha1 == path_hash(("k" * 5000,)) and len(entry.path_sha1) == 40
+    assert len(entry.model_dump_json()) <= 133
+
+
 def test_registry_restores_from_state_models():
-    reg = FlattenRegistry([FlattenColumn(path=["x"], column="body_x")], reserved=set())
+    reg = FlattenRegistry([FlattenColumn(path_sha1=path_hash(("x",)), column="body_x")], reserved=set())
     assert reg.register(("x",)) == "body_x" and reg.columns == ["body_x"] and reg.input_columns == ["body_x"]
 
 
@@ -1040,27 +1051,27 @@ def test_unmapped_is_reserved():
     assert FlattenRegistry([], reserved=set()).register(("unmapped",)) == "body_unmapped_2"
 
 
-def test_split_promotion_and_unmapped():
-    reg = FlattenRegistry([FlattenColumn(path=["x"], column="body_x")], reserved=set())
-    fields = {("x",): "1", ("y",): "2", ("o", "k"): "3"}
+def test_split_keys_unmapped_by_column_name():
+    reg = FlattenRegistry([FlattenColumn(path_sha1=path_hash(("x",)), column="body_x")], reserved=set())
+    fields = {("x",): "1", ("a.b",): "2", ("a", "b"): "3", (): "[1]"}
     for path in fields:
         reg.register(path)
-    assert reg.new_columns == ["body_y", "body_o_k"]
-    values, unmapped = reg.split(fields, promote=False)
-    assert values == {"body_x": "1"} and json.loads(unmapped) == {"y": "2", "o.k": "3"}
-    values, unmapped = reg.split(fields, promote=True)
-    assert values == {"body_x": "1", "body_y": "2", "body_o_k": "3"} and unmapped == ""
-    reg.register(())
-    assert json.loads(reg.split({(): "[1]"}, promote=False)[1]) == {"$": "[1]"}
+    assert reg.new_columns == ["body_a_b", "body_a_b_2", "body_value"]
+    values, unmapped = reg.split(fields)
+    assert values == {"body_x": "1"}
+    assert json.loads(unmapped) == {"body_a_b": "2", "body_a_b_2": "3", "body_value": "[1]"}
+    assert reg.split({("x",): "9"}) == ({"body_x": "9"}, "")
 
 
-def test_registry_cap(monkeypatch):
+def test_registry_cap_overflow_is_provisional(monkeypatch):
     monkeypatch.setattr(body_mod, "MAX_FLATTEN_COLUMNS", 2)
     reg = FlattenRegistry([], reserved=set())
     reg.register(("a",))
     reg.register(("b",))
-    with pytest.raises(FlattenColumnCapError):
-        reg.register(("c",))
+    assert not reg.overflowed
+    assert reg.register(("c",)) == "body_c" and reg.overflowed
+    assert [e.column for e in reg.to_state()] == ["body_a", "body_b"]
+    assert json.loads(reg.split({("c",): "3"})[1]) == {"body_c": "3"}
 
 
 def test_compact_json_bytes_keys():
@@ -1073,7 +1084,7 @@ def test_compact_json_bytes_keys():
   - TEXT: DATA → `raw.decode(charset_of(content_type), errors="replace")`; VALUE / SEQUENCE → `compact_json`. BASE64: DATA → `base64.b64encode(raw).decode("ascii")`; VALUE / SEQUENCE → base64 of `compact_json(...).encode("utf-8")`. Cell over `CELL_LIMIT_BYTES` (UTF-8 length) → `BodyTooLargeError`.
   - JSON_FLATTEN: DATA → `text = raw.decode(charset, errors="strict")` (UnicodeDecodeError → `NotJsonError`), `json.loads(text, parse_float=Decimal)` (`ValueError` → `NotJsonError`); VALUE → value; SEQUENCE → list. `flatten_value`: dict → recurse per key (keys as `str`); non-empty dict leaf recursion; empty dict → `"{}"`; list → `compact_json`; `str` as-is; `bool` → `"true"`/`"false"` (check `bool` before `int`); `None` → `""`; `int` / `Decimal` → `str(v)`; any field over the cell limit → `BodyTooLargeError`.
   - `column_name_for`: `() → ROOT_VALUE_COLUMN`; else `raw = FLATTEN_PREFIX + "_".join(path)`; `unicodedata.normalize("NFKD", raw)`, drop combining marks, `re.sub(r"[^A-Za-z0-9_]", "_", …)`, `.rstrip("_")`; if `len > 64`: `name[:55] + "_" + hashlib.sha1(json.dumps(list(path)).encode()).hexdigest()[:8]`.
-  - `FlattenRegistry`: `_by_path: dict[tuple, str]`, `_input: set[tuple]` and `_taken: set[str]` seeded with `reserved`, `UNMAPPED_COLUMN` and the existing entries; `register` returns the known name or builds `column_name_for(path)` then appends `_2`, `_3`, … (truncating the base so the result stays ≤ 64) until free; raises `FlattenColumnCapError` when registering beyond `MAX_FLATTEN_COLUMNS` (read the module global at call time so the test's monkeypatch applies).
+  - `FlattenRegistry`: `_by_hash: dict[str, str]` (path hash → column), `_input: set[str]` (hashes loaded from state) and `_taken: set[str]` seeded with `reserved`, `UNMAPPED_COLUMN` and the existing columns; `register` returns the known name or builds `column_name_for(path)` then appends `_2`, `_3`, … (truncating the base so the result stays ≤ 64) until free; beyond `MAX_FLATTEN_COLUMNS` recorded entries (read the module global at call time so the test's monkeypatch applies) the name is provisional: returned and marked taken for this run, not recorded, `overflowed = True`.
 - [ ] **Step 4:** PASS; ruff clean.
 - [ ] **Step 5:** Commit: `feat: body decoding (text/base64/value/sequence) and JSON flattening with stable column registry`.
 
@@ -1179,13 +1190,13 @@ def test_render_preview():
 - Produces:
   - `@dataclass(frozen=True) class OutputRow`: `metadata: dict[str, str]`, `body: str | None = None`, `fields: dict[tuple[str, ...], str] | None = None`.
   - `class RowSink(Protocol)`: `write_rows(self, rows: Sequence[OutputRow]) -> None`.
-  - `class OutputTable` (implements `RowSink`, context manager): `__init__(self, *, table_name: str, destination: DestinationConfig, body_format: BodyFormat, registry: FlattenRegistry | None, create_definition: Callable[..., TableDefinition], write_manifest: Callable[[TableDefinition], None], staging_dir: Path = Path("/tmp"))`; `open() -> None`; `write_rows(rows) -> None`; `arm_write_always() -> None` (idempotent; rewrites the manifest with `write_always=True`); `write_always_armed: bool`; `close(success: bool = True) -> None` (idempotent); `rows_written: int`; `columns -> list[str]`; `__enter__` calls `open()` and returns `self`; `__exit__` calls `close(success=exc_type is None)`, logs (never raises) a close failure while another exception is in flight, and returns `False`.
+  - `class OutputTable` (implements `RowSink`, context manager): `__init__(self, *, table_name: str, destination: DestinationConfig, body_format: BodyFormat, registry: FlattenRegistry | None, create_definition: Callable[..., TableDefinition], write_manifest: Callable[[TableDefinition], None])`; `open() -> None`; `write_rows(rows) -> None`; `arm_write_always() -> None` (idempotent; rewrites the manifest with `write_always=True`); `write_always_armed: bool`; `close() -> None` (idempotent); `rows_written: int`; `columns -> list[str]`; `__enter__` calls `open()` and returns `self`; `__exit__` calls `close()`, logs (never raises) a close failure while another exception is in flight, and returns `False`.
   - `schema_for(columns: list[str]) -> OrderedDict[str, ColumnDefinition]` — metadata types from `METADATA_COLUMNS`, everything else `BaseType.string()`.
 
 Behaviour (spec §6.9, §6.10):
-- Every manifest: `create_definition(name=f"{table_name}.csv", schema=schema_for(columns), primary_key=destination.primary_key.columns, incremental=destination.incremental, write_always=self.write_always_armed, has_header=True)`; `write_always_armed` starts `False` — **only `arm_write_always()` sets it** (C1 calls it before its first complete, C3 before its first receive — Tasks 11 / 14).
-- text / base64 → `open()` creates the CSV at the definition's `full_path`, writes the header (metadata columns + `body`) and **writes the manifest immediately**; `write_rows` appends and flushes (`f.flush()` + `os.fsync`).
-- flatten → `open()` writes a header-only CSV and a manifest for `metadata + registry.input_columns + [UNMAPPED_COLUMN]`; `write_rows` stages each row as one JSON line `{"metadata": {...}, "fields": [[path_list, value], ...]}` in `staging_dir / f"{table_name}.jsonl"`; `close(success)` decides **`promote = success and not self.write_always_armed`**, then builds the CSV under `staging_dir` with header `metadata + (registry.columns if promote else registry.input_columns) + [UNMAPPED_COLUMN]`, each row's values from `registry.split(fields, promote=promote)`, `shutil.copyfile`s it over the output file (no scratch file under `/data/out/tables/`), deletes the staging file and rewrites the manifest for the same columns.
+- **Columns are fixed at `open()`:** text / base64 → metadata columns + `body`; flatten → metadata columns + `registry.input_columns` + `UNMAPPED_COLUMN` (the input-state registry only — lead decision, gate cycle 2 — never keys discovered in this run).
+- `open()` creates the CSV at the definition's `full_path`, writes the header and **writes the manifest immediately**: `create_definition(name=f"{table_name}.csv", schema=schema_for(columns), primary_key=destination.primary_key.columns, incremental=destination.incremental, write_always=self.write_always_armed, has_header=True)`; `write_always_armed` starts `False` and **only `arm_write_always()` sets it** (C1 calls it before its first complete, C3 when its first receive returns messages — Tasks 11 / 14).
+- `write_rows` streams every format straight into the CSV and flushes (`f.flush()` + `os.fsync`): text / base64 rows write `row.body`; flatten rows write `values, unmapped = registry.split(row.fields)` — `values` fill the input-registry columns, `unmapped` fills `UNMAPPED_COLUMN`. No staging file, no rewrite at close; nothing but the table and its manifest is ever written under `/data/out/tables/`.
 
 - [ ] **Step 1: Write the failing tests** — `tests/unit/test_output.py`:
 
@@ -1196,7 +1207,7 @@ from pathlib import Path
 
 import pytest
 
-from body import UNMAPPED_COLUMN, FlattenRegistry
+from body import UNMAPPED_COLUMN, FlattenRegistry, path_hash
 from columns import metadata_column_names
 from configuration import BodyFormat, DestinationConfig
 from output import OutputRow, OutputTable, schema_for
@@ -1236,7 +1247,7 @@ def make(tmp_path, body_format, registry=None, destination=None):
     spy = ManifestSpy(tmp_path)
     table = OutputTable(
         table_name="orders", destination=destination or DestinationConfig(), body_format=body_format,
-        registry=registry, create_definition=spy.create, write_manifest=spy.write, staging_dir=tmp_path / "stage",
+        registry=registry, create_definition=spy.create, write_manifest=spy.write,
     )
     return table, spy
 
@@ -1252,7 +1263,8 @@ def header(path: Path) -> list[str]:
 
 
 def registry(existing=()):
-    return FlattenRegistry([FlattenColumn(path=list(p), column=c) for p, c in existing], reserved=set(metadata_column_names()))
+    entries = [FlattenColumn(path_sha1=path_hash(p), column=c) for p, c in existing]
+    return FlattenRegistry(entries, reserved=set(metadata_column_names()))
 
 
 def test_text_mode_manifest_first_write_always_false_then_armed(tmp_path):
@@ -1263,9 +1275,9 @@ def test_text_mode_manifest_first_write_always_false_then_armed(tmp_path):
         assert first["has_header"] is True and first["incremental"] is True
         assert first["primary_key"] == ["sequence_number"]
         table.write_rows([OutputRow(meta(1), body="a"), OutputRow(meta(2), body="b")])
+        assert [r["body"] for r in read_csv(tmp_path / "orders.csv")] == ["a", "b"]  # streamed + flushed
         table.arm_write_always()
         assert spy.manifest()["write_always"] is True
-        assert [r["body"] for r in read_csv(tmp_path / "orders.csv")] == ["a", "b"]
     assert table.rows_written == 2 and spy.manifest()["write_always"] is True
 
 
@@ -1276,53 +1288,33 @@ def test_never_armed_stays_false(tmp_path):
             table.write_rows([OutputRow(meta(1), body="a")])
             raise RuntimeError("boom")
     assert spy.manifest()["write_always"] is False
+    assert read_csv(tmp_path / "orders.csv")[0]["body"] == "a"
 
 
-def test_flatten_success_not_armed_promotes_new_keys(tmp_path):
-    reg = registry([(("x",), "body_x")])
-    table, _ = make(tmp_path, BodyFormat.JSON_FLATTEN, registry=reg)
-    with table:
-        reg.register(("y",))
-        table.write_rows([OutputRow(meta(1), fields={("y",): "2"})])
-    cols = header(tmp_path / "orders.csv")
-    assert cols[-3:] == ["body_x", "body_y", UNMAPPED_COLUMN] and "body" not in cols
-    row = read_csv(tmp_path / "orders.csv")[0]
-    assert row["body_x"] == "" and row["body_y"] == "2" and row[UNMAPPED_COLUMN] == ""
-
-
-def test_flatten_armed_success_defers_promotion(tmp_path):
-    reg = registry([(("x",), "body_x")])
+def test_flatten_columns_are_the_input_registry_only(tmp_path):
+    reg = registry([(("x",), "body_x"), (("z",), "body_z")])
     table, spy = make(tmp_path, BodyFormat.JSON_FLATTEN, registry=reg)
     with table:
-        reg.register(("y",))
-        table.arm_write_always()
+        reg.register(("x",))
+        reg.register(("y",))  # discovered in this run
         table.write_rows([OutputRow(meta(1), fields={("x",): "1", ("y",): "2"})])
     cols = header(tmp_path / "orders.csv")
-    assert "body_y" not in cols and cols[-2:] == ["body_x", UNMAPPED_COLUMN]
+    assert cols[-3:] == ["body_x", "body_z", UNMAPPED_COLUMN] and "body_y" not in cols and "body" not in cols
     row = read_csv(tmp_path / "orders.csv")[0]
-    assert row["body_x"] == "1" and json.loads(row[UNMAPPED_COLUMN]) == {"y": "2"}
-    assert spy.manifest()["columns"][-2:] == ["body_x", UNMAPPED_COLUMN]
-    assert [c.column for c in reg.to_state()] == ["body_x", "body_y"]  # saved for the next run
+    assert row["body_x"] == "1" and row["body_z"] == "" and json.loads(row[UNMAPPED_COLUMN]) == {"body_y": "2"}
+    assert spy.manifest()["columns"][-3:] == ["body_x", "body_z", UNMAPPED_COLUMN]
+    assert [c.column for c in reg.to_state()] == ["body_x", "body_z", "body_y"]  # saved for the next run
 
 
-def test_flatten_failed_run_puts_new_keys_in_unmapped(tmp_path):
+def test_flatten_first_run_everything_unmapped(tmp_path):
     reg = registry()
     table, _ = make(tmp_path, BodyFormat.JSON_FLATTEN, registry=reg)
-    with pytest.raises(RuntimeError):
-        with table:
-            reg.register(("a",))
-            table.write_rows([OutputRow(meta(1), fields={("a",): "1"})])
-            raise RuntimeError("boom")
-    assert header(tmp_path / "orders.csv")[-1] == UNMAPPED_COLUMN and "body_a" not in header(tmp_path / "orders.csv")
-    assert json.loads(read_csv(tmp_path / "orders.csv")[0][UNMAPPED_COLUMN]) == {"a": "1"}
-
-
-def test_input_registry_columns_always_written(tmp_path):
-    reg = registry([(("x",), "body_x"), (("z",), "body_z")])
-    table, _ = make(tmp_path, BodyFormat.JSON_FLATTEN, registry=reg)
     with table:
-        table.write_rows([OutputRow(meta(1), fields={("x",): "1"})])
-    assert header(tmp_path / "orders.csv")[-3:] == ["body_x", "body_z", UNMAPPED_COLUMN]
+        reg.register(("a.b",))
+        reg.register(("a", "b"))
+        table.write_rows([OutputRow(meta(1), fields={("a.b",): "1", ("a", "b"): "2"})])
+    assert header(tmp_path / "orders.csv")[-1] == UNMAPPED_COLUMN
+    assert json.loads(read_csv(tmp_path / "orders.csv")[0][UNMAPPED_COLUMN]) == {"body_a_b": "1", "body_a_b_2": "2"}
 
 
 def test_empty_run_writes_header_only(tmp_path):
@@ -1348,9 +1340,9 @@ def test_schema_types():
 ```
 
 - [ ] **Step 2:** FAIL.
-- [ ] **Step 3: Implement** `src/output.py` per the behaviour above. `schema_for` uses `ColumnDefinition(data_types=getattr(BaseType, t.lower())())` (`BaseType.string()` / `.integer()` / `.float()` / `.boolean()` / `.timestamp()`; keboola-component 1.11 returns `{"base": DataType(dtype=…)}`). CSV via `csv.DictWriter(f, fieldnames=columns, extrasaction="raise", restval="")`. The flatten staging dir is created on `open()`.
+- [ ] **Step 3: Implement** `src/output.py` per the behaviour above. `schema_for` uses `ColumnDefinition(data_types=getattr(BaseType, t.lower())())` (`BaseType.string()` / `.integer()` / `.float()` / `.boolean()` / `.timestamp()`; keboola-component 1.11 returns `{"base": DataType(dtype=…)}`). CSV via `csv.DictWriter(f, fieldnames=columns, extrasaction="raise", restval="")`.
 - [ ] **Step 4:** PASS; ruff clean.
-- [ ] **Step 5:** Commit: `feat: output table with write_always switch, flatten promotion rule and body_unmapped`.
+- [ ] **Step 5:** Commit: `feat: streaming output table with write_always switch and input-registry flatten columns + body_unmapped`.
 
 ---
 
@@ -1431,15 +1423,15 @@ def test_effective_settings_marks_defaults(caplog):
   - `class Settler(Protocol)`: `settle(self, receiver, message, body_bytes: int) -> None`. Implementations: `CompleteSettler(stats, arm: Callable[[], None])` — calls `arm()` once, **immediately before its first `complete_message`** (the `write_always` switch, spec §6.9); `DeferSettler(pending: PendingSetBuilder, entity: EntityRef, stats)` (never arms); `NoopSettler(stats, count_as_deleted: bool)` (never arms — C3 arms in the receive loop before its first receive, Task 14); factory `make_settler(mode: SettlementMode, *, pending: PendingSetBuilder | None, entity: EntityRef, stats: RunStats, arm: Callable[[], None] = lambda: None) -> Settler`.
   - `safe_settle(action: Callable[[], None], stats: RunStats) -> bool` — runs `action`; `MessageLockLostError` / `MessageAlreadySettled` → `stats.settlement_failures += 1`, returns `False`; other exceptions propagate (a connection error must reach the recycle logic).
   - `renew_if_needed(receiver, message, now: datetime) -> None` — PEEK_LOCK messages whose `locked_until_utc - now < LOCK_RENEW_MARGIN` get `receiver.renew_message_lock(message)`.
-  - `class UnreadableAction(StrEnum)`: `RETRY`, `DISPOSED`, `SKIPPED`.
-  - `class UnreadableHandler`: `__init__(self, *, policy: UnreadablePolicy, mode: SettlementMode, is_sub_queue: bool, stats: RunStats)`; `handle(self, receiver, message, error: Exception, generation: int) -> UnreadableAction`; `check_abort_share(self) -> None`.
+  - `class UnreadableAction(StrEnum)`: `RETRY`, `DISPOSED`, `SKIPPED`, `FAILED` (policy `fail`: recorded, raised after the batch).
+  - `class UnreadableHandler`: `__init__(self, *, policy: UnreadablePolicy, mode: SettlementMode, is_sub_queue: bool, stats: RunStats)`; `handle(self, receiver, message, error: Exception, generation: int) -> UnreadableAction`; `raise_pending(self) -> None` (raises the first recorded `fail`-policy `UserException`, if any); `check_abort_share(self) -> None`; attribute `retries_enabled: bool = True` (the peek pager sets it `False` for cursor-mode / session peeks, where a first failure is final — spec §6.6).
   - `@dataclass class BatchResult`: `written: int`, `needs_recycle: bool`, `progressed: bool` (`written > 0` or at least one unreadable disposition in this batch — the receive loop's no-progress guard counts both, spec §6.5).
   - `class BatchProcessor`: `__init__(self, *, entity: EntityRef, mode: SettlementMode, body_format: BodyFormat, sink: RowSink, registry: FlattenRegistry | None, settler: Settler, unreadable: UnreadableHandler, stats: RunStats, clock: Callable[[], datetime])`; `process(self, receiver, messages: Sequence, generation: int) -> BatchResult`.
   - `tests/fakes/recording.py`: `class RecordingSink` whose `write_rows(rows: Sequence[OutputRow])` appends one dict per row to `rows: list[dict]` — `{**row.metadata, "body": row.body, "fields": row.fields}` — so tests read `r["body"]`, `r["state"]`, `r["fields"]`.
 
-`handle()` rules (spec §6.6): `BodyDecodeError` → first failure for that sequence number **while `stats.unreadable_recycles < MAX_UNREADABLE_RECYCLES`**: remember `(seq → generation)`; C1/C2 `abandon_message` via `safe_settle`; C1/C2/C4 return `RETRY` (count `"<reason>:retry"`); C3 falls through to the final disposition. With the retry budget spent, a first failure goes straight to the final disposition (WARNING key `unreadable_retry_budget`). A repeat failure with a **different** generation, or any `NotJsonError` / `BodyTooLargeError` (deterministic), → final disposition: `FAIL` → `UserException(f"Message {seq} (message id {mid}) has an unreadable body ({reason}) and the unreadable_body policy is 'fail'.")`; C1/C2 with `DEAD_LETTER` on a main entity → `dead_letter_message(message, reason=<reason>, error_description=<exception class name>)` → `"dead_lettered"`; C1/C2 with `LEAVE`, or `DEAD_LETTER` on a sub-queue (WARNING key `dead_letter_on_sub_queue`) → nothing settled → `"left"`; C3 / C4 → WARNING (sequence number + message id, never the body) → `"skipped"`. A sequence number already disposed as `"left"` in this run → `DISPOSED` again without a retry and without counting twice. Reasons: `UnreadableBody`, `NotJson`, `BodyTooLarge`. `check_abort_share`: `stats.unreadable_total() > UNREADABLE_ABORT_SHARE * stats.received and stats.unreadable_total() >= UNREADABLE_ABORT_MIN` → `UserException`.
+`handle()` rules (spec §6.6): `BodyDecodeError` → first failure for that sequence number **while `retries_enabled` and `stats.unreadable_recycles < MAX_UNREADABLE_RECYCLES`**: remember `(seq → generation)`; C1/C2 `abandon_message` via `safe_settle`; C1/C2/C4 return `RETRY` (count `"<reason>:retry"`); C3 falls through to the final disposition. With the retry budget spent, a first failure goes straight to the final disposition (WARNING key `unreadable_retry_budget`). A repeat failure with a **different** generation, or any `NotJsonError` / `BodyTooLargeError` (deterministic), → final disposition: `FAIL` → **record** `UserException(f"Message {seq} (message id {mid}) has an unreadable body ({reason}) and the unreadable_body policy is 'fail'.")` (the first one per batch), settle nothing for that message, return `FAILED` — **never raise inside `handle()`** (write first, fail after, spec §6.6); C1/C2 with `DEAD_LETTER` on a main entity → `dead_letter_message(message, reason=<reason>, error_description=<exception class name>)` → `"dead_lettered"`; C1/C2 with `LEAVE`, or `DEAD_LETTER` on a sub-queue (WARNING key `dead_letter_on_sub_queue`) → nothing settled → `"left"`; C3 / C4 → WARNING (sequence number + message id, never the body) → `"skipped"`. A sequence number already disposed as `"left"` in this run → `DISPOSED` again without a retry and without counting twice. Reasons: `UnreadableBody`, `NotJson`, `BodyTooLarge`. `check_abort_share`: `stats.unreadable_total() > UNREADABLE_ABORT_SHARE * stats.received and stats.unreadable_total() >= UNREADABLE_ABORT_MIN` → `UserException`.
 
-`process()` order: for each message → `stats.received += 1`, `note_delivery_count`, `encode_body` (errors → `unreadable.handle`, a `RETRY` sets `needs_recycle`, a disposition sets `progressed`), build `OutputRow(metadata=message_metadata(...), body=enc.cell)` or, for flatten, `OutputRow(metadata=..., fields=enc.fields)` after `registry.register(path)` for every path (name + cap; `FlattenColumnCapError` → abandon every lockable message of the batch via `safe_settle`, then `UserException("The message bodies produced more than 1000 distinct JSON keys; use the text body format.")`); `sink.write_rows(good_rows)` (one call per batch, **before** any settle); then per good message `renew_if_needed` + `safe_settle(lambda: settler.settle(...))`; `stats.written += len(good_rows)`; finally `unreadable.check_abort_share()`.
+`process()` order: for each message → `stats.received += 1`, `note_delivery_count`, `encode_body` (errors → `unreadable.handle`, a `RETRY` sets `needs_recycle`, a disposition sets `progressed`), build `OutputRow(metadata=message_metadata(...), body=enc.cell)` or, for flatten, `OutputRow(metadata=..., fields=enc.fields)` after `registry.register(path)` for every path (a full registry hands out provisional names and sets `registry.overflowed`; the row is still written); `sink.write_rows(good_rows)` (one call per batch, **before** any settle); then per good message `renew_if_needed` + `safe_settle(lambda: settler.settle(...))`; `stats.written += len(good_rows)`; **then** `unreadable.raise_pending()`; then, if `registry.overflowed`, `UserException("The message bodies produced more than 1000 distinct JSON keys; this batch was written, but use the text body format for this entity.")`; finally `unreadable.check_abort_share()`. Nothing raises before the batch's readable rows are written and settled.
 
 - [ ] **Step 1: Write the failing tests** — `tests/unit/test_settlement.py`:
 
@@ -1560,14 +1552,52 @@ def test_not_json_dead_lettered_without_retry(broker):
     assert stats.unreadable["NotJson:dead_lettered"] == 1
 
 
-def test_fail_policy_raises(broker):
+def test_fail_policy_writes_rest_of_batch_first_c3(broker):
     q = broker.add_queue("q")
-    q.send(b"a")
-    broker.inject_body_error(1, times=5)
-    proc, _, _ = processor(broker, SettlementMode.RECEIVE_AND_DELETE, policy=UnreadablePolicy.FAIL)
+    seqs = [q.send(b"a"), q.send(b"b"), q.send(b"c")]
+    broker.inject_body_error(seqs[1], times=5)
+    proc, sink, _ = processor(broker, SettlementMode.RECEIVE_AND_DELETE, policy=UnreadablePolicy.FAIL)
     with receiver(broker, mode=ServiceBusReceiveMode.RECEIVE_AND_DELETE) as r:
         with pytest.raises(UserException, match="unreadable"):
-            proc.process(r, r.receive_messages(), generation=0)
+            proc.process(r, r.receive_messages(max_message_count=10), generation=0)
+    assert [row["body"] for row in sink.rows] == ["a", "c"]  # written before the raise
+
+
+def test_fail_policy_c1_settles_good_rows_and_leaves_the_bad_one(broker):
+    q = broker.add_queue("q")
+    seqs = [q.send(b"a"), q.send(b"b")]
+    broker.inject_body_error(seqs[1], times=5)
+    proc, sink, stats = processor(broker, SettlementMode.COMPLETE, policy=UnreadablePolicy.FAIL)
+    stats.unreadable_recycles = 50  # no retry: go straight to the policy
+    with receiver(broker) as r:
+        with pytest.raises(UserException):
+            proc.process(r, r.receive_messages(max_message_count=10), generation=0)
+    assert q.state_of(seqs[0]) is None and q.state_of(seqs[1]) == "ACTIVE" and len(sink.rows) == 1
+
+
+def test_flatten_cap_writes_batch_then_raises_c3(broker, monkeypatch):
+    import body as body_mod
+    from body import FlattenRegistry
+    from columns import metadata_column_names
+
+    monkeypatch.setattr(body_mod, "MAX_FLATTEN_COLUMNS", 1)
+    q = broker.add_queue("q")
+    q.send(b'{"a":1}')
+    q.send(b'{"b":2}')
+    stats = RunStats(mode="receive_and_delete")
+    sink = RecordingSink()
+    mode = SettlementMode.RECEIVE_AND_DELETE
+    proc = BatchProcessor(
+        entity=Q, mode=mode, body_format=BodyFormat.JSON_FLATTEN, sink=sink,
+        registry=FlattenRegistry([], reserved=set(metadata_column_names())),
+        settler=make_settler(mode, pending=None, entity=Q, stats=stats),
+        unreadable=UnreadableHandler(policy=UnreadablePolicy.DEAD_LETTER, mode=mode, is_sub_queue=False, stats=stats),
+        stats=stats, clock=broker.clock.now,
+    )
+    with receiver(broker, mode=ServiceBusReceiveMode.RECEIVE_AND_DELETE) as r:
+        with pytest.raises(UserException, match="distinct JSON keys"):
+            proc.process(r, r.receive_messages(max_message_count=10), generation=0)
+    assert len(sink.rows) == 2  # both deleted messages reached the output
 
 
 def test_dead_letter_degrades_to_leave_on_sub_queue(broker):
@@ -2042,7 +2072,7 @@ def test_probe_skips_sessions(broker):
   - `class RecoveryTracker`: `__init__(self, max_recoveries: int = MAX_RECOVERIES)`; `generation: int` (starts 0; +1 on **every** reopen — connection or unreadable retry); `count: int` (connection recoveries only); `progress(self) -> None`; `unreadable_retry(self) -> None` (`generation += 1` only — never touches `count` or the progress flag); `failure(self, error: Exception) -> None` — if the error is fatal → `raise to_user_exception(error, entity_path) from error`; if no progress since the previous connection failure, or `count == max_recoveries` → re-raise (a `ServiceBusError` as `UserException(f"Lost the connection to Service Bus {count + 1} times in this run (limit {MAX_RECOVERIES}, or twice without writing a row or disposing an unreadable message in between); last error: {redacted}. Messages that were not settled redeliver on the next run.")`, anything else unchanged → exit 2); else `count += 1`, `generation += 1`.
   - `class ReceiveLoop`: `__init__(self, *, connector, entity: EntityRef, info: EntityInfo, config: Configuration, processor: BatchProcessor, stats: RunStats, t0: datetime, state_size: Callable[[], int], arm_write_always: Callable[[], None], clock: Callable[[], datetime], monotonic: Callable[[], float] | None = None, sleep: Callable[[float], None] | None = None)`; `run(self) -> StopReason`. `state_size` returns the size of the **whole projected output state** (Task 16).
 
-Loop rules (spec §6.5): receive mode PEEK_LOCK for C1/C2, RECEIVE_AND_DELETE for C3; receiver kwargs `prefetch_count=config.advanced.prefetch_count`, `keep_alive=0`, `client_identifier=connector.client_identifier`, session receivers `session_id=NEXT_AVAILABLE_SESSION`, `max_wait_time=idle_timeout_seconds`. Per batch: stop checks first (remaining messages when `max_messages > 0`; `monotonic() >= deadline`; C2 and `state_size() >= STATE_BUDGET_BYTES` → WARNING key `state_budget`); C3: `arm_write_always()` immediately before the first `receive_messages` call of the run (RECEIVE_AND_DELETE deletes on delivery); `receive_messages(max_message_count=min(batch_size, remaining), max_wait_time=idle)`; empty → `IDLE`; `processor.process(receiver, batch, tracker.generation)`; `tracker.progress()` when `result.progressed`; `result.needs_recycle` → close + reopen, `tracker.unreadable_retry()`, `stats.unreadable_recycles += 1` (**not** a connection failure); watermark (`stop_at_job_start` and every non-`SCHEDULED` message of the batch has `enqueued_time_utc >= t0`) → `WATERMARK` (WARNING key `watermark_approximate` if `info.is_partitioned`). Sessions: loop until `OperationTimeoutError` (`NO_MORE_SESSIONS`); a session id seen before → `SESSION_REVISITED`; `SessionCannotBeLockedError` → skip; renew the session lock when `receiver.session.locked_until_utc - clock() < 10 s`; per-session `IDLE` / `WATERMARK` continue with the next session; global stops end the run. Stop drain on every stop except `IDLE` / `NO_MORE_SESSIONS`: `receive_messages(max_message_count=prefetch_count + 1, max_wait_time=1)` → C1/C2 `safe_settle(abandon)`, C3 `processor.process(...)`. Any other exception → close receiver + client, `tracker.failure(e)`, `stats.recoveries = tracker.count`, reopen. Session lock: before every receive in a session, `receiver.session.renew_lock()` when `receiver.session.locked_until_utc - clock() < LOCK_RENEW_MARGIN`. Catch-up: `recovery_wait_seconds > 0` and `tracker.count > 0` → poll with `max_wait_time=1` until `min(recovery_wait, remaining duration)` elapses, `sleep(1)` after each empty poll, processing whatever arrives. `stats.stop_reason = reason.value`.
+Loop rules (spec §6.5): receive mode PEEK_LOCK for C1/C2, RECEIVE_AND_DELETE for C3; receiver kwargs `prefetch_count=config.advanced.prefetch_count`, `keep_alive=0`, `client_identifier=connector.client_identifier`, session receivers `session_id=NEXT_AVAILABLE_SESSION`, `max_wait_time=idle_timeout_seconds`. Per batch: stop checks first (remaining messages when `max_messages > 0`; `monotonic() >= deadline`; C2 and `state_size() >= STATE_BUDGET_BYTES` → WARNING key `state_budget`); C3: `arm_write_always()` exactly once, right after the first `receive_messages` call (the stop drain included) that **returns at least one message** and before that batch is processed (RECEIVE_AND_DELETE has deleted them by then; a C3 run that receives nothing never arms); `receive_messages(max_message_count=min(batch_size, remaining), max_wait_time=idle)`; empty → `IDLE`; `processor.process(receiver, batch, tracker.generation)`; `tracker.progress()` when `result.progressed`; `result.needs_recycle` → close + reopen, `tracker.unreadable_retry()`, `stats.unreadable_recycles += 1` (**not** a connection failure); watermark (`stop_at_job_start` and every non-`SCHEDULED` message of the batch has `enqueued_time_utc >= t0`) → `WATERMARK` (WARNING key `watermark_approximate` if `info.is_partitioned`). Sessions: loop until `OperationTimeoutError` (`NO_MORE_SESSIONS`); a session id seen before → `SESSION_REVISITED`; `SessionCannotBeLockedError` → skip; renew the session lock when `receiver.session.locked_until_utc - clock() < 10 s`; per-session `IDLE` / `WATERMARK` continue with the next session; global stops end the run. Stop drain on every stop except `IDLE` / `NO_MORE_SESSIONS`: `receive_messages(max_message_count=prefetch_count + 1, max_wait_time=1)` → C1/C2 `safe_settle(abandon)`, C3 `processor.process(...)`. Any other exception → close receiver + client, `tracker.failure(e)`, `stats.recoveries = tracker.count`, reopen. Session lock: before every receive in a session, `receiver.session.renew_lock()` when `receiver.session.locked_until_utc - clock() < LOCK_RENEW_MARGIN`. Catch-up: `recovery_wait_seconds > 0` and `tracker.count > 0` → poll with `max_wait_time=1` until `min(recovery_wait, remaining duration)` elapses, `sleep(1)` after each empty poll, processing whatever arrives. `stats.stop_reason = reason.value`.
 
 - [ ] **Step 1: Write the failing tests** — `tests/unit/test_receive_loop.py`:
 
@@ -2199,7 +2229,7 @@ def test_exhausted_service_bus_errors_become_user_exception(broker):
     for call in range(2, 14, 2):
         broker.inject_receive_error(ServiceBusError(message="link detached"), on_call=call)
     loop, _, _, _ = build(broker, advanced={"batch_size": 1})
-    with pytest.raises(UserException, match="repeatedly"):
+    with pytest.raises(UserException, match="Lost the connection to Service Bus"):
         loop.run()
 
 
@@ -2263,14 +2293,22 @@ def test_unreadable_share_abort_reached_before_any_cap(broker):
     assert stats.recoveries == 0 and stats.unreadable_recycles <= 12
 
 
-def test_c3_arms_before_first_receive(broker):
+def test_c3_arms_when_first_messages_arrive(broker):
     q = broker.add_queue("q")
     seq = q.send(b"a")
     events: list[str] = []
-    loop, _, _, _ = build(broker, source={"entity_type": "queue", "queue_name": "q", "settlement_mode": "receive_and_delete"})
-    loop.arm_write_always = lambda: events.append(f"arm:{q.state_of(seq)}")
+    loop, sink, _, _ = build(broker, source={"entity_type": "queue", "queue_name": "q", "settlement_mode": "receive_and_delete"})
+    loop.arm_write_always = lambda: events.append(f"arm:{q.state_of(seq)}:{len(sink.rows)}")
     loop.run()
-    assert events[0] == "arm:ACTIVE" and q.state_of(seq) is None
+    assert events == ["arm:None:0"]  # once, after the broker deleted it, before its row was written
+
+
+def test_c3_empty_run_never_arms(broker):
+    broker.add_queue("q")
+    events: list[str] = []
+    loop, _, _, _ = build(broker, source={"entity_type": "queue", "queue_name": "q", "settlement_mode": "receive_and_delete"})
+    loop.arm_write_always = lambda: events.append("arm")
+    assert loop.run() is StopReason.IDLE and events == []
 
 
 def test_c2_never_arms(broker):
@@ -2317,9 +2355,9 @@ def test_session_lock_renewed_near_expiry(broker):
 
 **Interfaces:**
 - Consumes: Task 14 (`RecoveryTracker`, `StopReason`, `SESSION_ACCEPT_WAIT_SECONDS`); `PeekCursor` (Task 6).
-- Produces: `class PeekPager`: `__init__(self, *, connector, entity: EntityRef, info: EntityInfo, config: Configuration, processor: BatchProcessor, stats: RunStats, cursor: PeekCursor | None, t0: datetime, clock: Callable[[], datetime], monotonic: Callable[[], float] | None = None)`; `run(self) -> PeekCursor | None` (incremental → the new cursor; full → `None`).
+- Produces: `PEEK_PAGE_SIZE = 250` (module constant — the broker's per-call cap; tests monkeypatch it); `class PeekPager`: `__init__(self, *, connector, entity: EntityRef, info: EntityInfo, config: Configuration, processor: BatchProcessor, stats: RunStats, cursor: PeekCursor | None, t0: datetime, clock: Callable[[], datetime], monotonic: Callable[[], float] | None = None)`; `run(self) -> PeekCursor | None` (incremental → the new cursor; full → `None`).
 
-Rules (spec §6.7): incremental on `info.partitioned is True` → `UserException("Incremental Fetch cannot page a partitioned entity reliably; use Full Fetch.")` before peeking; heuristic partitioned detection mid-run → the same `UserException` (nothing written for that page, cursor unchanged). Start: cursor for the same `entity.path` → `last_sequence_number + 1`, a different path → 1 + INFO log. Pages: `peek_messages(250, sequence_number=next)` (full fetch on a partitioned entity: `sequence_number=0` cursor mode). Per message: skip `expires_at_utc < clock()` (`stats.expired_skipped += 1`); `stop_at_job_start` and a **non-`SCHEDULED`** message with `enqueued_time_utc >= t0` → stop before it (`WATERMARK`; WARNING `watermark_approximate` on partitioned / session entities; `SCHEDULED` messages are exported and never stop the peek); `max_messages`; `max_duration`. Write via `processor.process(receiver, page_messages, tracker.generation)` (the processor's settler is `NoopSettler`). Keep `written: set[int]` of the sequence numbers written in this run's current page; `needs_recycle` → reopen (`tracker.unreadable_retry()`, `stats.unreadable_recycles += 1`) and re-peek **from the first unreadable message's sequence number**, dropping every message whose sequence number is already in `written` before calling the processor — no duplicate rows. New cursor = highest written sequence number (unchanged when nothing was written). Session entities (full fetch only — the model refuses incremental): loop `NEXT_AVAILABLE_SESSION` receivers opened with `max_wait_time=SESSION_ACCEPT_WAIT_SECONDS` (**never** `idle_timeout_seconds`, which is hidden and ignored in peek mode), peek each from 1, stop on a revisited session or `OperationTimeoutError`, WARNING key `peek_sessions` once.
+Rules (spec §6.7): incremental on `info.partitioned is True` → `UserException("Incremental Fetch cannot page a partitioned entity reliably; use Full Fetch.")` before peeking; heuristic partitioned detection mid-run → the same `UserException` (nothing written for that page, cursor unchanged). Start: cursor for the same `entity.path` → `last_sequence_number + 1`, a different path → 1 + INFO log. Pages: `peek_messages(PEEK_PAGE_SIZE, sequence_number=next)` (full fetch on a partitioned entity: `sequence_number=0` cursor mode). Per message: skip `expires_at_utc < clock()` (`stats.expired_skipped += 1`); `stop_at_job_start` and a **non-`SCHEDULED`** message with `enqueued_time_utc >= t0` → stop before it (`WATERMARK`; WARNING `watermark_approximate` on partitioned / session entities; `SCHEDULED` messages are exported and never stop the peek); `max_messages`; `max_duration`. Write via `processor.process(receiver, page_messages, tracker.generation)` (the processor's settler is `NoopSettler`). **Retry / re-peek (spec §6.6):** explicit paging (plain entities): keep `processed: set[int]` for the current page; `needs_recycle` → reopen (`tracker.unreadable_retry()`, `stats.unreadable_recycles += 1`) and re-peek **from the first unreadable message's sequence number**, dropping every message already in `processed` before calling the processor — no duplicate rows. Cursor mode (partitioned full fetch) and session peeks: set `processor.unreadable.retries_enabled = False` before peeking, so a first failure is final (skipped + WARNING) and no re-peek is ever needed — the next full fetch re-reads the message. A full fetch that learns mid-run (sequence-number heuristic) that the entity is partitioned switches to cursor mode with a fresh receiver from the start, dropping sequence numbers already processed in this run. **Cursor:** the new cursor is the highest sequence number **processed** — written, skipped as unreadable, or skipped as expired — so a skipped last message is not re-peeked forever; messages after a watermark / limit stop are not processed (unchanged when nothing was processed). Session entities (full fetch only — the model refuses incremental): loop `NEXT_AVAILABLE_SESSION` receivers opened with `max_wait_time=SESSION_ACCEPT_WAIT_SECONDS` (**never** `idle_timeout_seconds`, which is hidden and ignored in peek mode), peek each from 1, stop on a revisited session or `OperationTimeoutError`, WARNING key `peek_sessions` once.
 
 - [ ] **Step 1: Write the failing tests** — `tests/unit/test_peek_pager.py`:
 
@@ -2461,6 +2499,28 @@ def test_repeek_after_unreadable_retry_does_not_duplicate(broker):
     assert stats.unreadable_recycles == 1 and cursor.last_sequence_number == seqs[-1]
 
 
+def test_cursor_moves_past_a_skipped_last_message(broker):
+    q = broker.add_queue("q")
+    good = q.send(b"a")
+    bad = q.send(b"b")
+    broker.inject_body_error(bad, times=2)
+    p, sink, stats = pager(broker)
+    cursor = p.run()
+    assert [r["body"] for r in sink.rows] == ["a"] and cursor.last_sequence_number == bad
+    assert stats.unreadable["UnreadableBody:skipped"] == 1 and good < bad
+
+
+def test_partitioned_full_fetch_skips_without_retry(broker):
+    pq = broker.add_queue("q", partitioned=True)
+    ok = pq.send(b"a", partition=1)
+    bad = pq.send(b"b", partition=2)
+    broker.inject_body_error(bad, times=1)
+    p, sink, stats = pager(broker, fetch_mode="full_fetch", info=EntityInfo(partitioned=True))
+    p.run()
+    assert [r["sequence_number"] for r in sink.rows] == [str(ok)]
+    assert stats.unreadable_recycles == 0 and stats.unreadable["UnreadableBody:skipped"] == 1
+
+
 def test_scheduled_message_does_not_stop_watermark(broker):
     q = broker.add_queue("q")
     q.send(b"sched", scheduled_at=broker.clock.now() + timedelta(hours=2))
@@ -2514,7 +2574,8 @@ Private methods (each small; spec §6.1–§6.12):
 - `_client_identifier()`: `f"kbc-{env.config_id or 'local'}-{env.config_row_id or 'root'}"[:64]` from `self.environment_variables`.
 - `_guard_dev_branch(config)`: destructive mode and `self.environment_variables.branch_id` and not `config.destructive_in_branch` → `UserException(DEV_BRANCH_MESSAGE.format(mode=...))`, where `DEV_BRANCH_MESSAGE = "Settlement mode '{mode}' deletes or hides messages on the production Service Bus entity, and this job runs in a development branch. Use Peek mode in branches, or, to consume production messages from this branch on purpose, open the configuration in debug mode and add \"destructive_in_branch\": true under parameters."`.
 - `_start_run(config)`: `t0 = datetime.now(UTC)`; `EntityRef.from_source`; `ExtractorState.load(self.get_state_file())`; `RunStats`; `load_entity_info` + `log_entity_counts(info, entity)` (L1); session mismatch (`info.requires_session is not None and not entity.is_sub_queue and info.requires_session != config.source.session_enabled`) → `UserException` (enable / disable Sessions); `log_effective_settings`; `FlattenRegistry(state.flatten_columns, reserved=metadata_column_names())` only for flatten; `PendingSetBuilder()`.
-- `_open_output(config, run)`: `OutputTable(table_name=config.destination.table_name or run.entity.default_table_name(), destination=config.destination, body_format=config.body.body_format, registry=run.registry, create_definition=self.create_out_table_definition, write_manifest=self.write_manifest)`; the `with` block exits through `OutputTable.__exit__`, which materialises with `success = exc_type is None`.
+- `_open_output(config, run)`: `OutputTable(table_name=config.destination.table_name or run.entity.default_table_name(), destination=config.destination, body_format=config.body.body_format, registry=run.registry, create_definition=self.create_out_table_definition, write_manifest=self._write_manifest)`; the `with` block exits through `OutputTable.__exit__`, which flushes and closes the CSV.
+- `_write_manifest(definition)`: `self.write_manifest(definition)`; then, **if `self.is_legacy_queue`** (keboola-component 1.11.0 drops `write_always` there), re-open `definition.full_path + ".manifest"`, set `"write_always": definition.write_always`, and write it back — the legacy-queue fallback of spec §6.9.
 - `_build_processor`: `run.output = output`; `BatchProcessor` with `make_settler(mode, pending=run.pending, entity=run.entity, stats=run.stats, arm=output.arm_write_always)` (only `CompleteSettler` uses `arm`) and `UnreadableHandler(policy=config.body.unreadable_body, mode=mode, is_sub_queue=run.entity.is_sub_queue, stats=run.stats)`, `clock=lambda: datetime.now(UTC)`.
 - `_commit_pending`: `run.pending.carry(PendingCommitter(self._connector, configured=run.entity, stats=run.stats).commit(run.state.pending_commit))`.
 - `_reconcile_deferrals`: C2 → `OrphanScanner(...).scan()`; C1 / C3 → `ForeignDeferralProbe(...).probe()`.
@@ -2635,11 +2696,22 @@ def test_counts_logged_when_management_available(broker, tmp_path, monkeypatch, 
     assert any("holds 1 active" in r.getMessage() for r in caplog.records)
 
 
+def test_write_always_kept_on_legacy_queue(broker, tmp_path, monkeypatch):
+    import component as component_mod
+
+    broker.add_queue("q").send(b"x")
+    monkeypatch.setattr(component_mod.Component, "is_legacy_queue", property(lambda self: True))
+    component(tmp_path, monkeypatch, PARAMS).execute_action()
+    assert json.loads((tmp_path / "out/tables/q.csv.manifest").read_text())["write_always"] is True
+
+
 def test_state_budget_counts_whole_state(broker, tmp_path, monkeypatch):
     import state as state_mod
 
     broker.add_queue("q").send(b"x")
-    registry = [{"path": [f"k{i}"], "column": f"body_k{i}"} for i in range(50)]
+    import hashlib
+
+    registry = [{"path_sha1": hashlib.sha1(str(i).encode()).hexdigest(), "column": f"body_k{i}"} for i in range(50)]
     monkeypatch.setattr(state_mod, "STATE_BUDGET_BYTES", 1500)
     import receiver as receiver_mod
 
@@ -2667,7 +2739,7 @@ def test_state_budget_counts_whole_state(broker, tmp_path, monkeypatch):
 
 **Interfaces:** Consumes the field list of spec §5 (names, enums, defaults, gating) and the sync-action names of Task 16.
 
-Schema content (spec §5.1–§5.6): root = `auth_type` (enum + `enum_titles` "Connection string (SAS)" / "Service principal (Entra ID)", default `connection_string`), `#connection_string` (password, gated on SAS, tooltip naming *Shared access policies* and Listen rights), `tenant_id`, `client_id`, `#client_secret`, `fully_qualified_namespace` (gated on SP, tooltips as in the writer plus the **Azure Service Bus Data Receiver** role), and a `test_connection` button (`format: test-connection`). Row = `source` (`grid-strict`), `limits`, `body`, `destination` sections, `advanced_options` checkbox and gated `advanced` section, with the fields, enums, defaults and `options.dependencies` of §5.2 / §5.5; creatable async selects with `autoload` for `queue_name` (`listQueues`), `topic_name` (`listTopics`), `subscription_name` (`listSubscriptions`, reloading on `topic_name`), each declaring `"enum": []` (required for async selects); buttons `test_connection` (`format: test-connection`), `preview_messages` (`previewMessages`, label "Preview Messages"), `entity_info` (`entityInfo`, label "Show Entity Details"). Tooltips: `settlement_mode` (one line per mode with its guarantee / loss window; C2 exclusive-consumer rule; C3 at-most-once), `body_format` and `primary_key` ("changes the output columns / key — drop the existing table first"); the `primary_key` description names why the picker exists (sequence numbers are unique only per entity — use the composite key when several entities share a table) and its `message_id` option warns "Producer-set: may be empty or reused, in which case upserts merge different messages."; `json_flatten` behaviour and limits (`body_unmapped` holds keys not yet promoted — in complete / receive-and-delete modes a key becomes a column one run after it first appears; state reset and shared tables; prefer defer-commit), `session_enabled`, `stop_at_job_start`, `max_messages` ("0 = no limit"), `idle_timeout_seconds`, `table_name` (empty = derived pattern), the dropdown tooltip about SP / Manage rights. `destructive_in_branch` appears **nowhere**. `uiOptions.md` = `["genericDockerUI", "genericDockerUI-rows"]`. Descriptions and README: what it does, auth + provisioning (Listen / Data Receiver, IP allowlisting of the stack egress IPs with the help-page link, `disableLocalAuth` → SP, private endpoints unsupported), settlement guarantees table, C2 limits, dev-branch override, body formats + flatten rules, the `body_unmapped` known behaviour (spec §6.10) and limits, the `write_always` per-mode table (spec §6.9), large-body guidance (lower batch size), output columns + types, state, the K2 WebSocket note (spec §11), sync-action caveat, how to run the tests.
+Schema content (spec §5.1–§5.6): root = `auth_type` (enum + `enum_titles` "Connection string (SAS)" / "Service principal (Entra ID)", default `connection_string`), `#connection_string` (password, gated on SAS, tooltip naming *Shared access policies* and Listen rights), `tenant_id`, `client_id`, `#client_secret`, `fully_qualified_namespace` (gated on SP, tooltips as in the writer plus the **Azure Service Bus Data Receiver** role), and a `test_connection` button (`format: test-connection`). Row = `source` (`grid-strict`), `limits`, `body`, `destination` sections, `advanced_options` checkbox and gated `advanced` section, with the fields, enums, defaults and `options.dependencies` of §5.2 / §5.5; creatable async selects with `autoload` for `queue_name` (`listQueues`), `topic_name` (`listTopics`), `subscription_name` (`listSubscriptions`, reloading on `topic_name`), each declaring `"enum": []` (required for async selects); buttons `test_connection` (`format: test-connection`), `preview_messages` (`previewMessages`, label "Preview Messages"), `entity_info` (`entityInfo`, label "Show Entity Details"). Tooltips: `settlement_mode` (one line per mode with its guarantee / loss window; C2 exclusive-consumer rule; C3 at-most-once), `body_format` and `primary_key` ("changes the output columns / key — drop the existing table first"); the `primary_key` description names why the picker exists (sequence numbers are unique only per entity — use the composite key when several entities share a table) and its `message_id` option warns "Producer-set: may be empty or reused, in which case upserts merge different messages."; `json_flatten` behaviour and limits (`body_unmapped` holds, keyed by column name, the keys first seen in the current run — in every mode a key becomes a column from the run after it first appears; state reset and shared tables; prefer defer-commit), `session_enabled`, `stop_at_job_start`, `max_messages` ("0 = no limit"), `idle_timeout_seconds`, `table_name` (empty = derived pattern), the dropdown tooltip about SP / Manage rights. `destructive_in_branch` appears **nowhere**. `uiOptions.md` = `["genericDockerUI", "genericDockerUI-rows"]`. Descriptions and README: what it does, auth + provisioning (Listen / Data Receiver, IP allowlisting of the stack egress IPs with the help-page link, `disableLocalAuth` → SP, private endpoints unsupported), settlement guarantees table, C2 limits, dev-branch override, body formats + flatten rules, the `body_unmapped` known behaviour (spec §6.10) and limits, the `write_always` per-mode table (spec §6.9), large-body guidance (lower batch size), output columns + types, state, the K2 WebSocket note (spec §11), sync-action caveat, how to run the tests.
 
 - [ ] **Step 1: Write the failing tests** — `tests/unit/test_schemas.py`:
 
@@ -2795,7 +2867,7 @@ def test_root_schema_not_empty():
   - `@dataclass class CaseResult`: `exit_code: int`, `out_dir: Path`, `stdout: str`, `stderr: str`, `state: dict | None`, `tables: dict[str, list[dict]]` (CSV rows per output file), `manifests: dict[str, dict]`.
   - `run_case(name: str, tmp_path: Path, monkeypatch, capsys, *, state: dict | None = None, env: dict[str, str] | None = None, overrides: dict | None = None) -> CaseResult` — materialises `data/config.json` (deep-merging `overrides` into `parameters`), optional `in/state.json`, sets `KBC_DATADIR` (+ `env`), runs `runpy.run_path("src/component.py", run_name="__main__")`, captures `SystemExit` (no exit → 0), reads outputs.
   - `run_twice(name, tmp_path, monkeypatch, capsys, **kw) -> tuple[CaseResult, CaseResult]` — second run gets the first run's `out/state.json` as `in/state.json` (or the first run's *input* state when the first run wrote none — a failed run), same broker.
-  - `run_chain(names: list[str], tmp_path, monkeypatch, capsys, *, before_each: Callable[[int], None] | None = None) -> list[CaseResult]` — the same chaining rule over N runs; `before_each(i)` seeds / injects faults before run `i`.
+  - `run_chain(names: list[str], tmp_path, monkeypatch, capsys, *, before_each: Callable[[int], None] | None = None, discard_state: set[int] = frozenset()) -> list[CaseResult]` — the same chaining rule over N runs; `before_each(i)` seeds / injects faults before run `i`; a run index in `discard_state` hands its *input* state to the next run even if it succeeded (simulates another row of the same job failing, spec §6.10).
   - `sync_result(result: CaseResult) -> object` — parses the last stdout line as JSON.
 
 `tests/setup/configs.json` contains one wrapped entry per case of spec §8 with dummy credentials only (SAS `SharedAccessKey=ZmFrZWtleWZha2VrZXlmYWtla2V5ZmFrZWtleTEyMzQ1Njc4OTA=`, SP `tenant_id` / `client_id` = `00000000-0000-0000-0000-000000000000`, `#client_secret` = `dummy-secret`).
@@ -2896,15 +2968,15 @@ def test_01_testConnection_queue(fake_broker, tmp_path, monkeypatch, capsys):
 - Create: `tests/functional/test_bodies_and_robustness.py`, `tests/functional/test_sanitisation.py`
 - Modify: `tests/setup/configs.json`
 
-- [ ] **Step 1: Write the failing tests** — cases `46`–`67` of spec §8:
+- [ ] **Step 1: Write the failing tests** — cases `46`–`69` of spec §8:
 
 | Case | Seed / setup | Assertions |
 |---|---|---|
 | `46_run_body_base64` | body `b"\x00\x01"` | `body == "AAE="` |
 | `47_run_body_value_sequence` | VALUE `{"k": "v"}`, SEQUENCE `[[1, "a"]]` | bodies `{"k":"v"}` / `[[1,"a"]]`; `body_type` `VALUE` / `SEQUENCE` |
 | `48_run_body_charset_multisection` | DATA sections `[b"p\xe9", b"x"]`, content type `text/plain; charset=latin-1` | `body == "péx"` |
-| `49_run_flatten_json` | body `{"order":{"id":1,"items":[1,2]},"a.b":1,"a":{"b":2}}` | no `body` column; columns `body_order_id`, `body_order_items` (`[1,2]`), `body_a_b`, `body_a_b_2`; state `flatten_columns` has 4 entries |
-| `50_run_flatten_new_keys_second_run` | `run_twice`: run 1 `{"x":1}`, run 2 `{"y":2}` | run 2 header contains both `body_x` and `body_y` (`body_x` empty) |
+| `49_run_flatten_json` | C1 (`complete`), flatten, `run_twice`; each run gets one message with body `{"order":{"id":1,"items":[1,2]},"a.b":1,"a":{"b":2}}` | run 1: no `body` column and no `body_*` key columns; `body_unmapped` = `{"body_order_id":"1","body_order_items":"[1,2]","body_a_b":"1","body_a_b_2":"2"}`; state `flatten_columns` has 4 hashed entries. Run 2: header has `body_order_id`, `body_order_items`, `body_a_b`, `body_a_b_2`, `body_unmapped`; values in their columns; `body_unmapped` empty |
+| `50_run_flatten_new_keys_second_run` | C2 (`defer_commit`), flatten, `run_chain` of 3: run 1 `{"x":1}`, run 2 `{"y":2}`, run 3 `{"y":3}` | run 2: header has `body_x` (empty) but not `body_y`, `body_unmapped` = `{"body_y":"2"}`; run 3: header has `body_x` and `body_y`, `body_unmapped` empty |
 | `51_run_flatten_not_json` | body `b"plain"`, flatten, C1 | 0 rows; message in DLQ with reason `NotJson` |
 | `52_run_unreadable_body_two_connections` | `inject_body_error(seq, times=2)` | message dead-lettered `UnreadableBody`; ≥ 2 clients opened; 0 rows for it |
 | `53_run_unreadable_on_dlq_degrades` | DLQ source + `inject_body_error(times=2)` | message stays in the DLQ; WARNING about sub-queues |
@@ -2919,9 +2991,11 @@ def test_01_testConnection_queue(fake_broker, tmp_path, monkeypatch, capsys):
 | `62_run_dev_branch_override` | env `KBC_BRANCHID=1`, `destructive_in_branch: true` | exit 0; messages consumed |
 | `63_run_dev_branch_peek` | env `KBC_BRANCHID=1`, peek | exit 0 |
 | `64_run_missing_creds` | no `#connection_string` | exit 1; stderr contains `connection_string` |
-| `65_run_failure_write_always_per_mode` | 3 messages, batch 1, a non-recoverable error injected on receive call 3, parametrised over C1 / C2 / C3 / C4, plus C1 failing on call 1 | exit ≠ 0 in every variant; C1 / C3: `out/tables/q.csv` holds the 2 settled rows and the manifest has `write_always: true`; C2, C4 and C1-on-call-1: manifest `write_always` is `false` (a failed job uploads nothing) |
-| `66_run_flatten_failed_run_new_keys` | C2, flatten; run 1: 2 messages `{"a":1}` then a non-recoverable error on call 2; run 2 (same broker, run 1's input state because run 1 wrote none): 1 message `{"a":2,"b":3}` | run 1: exit ≠ 0, CSV header ends with `body_unmapped` and has no `body_a`, the written row's `body_unmapped` is `{"a":"1"}`, no `out/state.json`; run 2: exit 0, header has `body_a`, `body_b`, `body_unmapped`, the row's `body_unmapped` empty, state registry `[a, b]` |
-| `67_run_flatten_c1_promotion_lag` | C1, flatten, three runs chaining state; run 1 fails after one settled batch with key `k`; run 2 succeeds with key `k`; run 3 succeeds with key `k` | run 1: `write_always` true, no `body_k`, `body_unmapped` filled; run 2: still no `body_k`, `body_unmapped` filled, state registry contains `k`; run 3: header has `body_k`, `body_unmapped` empty |
+| `65_run_failure_write_always_per_mode` | 3 messages, batch 1; the injected error is fatal (`ServiceBusAuthenticationError`, never recycled); parametrised: C1 / C2 / C3 with `inject_receive_error` on receive call 3; C4 with `inject_peek_error` on peek call 2 after `receiver.PEEK_PAGE_SIZE` is monkeypatched to 1; C1 with the error on call 1; C3 with the error on call 1 (nothing returned yet) | exit ≠ 0 in every variant; C1 / C3 (error on call 3): `out/tables/q.csv` holds the 2 settled rows and the manifest has `write_always: true`; C2, C4, C1-on-call-1 and C3-on-call-1: manifest `write_always` is `false` |
+| `66_run_flatten_failed_run_new_keys` | C2, flatten, `run_chain` of 3; run 1: messages `{"a":1}` then a non-recoverable error on receive call 2; runs 2 and 3: one message `{"a":2}` each | run 1: exit ≠ 0, header has no `body_a`, the written row's `body_unmapped` = `{"body_a":"1"}`, no `out/state.json`; run 2 (starts from run 1's input state): exit 0, still no `body_a`, `body_unmapped` = `{"body_a":"2"}`, state registry has `a`; run 3: header has `body_a`, `body_unmapped` empty |
+| `67_run_flatten_cross_row_state_discard` | C4 (`peek`, full fetch), flatten, `run_chain` of 2 with `discard_state={0}` (run 1 succeeds but its state is discarded, as when another row of the job fails); one message `{"k":1}` | run 1 header has no `body_k`; run 2 starts from run 1's input state and its header equals run 1's — no import can ever miss a column |
+| `68_run_unreadable_fail_writes_rest_first` | C3, policy `fail`, 3 messages in one batch, the middle one with a body error | exit 1; the 2 readable rows are in the CSV; manifest `write_always: true` |
+| `69_run_flatten_cap_writes_rest_first` | C3, flatten, `MAX_FLATTEN_COLUMNS` monkeypatched to 1, one batch of `{"a":1}` and `{"b":2}` | exit 1 ("distinct JSON keys"); both rows are in the CSV (`body_b` in `body_unmapped`); manifest `write_always: true` |
 
 - [ ] **Step 2:** FAIL → fix revealed component bugs test-first in the owning module.
 - [ ] **Step 3: Sanitisation gate** — add `tests/functional/test_sanitisation.py`:
@@ -2962,9 +3036,9 @@ def test_committed_fixtures_hold_only_dummy_secrets():
 
 ## Self-Review
 
-1. **Spec coverage:** gate-1 amendments — `write_always` switch (spec §6.9) → Tasks 9, 11, 14, 16, 20 (case 65); `body_unmapped` + promotion rule (§6.10) → Tasks 7, 9, 11, 20 (cases 66–67); separate unreadable retry budget (§6.5–§6.6) → Tasks 11, 14, 15. §2.3–§2.5 → Tasks 2, 11, 14–16; §3 (auth, profile, pin) → Tasks 1, 3, 14; §4 in-scope rows → A (Tasks 5, 14, 15), B (3), C (11–15), D (2, 14, 15), E (8), F (7), G (9), H (6, 12, 13, 15), I (16, 17), J (3, 11–16), K (1, 3), L (5, 16); §5 → Tasks 2, 16, 17; §6.1–§6.12 → Tasks 5–16; §8 cases → Tasks 18–20 (+ unit tests per task); §9 → Phase 7; §11 → README (Task 17). Excluded rows have no task by design.
+1. **Spec coverage:** gate-1 amendments — `write_always` switch (spec §6.9) → Tasks 9, 11, 14, 16, 20 (case 65); `body_unmapped` + the input-registry column rule in every mode (§6.10, gate cycle 2) → Tasks 7, 9, 11, 20 (cases 49, 50, 66, 67); write-first-fail-after (§6.6) → Task 11, cases 68–69; hashed registry + budget (§6.8) → Tasks 6, 7, 16; separate unreadable retry budget (§6.5–§6.6) → Tasks 11, 14, 15. §2.3–§2.5 → Tasks 2, 11, 14–16; §3 (auth, profile, pin) → Tasks 1, 3, 14; §4 in-scope rows → A (Tasks 5, 14, 15), B (3), C (11–15), D (2, 14, 15), E (8), F (7), G (9), H (6, 12, 13, 15), I (16, 17), J (3, 11–16), K (1, 3), L (5, 16); §5 → Tasks 2, 16, 17; §6.1–§6.12 → Tasks 5–16; §8 cases → Tasks 18–20 (+ unit tests per task); §9 → Phase 7; §11 → README (Task 17). Excluded rows have no task by design.
 2. **Placeholder scan:** no placeholder markers; every test step has code or an exact per-case assertion table.
-3. **Type consistency:** `EntityRef`, `EntityInfo`, `PendingSetBuilder`, `PendingEntity`, `FlattenRegistry` (`register` / `split` / `input_columns`), `OutputRow` / `OutputTable` / `RowSink` (`arm_write_always`, `close(success)`), `BatchProcessor` / `BatchResult.progressed`, `RecoveryTracker.unreadable_retry`, `RunStats`, `ServiceBusConnector` names and signatures match across Tasks 2–20.
+3. **Type consistency:** `EntityRef`, `EntityInfo`, `PendingSetBuilder`, `PendingEntity`, `FlattenRegistry` (`register` / `split` / `input_columns` / `overflowed`, `path_hash`), `OutputRow` / `OutputTable` / `RowSink` (`arm_write_always`, `close()`), `BatchProcessor` / `BatchResult.progressed`, `RecoveryTracker.unreadable_retry`, `RunStats`, `ServiceBusConnector` names and signatures match across Tasks 2–20.
 
 ## Execution Handoff
 
