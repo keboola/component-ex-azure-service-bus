@@ -13,7 +13,7 @@ import logging
 import time
 from collections import Counter
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import InitVar, dataclass, field
 from typing import Any
 
 from configuration import (
@@ -37,12 +37,21 @@ def _mark(value: Any, default: Any) -> str:
     return f"{value} (default)" if value == default else f"{value}"
 
 
+def _mark_table_name(table_name: str, default_table_name: str) -> str:
+    """Like ``_mark``, but comparing the raw (possibly empty) model values first -- an explicit
+    ``table_name`` that happens to be the literal string ``"derived"`` must never be marked
+    ``(default)`` just because the empty default also displays as ``"derived"``."""
+    display = table_name or "derived"
+    return f"{display} (default)" if table_name == default_table_name else display
+
+
 @dataclass
 class RunStats:
     """Per-run counters plus the two spec §6.12 log lines.
 
     ``monotonic`` is the R-4 injectable clock (``None`` resolves to ``time.monotonic`` at
-    construction) used to report ``duration_s`` in ``summary_line()``.
+    construction) used to report ``duration_s`` in ``summary_line()``; it is an ``InitVar``, not a
+    public field, since it is consumed once in ``__post_init__`` and never read back.
     """
 
     mode: str
@@ -65,10 +74,10 @@ class RunStats:
     unreadable: Counter[str] = field(default_factory=Counter)
     stop_reason: str = ""
     warnings: dict[str, str] = field(default_factory=dict)
-    monotonic: Callable[[], float] | None = None
+    monotonic: InitVar[Callable[[], float] | None] = None
 
-    def __post_init__(self) -> None:
-        self._monotonic = self.monotonic or time.monotonic
+    def __post_init__(self, monotonic: Callable[[], float] | None) -> None:
+        self._monotonic = monotonic or time.monotonic
         self._start = self._monotonic()
 
     def warn(self, key: str, message: str) -> None:
@@ -154,7 +163,7 @@ def log_effective_settings(config: Configuration, entity: EntityRef) -> None:
             f"unreadable_body={_mark(body.unreadable_body, default_body.unreadable_body)}",
             f"load_type={_mark(destination.load_type, default_destination.load_type)}",
             f"primary_key={_mark(destination.primary_key, default_destination.primary_key)}",
-            "table_name=" + _mark(destination.table_name or "derived", default_destination.table_name or "derived"),
+            "table_name=" + _mark_table_name(destination.table_name, default_destination.table_name),
             f"batch_size={_mark(advanced.batch_size, default_advanced.batch_size)}",
             f"prefetch_count={_mark(advanced.prefetch_count, default_advanced.prefetch_count)}",
             f"recovery_wait_seconds={_mark(advanced.recovery_wait_seconds, default_advanced.recovery_wait_seconds)}",
