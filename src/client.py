@@ -65,19 +65,21 @@ def redact_secrets(text: str, secrets: Iterable[str] = ()) -> str:
 
 
 class RedactingFilter(logging.Filter):
-    """Rewrites ``record.msg`` and ``record.args`` through :func:`redact_secrets` (J7)."""
+    """Rewrites the record's message through :func:`redact_secrets` (J7).
+
+    The message is formatted first (``msg % args``) and the result redacted, with ``args`` cleared:
+    redacting each argument as a string instead would break numeric placeholders such as ``%d``,
+    and formatting first also masks a secret carried by a non-string argument's ``str()``. Running
+    the filter again on the same record (one instance sits on every root handler) is a no-op.
+    """
 
     def __init__(self, secrets: Iterable[str]) -> None:
         super().__init__()
         self._secrets = tuple(s for s in secrets if s)
 
     def filter(self, record: logging.LogRecord) -> bool:
-        record.msg = redact_secrets(str(record.msg), self._secrets)
-        if record.args:
-            if isinstance(record.args, dict):
-                record.args = {key: redact_secrets(str(value), self._secrets) for key, value in record.args.items()}
-            else:
-                record.args = tuple(redact_secrets(str(arg), self._secrets) for arg in record.args)
+        record.msg = redact_secrets(record.getMessage(), self._secrets)
+        record.args = None
         return True
 
 
@@ -95,6 +97,16 @@ def configure_logging(secrets: Iterable[str], debug: bool) -> None:
                 handler.removeFilter(existing)
         handler.addFilter(redacting_filter)
     logging.getLogger("azure").setLevel(logging.INFO if debug else logging.CRITICAL)
+
+
+def is_session_mismatch(error: BaseException) -> bool:
+    """True for the plain ``ServiceBusError`` the SDK raises when the row's Sessions setting does not
+    match the entity (§6.11) -- exactly the texts :func:`to_user_exception` maps to "enable / disable
+    Sessions". The SDK's own session-lock errors (``SessionLockLostError``, ...) never match."""
+    if not isinstance(error, ServiceBusError):
+        return False
+    text = str(error)
+    return _SESSION_REQUIRED_TEXT in text or any(marker in text.lower() for marker in _SESSION_NOT_USED_TEXTS)
 
 
 def is_management_denied(error: Exception) -> bool:
@@ -140,10 +152,9 @@ def to_user_exception(
             "Check the host name and network access (outbound AMQP port 5671)."
         )
     elif isinstance(error, ServiceBusError):
-        text = str(error)
-        if _SESSION_REQUIRED_TEXT in text:
+        if _SESSION_REQUIRED_TEXT in str(error):
             message = f"The entity{target} requires sessions: enable Sessions in the row."
-        elif any(marker in text.lower() for marker in _SESSION_NOT_USED_TEXTS):
+        elif is_session_mismatch(error):
             message = f"The entity{target} does not use sessions: disable Sessions in the row."
         else:
             message = f"Azure Service Bus reported an error for{target}."

@@ -1,0 +1,475 @@
+"""Receive loop (C1 / C2 / C3) and connection-recovery bookkeeping (Task 14, spec §6.2, §6.5, §6.6, §6.11).
+
+``ReceiveLoop`` drives one destructive run: batches of ``receive_messages`` go through the shared
+``BatchProcessor`` (write first, then settle) until a stop rule fires; then the stop drain empties the
+local receive buffer -- C1 / C2 abandon the drained messages so they are available again at once, C3
+writes them because RECEIVE_AND_DELETE has already deleted them on the broker. Session entities loop
+``NEXT_AVAILABLE_SESSION`` receivers, one session at a time.
+
+Any failure that is neither the processor's own ``UserException`` (``fail`` policy, flatten cap, abort
+share -- the run ends after the stop drain) nor a configuration / auth / entity error closes the
+receiver and its client and opens fresh ones. ``RecoveryTracker`` caps those connection recoveries
+(5 per run, and never twice without progress in between); the unreadable-body retry recycles the
+connection on its own budget and never counts as a recovery. Every SDK call runs on the main thread;
+message bodies are never logged.
+"""
+
+import logging
+import time
+from collections.abc import Callable, Iterable, Sequence
+from datetime import UTC, datetime
+from enum import StrEnum
+from functools import partial
+from typing import Any
+
+from azure.servicebus import NEXT_AVAILABLE_SESSION, ServiceBusClient, ServiceBusMessageState, ServiceBusReceiveMode
+from azure.servicebus.exceptions import (
+    MessagingEntityDisabledError,
+    MessagingEntityNotFoundError,
+    OperationTimeoutError,
+    ServiceBusAuthenticationError,
+    ServiceBusAuthorizationError,
+    ServiceBusError,
+    SessionCannotBeLockedError,
+)
+from keboola.component.exceptions import UserException
+
+from client import ServiceBusConnector, is_session_mismatch, redact_secrets, to_user_exception
+from configuration import Configuration, SettlementMode
+from entity import EntityInfo, EntityRef
+from settlement import LOCK_RENEW_MARGIN, BatchProcessor, BatchResult, safe_settle
+from state import STATE_BUDGET_BYTES
+from stats import RunStats
+
+logger = logging.getLogger(__name__)
+
+MAX_RECOVERIES = 5
+# The accept wait of every session receiver outside the destructive receive loop (C4 peek,
+# testConnection, previewMessages): idle_timeout_seconds is hidden -- and so ignored -- there.
+SESSION_ACCEPT_WAIT_SECONDS = 5
+DRAIN_WAIT_SECONDS = 1
+CATCH_UP_POLL_SECONDS = 1
+
+# Errors a fresh connection cannot fix (spec §6.11); plus the session mismatch (``is_session_mismatch``).
+FATAL_ERRORS = (
+    ServiceBusAuthenticationError,
+    ServiceBusAuthorizationError,
+    MessagingEntityNotFoundError,
+    MessagingEntityDisabledError,
+)
+
+_RECEIVE_MODES = {
+    SettlementMode.COMPLETE: ServiceBusReceiveMode.PEEK_LOCK,
+    SettlementMode.DEFER_COMMIT: ServiceBusReceiveMode.PEEK_LOCK,
+    SettlementMode.RECEIVE_AND_DELETE: ServiceBusReceiveMode.RECEIVE_AND_DELETE,
+}
+
+
+class StopReason(StrEnum):
+    IDLE = "idle"
+    MAX_MESSAGES = "max_messages"
+    MAX_DURATION = "max_duration"
+    WATERMARK = "watermark"
+    STATE_BUDGET = "state_budget"
+    NO_MORE_SESSIONS = "no_more_sessions"
+    SESSION_REVISITED = "session_revisited"
+    END_OF_ENTITY = "end_of_entity"
+
+
+def is_fatal(error: BaseException) -> bool:
+    """A configuration, auth or entity error (or the session mismatch): mapped, never recycled."""
+    return isinstance(error, FATAL_ERRORS) or is_session_mismatch(error)
+
+
+class RecoveryTracker:
+    """Connection-recovery budget and the no-progress guard (spec §6.5).
+
+    ``generation`` identifies the current connection: it grows on every reopen -- a connection
+    recovery or an unreadable-body retry -- so the unreadable handler can tell a second failure on a
+    fresh connection from the first. ``count`` counts connection recoveries only.
+    """
+
+    def __init__(
+        self, max_recoveries: int = MAX_RECOVERIES, *, entity_path: str | None = None, secrets: Iterable[str] = ()
+    ) -> None:
+        self.max_recoveries = max_recoveries
+        self.generation = 0
+        self.count = 0
+        self._entity_path = entity_path
+        self._secrets = tuple(secrets)
+        self._progressed = True  # no connection failure yet: the first one is always recycled
+
+    def progress(self) -> None:
+        """A row was written or an unreadable body was finally disposed of."""
+        self._progressed = True
+
+    def unreadable_retry(self) -> None:
+        """The processor asked for a fresh connection for an unreadable body -- its own budget, not a
+        connection failure: neither ``count`` nor the progress flag changes."""
+        self.generation += 1
+
+    def failure(self, error: Exception) -> None:
+        """Account for a connection failure, or raise when it must end the run.
+
+        A ``UserException`` (the processor's ``fail`` policy / flatten cap / abort share) is re-raised
+        unchanged and never counted; a fatal error is mapped to a ``UserException``; a failure with no
+        progress since the previous one, or beyond ``max_recoveries``, ends the run -- as a
+        ``UserException`` for a ``ServiceBusError``, anything else unchanged (exit 2)."""
+        if isinstance(error, UserException):
+            raise error
+        if isinstance(error, ServiceBusError) and is_fatal(error):
+            raise to_user_exception(error, self._entity_path, self._secrets) from error
+        if self.count >= self.max_recoveries or not self._progressed:
+            if isinstance(error, ServiceBusError):
+                raise UserException(
+                    f"Lost the connection to Service Bus {self.count + 1} times in this run (limit "
+                    f"{self.max_recoveries}, or twice without writing a row or disposing an unreadable message in "
+                    f"between); last error: {redact_secrets(str(error), self._secrets)}. Messages that were not "
+                    "settled redeliver on the next run."
+                ) from error
+            raise error
+        self.count += 1
+        self.generation += 1
+        self._progressed = False
+
+
+def _enter(receiver: Any) -> Any:
+    """Open (attach) ``receiver`` so entity, auth and session errors surface here, inside the caller's
+    recovery ``try``; a receiver that fails to open is closed before the error propagates."""
+    try:
+        return receiver.__enter__()
+    except Exception:
+        _close_quietly(receiver)
+        raise
+
+
+def _close_quietly(handler: Any) -> None:
+    """Close a receiver or client; a broken link may fail to close, which must never mask the error
+    that ended the run (the next open starts afresh anyway)."""
+    try:
+        handler.close()
+    except Exception as error:  # noqa: BLE001 -- best-effort cleanup
+        logger.debug("Closing a Service Bus handler failed: %s", type(error).__name__)
+
+
+def _renew_session_if_needed(receiver: Any, now: datetime) -> None:
+    """Renew the session lock from the main thread when it lapses within ``LOCK_RENEW_MARGIN`` (D10);
+    session receivers hold no message locks (``locked_until_utc`` is ``None`` on their messages)."""
+    session = receiver.session
+    locked_until = session.locked_until_utc if session is not None else None
+    if locked_until is not None and locked_until - now < LOCK_RENEW_MARGIN:
+        session.renew_lock()
+
+
+def _after_watermark(message: Any, t0: datetime) -> bool:
+    """Enqueued at or after T0. ``SCHEDULED`` messages never count: their enqueue time may be the
+    future scheduled time [inferred]."""
+    enqueued = message.enqueued_time_utc
+    return message.state != ServiceBusMessageState.SCHEDULED and enqueued is not None and enqueued >= t0
+
+
+def _describe(error: BaseException, secrets: Iterable[str]) -> str:
+    return redact_secrets(f"{type(error).__name__}: {error}", secrets)
+
+
+class ReceiveLoop:
+    """One destructive run (C1 / C2 / C3) over the row's entity (spec §6.5). ``processor`` and
+    ``arm_write_always`` are public attributes (the tests replace them)."""
+
+    def __init__(
+        self,
+        *,
+        connector: ServiceBusConnector,
+        entity: EntityRef,
+        info: EntityInfo,
+        config: Configuration,
+        processor: BatchProcessor,
+        stats: RunStats,
+        t0: datetime,
+        state_size: Callable[[], int],
+        arm_write_always: Callable[[], None],
+        clock: Callable[[], datetime] | None = None,
+        monotonic: Callable[[], float] | None = None,
+        sleep: Callable[[float], None] | None = None,
+    ) -> None:
+        mode = config.source.settlement_mode
+        if mode not in _RECEIVE_MODES:
+            raise ValueError("the receive loop runs the destructive settlement modes; peek mode uses PeekPager")
+        self._connector = connector
+        self._entity = entity
+        self._info = info
+        self._config = config
+        self.processor = processor
+        self._stats = stats
+        self._t0 = t0
+        self._state_size = state_size
+        self.arm_write_always = arm_write_always
+        self._clock = clock or (lambda: datetime.now(UTC))
+        self._monotonic = monotonic or time.monotonic
+        self._sleep = sleep or time.sleep
+        self._mode = mode
+        self._sessions = config.source.session_enabled
+        self._tracker = RecoveryTracker(entity_path=entity.path, secrets=connector.secrets)
+        self._client: ServiceBusClient | None = None
+        self._receiver: Any = None
+        self._session_id: str | None = None  # the session the open receiver holds
+        self._seen_sessions: set[str] = set()
+        self._taken = 0  # messages handled for max_messages; a retried body counts once it comes back
+        self._armed = False
+        self._deadline = 0.0
+        self._wait: float = config.source.idle_timeout_seconds  # 1 s while catching up
+
+    def run(self) -> StopReason:
+        self._deadline = self._monotonic() + self._config.limits.max_duration_seconds
+        try:
+            reason = self._consume(catch_up_until=None)
+            if self._catch_up_due(reason):
+                reason = self._catch_up()
+        finally:
+            self._close()
+        self._stats.stop_reason = reason.value
+        return reason
+
+    # --- the loop -------------------------------------------------------------------------------------
+
+    def _consume(self, *, catch_up_until: float | None) -> StopReason:
+        """Steps until a stop. Every receiver is opened inside this ``try``, so an error at open
+        (auth, missing entity, session mismatch) is mapped or recycled like one on a call."""
+        while True:
+            try:
+                reason = self._step(catch_up_until)
+            except UserException:
+                raise  # the processor's own failure (already drained) or a configuration problem
+            except Exception as error:  # noqa: BLE001 -- a recycle candidate: the tracker re-raises what ends the run
+                if self._sessions and isinstance(error, SessionCannotBeLockedError):
+                    logger.info("A session could not be locked (another receiver holds it); skipping it.")
+                    self._finish_session()
+                else:
+                    self._recover(error)
+                continue
+            if reason is not None:
+                return reason
+
+    def _step(self, catch_up_until: float | None) -> StopReason | None:
+        """Open the next receiver, or receive and process one batch. ``None``: keep going."""
+        receiver = self._receiver
+        stop = self._stop_check(catch_up_until)
+        if stop is not None:
+            if receiver is not None:
+                self._stop_drain(receiver, failing=False)
+            return stop
+        if receiver is None:
+            return self._open_next(catch_up_until)
+        if self._sessions:
+            _renew_session_if_needed(receiver, self._clock())
+        batch = self._receive(receiver, self._batch_count(), self._wait)
+        if not batch:
+            return self._on_empty(catch_up_until)
+        result = self._process(receiver, batch)
+        if self._config.limits.stop_at_job_start and self._is_watermark_batch(batch):
+            return self._on_watermark(receiver)
+        if result.needs_recycle:
+            # A fresh connection for the unreadable bodies (they were abandoned and redeliver at once);
+            # the unreadable budget pays for it, the connection-recovery budget does not.
+            self._close(interrupted=True)
+            self._tracker.unreadable_retry()
+            self._stats.unreadable_recycles += 1
+        return None
+
+    def _stop_check(self, catch_up_until: float | None) -> StopReason | None:
+        limit = self._config.limits.max_messages
+        if limit > 0 and self._taken >= limit:
+            return StopReason.MAX_MESSAGES
+        now = self._monotonic()
+        if now >= self._deadline:
+            return StopReason.MAX_DURATION
+        if self._mode is SettlementMode.DEFER_COMMIT and self._state_size() >= STATE_BUDGET_BYTES:
+            self._stats.warn(
+                "state_budget",
+                f"The state this defer-commit run would save reached {STATE_BUDGET_BYTES // 1024} KiB (Keboola "
+                "keeps about 1 MB of state per configuration), so the run stopped receiving early; the next run "
+                "deletes this run's deferrals first and continues.",
+            )
+            return StopReason.STATE_BUDGET
+        if catch_up_until is not None and now >= catch_up_until:
+            return StopReason.NO_MORE_SESSIONS if self._sessions else StopReason.IDLE
+        return None
+
+    def _batch_count(self) -> int:
+        batch_size, limit = self._config.advanced.batch_size, self._config.limits.max_messages
+        return min(batch_size, limit - self._taken) if limit > 0 else batch_size
+
+    def _open_next(self, catch_up_until: float | None) -> StopReason | None:
+        if self._client is None:
+            self._client = self._connector.receive_client()
+        if not self._sessions:
+            self._receiver = self._open_receiver(self._client, session=False)
+            return None
+        try:
+            receiver = self._open_receiver(self._client, session=True)
+        except OperationTimeoutError:  # no session with an available message
+            if catch_up_until is None:
+                return StopReason.NO_MORE_SESSIONS
+            self._sleep(CATCH_UP_POLL_SECONDS)
+            return None
+        self._receiver = receiver
+        session_id = str(receiver.session.session_id)
+        if session_id in self._seen_sessions:
+            # Handed out a second time: it still holds messages enqueued after T0 -- end the session loop.
+            self._stop_drain(receiver, failing=False)
+            return StopReason.SESSION_REVISITED
+        self._seen_sessions.add(session_id)
+        self._session_id = session_id
+        return None
+
+    def _open_receiver(self, client: ServiceBusClient, *, session: bool) -> Any:
+        """The §6.2 profile: the mode's receive mode, ``prefetch_count``, no keep-alive thread, the
+        row's client identifier; session receivers wait ``idle_timeout_seconds`` for a session."""
+        kwargs: dict[str, Any] = {
+            "receive_mode": _RECEIVE_MODES[self._mode],
+            "prefetch_count": self._config.advanced.prefetch_count,
+            "keep_alive": 0,
+            "client_identifier": self._connector.client_identifier,
+        }
+        if session:
+            kwargs |= {"session_id": NEXT_AVAILABLE_SESSION, "max_wait_time": self._wait}
+        return _enter(self._entity.open_receiver(client, **kwargs))
+
+    def _receive(self, receiver: Any, count: int, wait: float) -> list[Any]:
+        batch = receiver.receive_messages(max_message_count=count, max_wait_time=wait)
+        for message in batch:
+            self._info.note_sequence_number(message.sequence_number)
+        if batch and self._mode is SettlementMode.RECEIVE_AND_DELETE and not self._armed:
+            # C3: the broker deleted these on receive -- arm before the first of them is written (§6.9).
+            self.arm_write_always()
+            self._armed = True
+        return batch
+
+    def _process(self, receiver: Any, batch: Sequence[Any]) -> BatchResult:
+        written = self._stats.written
+        try:
+            result = self.processor.process(receiver, batch, self._tracker.generation)
+        except UserException:
+            # Write first, fail after (amendments 1 + 2): the batch's readable rows are written and
+            # settled. Never a connection failure -- drain the still-open receiver, then re-raise.
+            self._stop_drain(receiver, failing=True)
+            raise
+        finally:
+            # Rows written before a settle-time connection error still count as progress.
+            if self._stats.written > written:
+                self._tracker.progress()
+        if result.progressed:
+            self._tracker.progress()
+        self._taken += len(batch) - len(result.retried)
+        return result
+
+    def _is_watermark_batch(self, batch: Sequence[Any]) -> bool:
+        considered = [message for message in batch if message.state != ServiceBusMessageState.SCHEDULED]
+        return bool(considered) and all(_after_watermark(message, self._t0) for message in considered)
+
+    def _on_empty(self, catch_up_until: float | None) -> StopReason | None:
+        if self._sessions:
+            self._finish_session()  # this session is drained: on to the next one
+            return None
+        if catch_up_until is None:
+            return StopReason.IDLE
+        self._sleep(CATCH_UP_POLL_SECONDS)
+        return None
+
+    def _on_watermark(self, receiver: Any) -> StopReason | None:
+        if self._info.is_partitioned:
+            self._stats.warn(
+                "watermark_approximate",
+                f"'{self._entity.path}' is partitioned, so messages are not received in enqueue order: the stop at "
+                "the job start time is approximate (it can end early or late; nothing is lost).",
+            )
+        self._stop_drain(receiver, failing=False)
+        if self._sessions:
+            self._finish_session()  # a per-session watermark: continue with the next session
+            return None
+        return StopReason.WATERMARK
+
+    # --- stop drain, recovery, catch-up ---------------------------------------------------------------
+
+    def _stop_drain(self, receiver: Any, *, failing: bool) -> None:
+        """Empty the local receive buffer at a stop (C8): C1 / C2 abandon the drained messages, C3
+        writes them (already deleted on the broker), even past ``max_messages``. ``failing``: the run
+        is about to raise the processor's ``UserException`` -- a further one from the drained batch is
+        swallowed (its readable rows are written) and nothing here may mask the original."""
+        try:
+            if self._sessions:
+                _renew_session_if_needed(receiver, self._clock())
+            drained = self._receive(receiver, self._config.advanced.prefetch_count + 1, DRAIN_WAIT_SECONDS)
+            if not drained:
+                return
+            if self._mode is SettlementMode.RECEIVE_AND_DELETE:
+                self.processor.process(receiver, drained, self._tracker.generation)
+                return
+            for message in drained:
+                safe_settle(partial(receiver.abandon_message, message), self._stats)
+            logger.info("Abandoned %d buffered message(s) at the stop; they are available again at once.", len(drained))
+        except UserException as error:
+            if not failing:
+                raise
+            logger.warning(
+                "The messages drained before the run fails raised a further error (their readable rows were "
+                "written): %s",
+                redact_secrets(str(error), self._connector.secrets),
+            )
+        except Exception as error:  # noqa: BLE001 -- the drain is best-effort; it must not change the run's outcome
+            if self._mode is SettlementMode.RECEIVE_AND_DELETE:
+                consequence = "messages already in the local buffer were deleted on receive and may be lost"
+            else:
+                consequence = "buffered messages stay locked until their lock expires, then redeliver"
+            logger.warning("The stop drain failed (%s); %s.", _describe(error, self._connector.secrets), consequence)
+
+    def _recover(self, error: Exception) -> None:
+        """Close the receiver and its client, then let the tracker decide; the next step reopens."""
+        self._close(interrupted=True)
+        self._tracker.failure(error)
+        self._stats.recoveries = self._tracker.count
+        logger.warning(
+            "The Service Bus connection failed (%s); reopening it (recovery %d of %d). Messages of an interrupted "
+            "batch redeliver once their lock expires.",
+            _describe(error, self._connector.secrets),
+            self._tracker.count,
+            self._tracker.max_recoveries,
+        )
+
+    def _catch_up_due(self, reason: StopReason) -> bool:
+        return (
+            self._config.advanced.recovery_wait_seconds > 0
+            and self._tracker.count > 0
+            and reason in (StopReason.IDLE, StopReason.NO_MORE_SESSIONS)
+        )
+
+    def _catch_up(self) -> StopReason:
+        """D6: keep polling (1 s waits, 1 s sleep after each empty poll) for up to
+        ``recovery_wait_seconds``, bounded by ``max_duration_seconds``, to collect the messages of
+        interrupted batches once their locks lapse."""
+        wait = self._config.advanced.recovery_wait_seconds
+        until = min(self._monotonic() + wait, self._deadline)
+        logger.info(
+            "Collecting messages redelivered after %d connection recovery(ies) for up to %d s.",
+            self._tracker.count,
+            wait,
+        )
+        self._wait = CATCH_UP_POLL_SECONDS
+        return self._consume(catch_up_until=until)
+
+    def _finish_session(self) -> None:
+        """Close the session's receiver (releasing the session lock); the client stays open."""
+        receiver, self._receiver, self._session_id = self._receiver, None, None
+        if receiver is not None:
+            _close_quietly(receiver)
+
+    def _close(self, *, interrupted: bool = False) -> None:
+        """Close the receiver and its client. ``interrupted``: the open session was not finished, so
+        being handed it again continues it rather than counting as a revisit."""
+        if interrupted and self._session_id is not None:
+            self._seen_sessions.discard(self._session_id)
+        receiver, client = self._receiver, self._client
+        self._receiver = self._client = self._session_id = None
+        for handler in (receiver, client):
+            if handler is not None:
+                _close_quietly(handler)

@@ -166,12 +166,32 @@ def test_redacting_filter_masks_log_records():
     assert "c2VjcmV0" not in text and "s3cr3t" not in text and "SharedAccessKey=***" in text
 
 
+def test_redacting_filter_keeps_numeric_placeholders_and_masks_objects():
+    import io
+    import logging
+
+    from client import RedactingFilter
+
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.addFilter(RedactingFilter(["s3cr3t"]))
+    log = logging.getLogger("redaction-numeric-test")
+    log.addHandler(handler)
+    log.propagate = False
+    try:
+        log.warning("recovery %d of %d: %s", 1, 5, ValueError("token s3cr3t"))
+    finally:
+        log.removeHandler(handler)
+    assert stream.getvalue() == "recovery 1 of 5: token ***\n"
+
+
 def test_configure_logging_levels_and_filter():
     import logging
 
     from client import RedactingFilter, configure_logging
 
     root = logging.getLogger()
+    azure_level = logging.getLogger("azure").level
     handler = logging.StreamHandler()
     root.addHandler(handler)
     try:
@@ -183,3 +203,7 @@ def test_configure_logging_levels_and_filter():
         assert sum(isinstance(f, RedactingFilter) for f in handler.filters) == 1  # no duplicates
     finally:
         root.removeHandler(handler)
+        for other in root.handlers:  # configure_logging touched every root handler (pytest's included)
+            for installed in [f for f in other.filters if isinstance(f, RedactingFilter)]:
+                other.removeFilter(installed)
+        logging.getLogger("azure").setLevel(azure_level)
