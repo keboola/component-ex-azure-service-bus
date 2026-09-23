@@ -185,6 +185,44 @@ def test_redacting_filter_keeps_numeric_placeholders_and_masks_objects():
     assert stream.getvalue() == "recovery 1 of 5: token ***\n"
 
 
+def test_redacting_filter_masks_tracebacks_and_stack_info():
+    import io
+    import logging
+
+    from client import RedactingFilter
+
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.addFilter(RedactingFilter(["s3cr3t"]))
+    log = logging.getLogger("redaction-traceback-test")
+    log.addHandler(handler)
+    log.propagate = False
+    try:
+        try:
+            raise RuntimeError(f"cannot open {SAS} with s3cr3t")
+        except RuntimeError:
+            log.exception("Component failed with an unexpected error")
+        log.warning("where am I", stack_info=True, extra={"marker": "s3cr3t"})
+    finally:
+        log.removeHandler(handler)
+    text = stream.getvalue()
+    assert "Traceback (most recent call last)" in text and "RuntimeError: cannot open" in text
+    assert "c2VjcmV0" not in text and "s3cr3t" not in text and "SharedAccessKey=***" in text
+    assert "Stack (most recent call last)" in text
+
+
+def test_redacting_filter_masks_preformatted_exc_text():
+    import logging
+
+    from client import RedactingFilter
+
+    record = logging.LogRecord("x", logging.ERROR, __file__, 1, "boom", None, None)
+    record.exc_text = f"Traceback ...\nValueError: {SAS} s3cr3t"
+    RedactingFilter(["s3cr3t"]).filter(record)
+    assert record.exc_text is not None
+    assert "c2VjcmV0" not in record.exc_text and "s3cr3t" not in record.exc_text
+
+
 def test_configure_logging_levels_and_filter():
     import logging
 

@@ -12,6 +12,9 @@ COPY scripts/ scripts/
 
 FROM base AS test
 RUN uv sync --all-groups --frozen
+# Deviation from the cookiecutter template: the schema tests and the sanitisation gate read
+# component_config/, so the test stage needs it (the production stage does not).
+COPY component_config/ component_config/
 COPY tests/ tests/
 RUN uv run ruff check src/ tests/
 CMD ["uv", "run", "pytest", "tests/", "-v"]

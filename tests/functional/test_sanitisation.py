@@ -15,8 +15,10 @@ PLACEHOLDER = re.compile(r"<[^<>]+>")
 
 def _scanned() -> list[Path]:
     tests = ROOT / "tests"
-    # component_config is not copied into the Docker test stage: rglob on a missing folder yields nothing.
-    paths = [*tests.rglob("*.json"), *tests.rglob("*.csv"), *(ROOT / "component_config").rglob("*")]
+    component_config = ROOT / "component_config"
+    # The Docker test stage copies component_config/ (Dockerfile); an empty scan would pass silently.
+    assert component_config.is_dir(), "component_config/ is missing: the sanitisation gate would scan nothing"
+    paths = [*tests.rglob("*.json"), *tests.rglob("*.csv"), *component_config.rglob("*")]
     return [path for path in paths if path.is_file()]
 
 

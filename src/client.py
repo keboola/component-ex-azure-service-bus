@@ -65,13 +65,18 @@ def redact_secrets(text: str, secrets: Iterable[str] = ()) -> str:
 
 
 class RedactingFilter(logging.Filter):
-    """Rewrites the record's message through :func:`redact_secrets` (J7).
+    """Rewrites the record's message, traceback and stack through :func:`redact_secrets` (J7).
 
     The message is formatted first (``msg % args``) and the result redacted, with ``args`` cleared:
     redacting each argument as a string instead would break numeric placeholders such as ``%d``,
-    and formatting first also masks a secret carried by a non-string argument's ``str()``. Running
-    the filter again on the same record (one instance sits on every root handler) is a no-op.
+    and formatting first also masks a secret carried by a non-string argument's ``str()``. An
+    attached exception (``logger.exception``) is formatted into ``exc_text`` and redacted, and
+    ``exc_info`` is cleared so no formatter renders the raw traceback again; ``stack_info`` is
+    redacted too. Running the filter again on the same record (one instance sits on every root
+    handler) is a no-op.
     """
+
+    _TRACEBACK_FORMATTER = logging.Formatter()
 
     def __init__(self, secrets: Iterable[str]) -> None:
         super().__init__()
@@ -80,6 +85,14 @@ class RedactingFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         record.msg = redact_secrets(record.getMessage(), self._secrets)
         record.args = None
+        if record.exc_info:
+            if not record.exc_text:
+                record.exc_text = self._TRACEBACK_FORMATTER.formatException(record.exc_info)
+            record.exc_info = None
+        if record.exc_text:
+            record.exc_text = redact_secrets(record.exc_text, self._secrets)
+        if record.stack_info:
+            record.stack_info = redact_secrets(record.stack_info, self._secrets)
         return True
 
 
