@@ -1,5 +1,7 @@
 import base64
 import json
+from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 
@@ -32,10 +34,20 @@ def test_unknown_charset_falls_back_and_replaces():
     assert charset_of("application/json") == "utf-8"
 
 
+def test_non_text_charset_falls_back_to_utf8():
+    # "base64" is a real codec (codecs.lookup succeeds) but a bytes<->bytes transform, not text --
+    # bytes.decode("base64") raises LookupError outright, which must never reach the caller.
+    assert charset_of("text/plain; charset=base64") == "utf-8"
+    m = make_message(b"hello", content_type="text/plain; charset=base64")
+    assert encode_body(m, BodyFormat.TEXT).cell == "hello"
+
+
 def test_base64_data_and_value():
     assert encode_body(make_message(b"\x00\x01"), BodyFormat.BASE64).cell == base64.b64encode(b"\x00\x01").decode()
     value = make_message({"k": "v"}, body_type="VALUE")
-    assert base64.b64decode(encode_body(value, BodyFormat.BASE64).cell) == b'{"k":"v"}'
+    enc = encode_body(value, BodyFormat.BASE64)
+    assert enc.cell is not None
+    assert base64.b64decode(enc.cell) == b'{"k":"v"}'
 
 
 def test_value_and_sequence_as_json_text():
@@ -46,6 +58,29 @@ def test_value_and_sequence_as_json_text():
 def test_body_access_error_is_body_decode_error():
     with pytest.raises(BodyDecodeError):
         encode_body(make_message(b"x", body_error=True), BodyFormat.TEXT)
+
+
+class _MidGeneratorFailureMessage:
+    """A minimal message double whose ``.body`` property access succeeds but whose generator raises
+    partway through consumption -- unlike ``body_error=True``, which fails at property access itself.
+    ``make_message`` cannot construct this (``FakeEntity``/``make_message`` validate section types
+    eagerly), so it is hand-built to exercise the consumption path specifically."""
+
+    body_type = SimpleNamespace(name="DATA")
+    content_type = None
+
+    @property
+    def body(self):
+        def sections():
+            yield b"ok"
+            raise TypeError("boom mid-generator")
+
+        return sections()
+
+
+def test_data_consumption_failure_is_body_decode_error():
+    with pytest.raises(BodyDecodeError):
+        encode_body(_MidGeneratorFailureMessage(), BodyFormat.TEXT)
 
 
 def test_flatten_nested_arrays_scalars():
@@ -62,6 +97,24 @@ def test_flatten_nested_arrays_scalars():
     }
 
 
+def test_compact_json_keeps_decimal_unquoted():
+    # json.dumps(..., default=str) would quote a Decimal ("1.10" -> "\"1.10\""); the manual encoder
+    # must instead emit it as a bare JSON number, at any nesting depth, never rounding through float.
+    assert body_mod.compact_json([Decimal("1.10"), Decimal("2.5")]) == "[1.10,2.5]"
+    assert body_mod.compact_json(Decimal("1.10")) == "1.10"
+    assert body_mod.compact_json([{"p": Decimal("1.5")}]) == '[{"p":1.5}]'
+
+
+def test_flatten_array_of_decimals_stays_unquoted():
+    fields = encode_body(make_message(b'{"prices":[1.10,2.5]}'), BodyFormat.JSON_FLATTEN).fields
+    assert fields == {("prices",): "[1.10,2.5]"}
+
+
+def test_flatten_root_decimal_scalar_and_array_of_objects():
+    assert encode_body(make_message(b"1.10"), BodyFormat.JSON_FLATTEN).fields == {(): "1.10"}
+    assert encode_body(make_message(b'[{"p":1.5}]'), BodyFormat.JSON_FLATTEN).fields == {(): '[{"p":1.5}]'}
+
+
 def test_flatten_value_body_without_parsing():
     assert encode_body(make_message({"a": {"b": "c"}}, body_type="VALUE"), BodyFormat.JSON_FLATTEN).fields == {
         ("a", "b"): "c"
@@ -74,6 +127,15 @@ def test_flatten_root_array():
 
 @pytest.mark.parametrize("raw", [b"not json", b"\xff\xfe{", b""])
 def test_flatten_not_json(raw):
+    with pytest.raises(NotJsonError):
+        encode_body(make_message(raw), BodyFormat.JSON_FLATTEN)
+
+
+def test_deeply_nested_json_is_not_json_error():
+    # a ~100k-deep array blows json.loads's own recursion budget (RecursionError, not ValueError) --
+    # that must land on the same deterministic NotJsonError as any other malformed body, not exit 2.
+    depth = 100_000
+    raw = (b"[" * depth) + (b"]" * depth)
     with pytest.raises(NotJsonError):
         encode_body(make_message(raw), BodyFormat.JSON_FLATTEN)
 
@@ -144,6 +206,18 @@ def test_split_keys_unmapped_by_column_name():
     assert values == {"body_x": "1"}
     assert json.loads(unmapped) == {"body_a_b": "2", "body_a_b_2": "3", "body_value": "[1]"}
     assert reg.split({("x",): "9"}) == ({"body_x": "9"}, "")
+
+
+def test_split_raises_when_unmapped_cell_exceeds_the_cap(monkeypatch):
+    # each field alone is under the per-field cap (checked by the caller before split), but the
+    # combined body_unmapped JSON -- which split alone can size -- exceeds it.
+    monkeypatch.setattr(body_mod, "CELL_LIMIT_BYTES", 20)
+    reg = FlattenRegistry([], reserved=set())
+    fields: dict[tuple[str, ...], str] = {("a",): "x" * 15, ("b",): "y" * 15}
+    for path in fields:
+        reg.register(path)
+    with pytest.raises(BodyTooLargeError):
+        reg.split(fields)
 
 
 def test_registry_cap_overflow_is_provisional(monkeypatch):

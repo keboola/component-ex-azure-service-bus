@@ -65,7 +65,10 @@ class EncodedBody:
 
 
 def charset_of(content_type: str | None) -> str:
-    """The ``charset=`` parameter of ``content_type`` if Python has a codec for it, else ``utf-8``."""
+    """The ``charset=`` parameter of ``content_type`` if Python has a *text* codec for it, else
+    ``utf-8``. A sender-controlled ``content_type`` naming a non-text codec (``base64``, ``rot13``,
+    ``zlib_codec``, ...) must not reach ``bytes.decode`` -- that raises ``LookupError`` /
+    ``UnicodeDecodeError`` outside every unreadable-body policy -- so those are rejected too."""
     if not content_type:
         return "utf-8"
     for part in content_type.split(";")[1:]:
@@ -74,18 +77,20 @@ def charset_of(content_type: str | None) -> str:
             continue
         charset = value.strip().strip('"').strip("'")
         try:
-            codecs.lookup(charset)
+            info = codecs.lookup(charset)
         except LookupError:
+            return "utf-8"
+        if not getattr(info, "_is_text_encoding", True):
             return "utf-8"
         return charset
     return "utf-8"
 
 
 def to_jsonable(value: object) -> object:
-    """Recursively make ``value`` safe for ``json.dumps``: ``bytes`` (and dict keys) become UTF-8
-    strings with replacement, ``datetime`` becomes ISO-8601, ``Decimal`` is kept as-is (rendered by
-    ``compact_json``'s ``default=str``), ``uuid.UUID`` becomes ``str()``, other non-JSON scalars
-    fall back to ``str()``."""
+    """Recursively make ``value`` safe for JSON encoding: ``bytes`` (and dict keys) become UTF-8
+    strings with replacement, ``datetime`` becomes ISO-8601, ``Decimal`` is kept as-is (``compact_json``
+    renders it as a bare, unquoted JSON number so ``1.10`` never loses its trailing zero or gets
+    quoted), ``uuid.UUID`` becomes ``str()``, other non-JSON scalars fall back to ``str()``."""
     if isinstance(value, bytes):
         return value.decode("utf-8", errors="replace")
     if isinstance(value, dict):
@@ -103,8 +108,39 @@ def to_jsonable(value: object) -> object:
     return str(value)
 
 
+def _json_key(key: object) -> str:
+    """A dict key rendered the way ``json.dumps`` renders a non-string key (``int``/``float`` as
+    their text, ``True``/``False``/``None`` as ``true``/``false``/``null``), since the manual
+    encoder below no longer delegates key coercion to ``json.dumps``."""
+    if isinstance(key, str):
+        return key
+    if key is True:
+        return "true"
+    if key is False:
+        return "false"
+    if key is None:
+        return "null"
+    return str(key)
+
+
+def _encode_json(value: object) -> str:
+    """A minimal recursive JSON encoder for an already-``to_jsonable`` value: dicts and lists are
+    walked so a nested ``Decimal`` renders as ``str(d)`` -- a bare, unquoted JSON number, preserving
+    its exact text (``1.10`` stays ``1.10``, never ``1.1`` or ``"1.10"``) -- while every other leaf
+    goes through ``json.dumps`` (``default=str`` is a safety net; ``to_jsonable`` has already
+    resolved every other non-native type)."""
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, dict):
+        items = ",".join(f"{json.dumps(_json_key(k), ensure_ascii=False)}:{_encode_json(v)}" for k, v in value.items())
+        return "{" + items + "}"
+    if isinstance(value, list):
+        return "[" + ",".join(_encode_json(item) for item in value) + "]"
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+
+
 def compact_json(value: object) -> str:
-    return json.dumps(to_jsonable(value), ensure_ascii=False, separators=(",", ":"), default=str)
+    return _encode_json(to_jsonable(value))
 
 
 def _leaf_cell(value: object) -> str:
@@ -242,7 +278,10 @@ class FlattenRegistry:
         """Values for the input-registry columns, plus the ``body_unmapped`` cell for every other
         field (this run's new and provisional columns), keyed by the name ``register`` gave each
         path. Every path must already be registered -- by the caller, before calling ``split`` --
-        a path this run never registered is a programming error."""
+        a path this run never registered is a programming error. The per-field cap (checked by the
+        caller before ``split``) bounds one field, not the combined ``body_unmapped`` cell -- several
+        fields just under the cap can still add up past it, so that combined cell is checked here too
+        (``CELL_LIMIT_BYTES`` read at call time, like every other cap check in this module)."""
         values: dict[str, str] = {}
         unmapped: dict[str, str] = {}
         for path, cell in fields.items():
@@ -257,7 +296,10 @@ class FlattenRegistry:
                 unmapped[self._provisional[h]] = cell
             else:
                 raise KeyError(f"path {path!r} was never registered in this run")
-        return values, compact_json(unmapped) if unmapped else ""
+        unmapped_json = compact_json(unmapped) if unmapped else ""
+        if len(unmapped_json.encode("utf-8")) > CELL_LIMIT_BYTES:
+            raise BodyTooLargeError(f"the body_unmapped cell exceeds the {CELL_LIMIT_BYTES}-byte cell limit")
+        return values, unmapped_json
 
 
 def _check_field_sizes(fields: dict[tuple[str, ...], str]) -> None:
@@ -275,20 +317,23 @@ def encode_body(message: Any, body_format: BodyFormat) -> EncodedBody:
     body_type = raw_type.name if hasattr(raw_type, "name") else str(raw_type)
     content_type = getattr(message, "content_type", None)
 
+    # Every bit of body *consumption* -- not just the ``.body`` property access -- lives inside this
+    # try: a lazily-raising generator (a non-bytes section, a mid-iteration SDK failure) surfaces only
+    # once its sections are actually joined / materialised, and must become BodyDecodeError just the
+    # same as an eager failure at property-access time.
     try:
         sections = message.body
+        if body_type == "DATA":
+            raw: bytes | None = b"".join(sections)
+            value: object = None
+            size_bytes = len(raw)
+        else:
+            raw = None
+            materialised = list(sections) if body_type == "SEQUENCE" else sections
+            value = to_jsonable(materialised)
+            size_bytes = len(compact_json(value).encode("utf-8"))
     except Exception as e:
         raise BodyDecodeError(f"{type(e).__name__}: {e}") from e
-
-    if body_type == "DATA":
-        raw: bytes | None = b"".join(sections)
-        value: object = None
-        size_bytes = len(raw)
-    else:
-        raw = None
-        materialised = list(sections) if body_type == "SEQUENCE" else sections
-        value = to_jsonable(materialised)
-        size_bytes = len(compact_json(value).encode("utf-8"))
 
     if body_format is BodyFormat.JSON_FLATTEN:
         if raw is not None:
@@ -299,11 +344,14 @@ def encode_body(message: Any, body_format: BodyFormat) -> EncodedBody:
                 raise NotJsonError(str(e)) from e
             try:
                 parsed = json.loads(text, parse_float=Decimal)
-            except ValueError as e:
+            except (ValueError, RecursionError) as e:
                 raise NotJsonError(str(e)) from e
         else:
             parsed = value
-        fields = flatten_value(parsed)
+        try:
+            fields = flatten_value(parsed)
+        except RecursionError as e:
+            raise NotJsonError(str(e)) from e
         _check_field_sizes(fields)
         return EncodedBody(body_type=body_type, size_bytes=size_bytes, cell=None, fields=fields)
 
