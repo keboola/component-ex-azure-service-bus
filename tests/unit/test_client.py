@@ -83,6 +83,14 @@ def test_malformed_connection_string():
         ServiceBusConnector(auth, "id").receive_client()
 
 
+def test_malformed_connection_string_admin_client():
+    # Root testConnection / listQueues / listTopics call admin_client() without receive_client()
+    # first, so the connection-string parse failure must be caught there too (real SDK parser).
+    auth = AuthConfiguration(**{"auth_type": "connection_string", "#connection_string": "garbage"})
+    with pytest.raises(UserException, match="Invalid connection string"):
+        ServiceBusConnector(auth, "id").admin_client()
+
+
 def test_secrets_tuple():
     assert ServiceBusConnector(sp_auth(), "id").secrets == ("s3cr3t",)
 
@@ -105,6 +113,13 @@ def test_secrets_tuple():
         (ClientAuthenticationError("401"), "Data Receiver"),
         (ResourceNotFoundError("x"), "was not found"),
         (AzureError("x"), "management reported an error"),
+        (
+            ServiceBusError(
+                message="It is not possible for an entity that does not require sessions "
+                "to create a sessionful message receiver"
+            ),
+            "does not use sessions",
+        ),
     ],
 )
 def test_error_mapping(error, fragment):

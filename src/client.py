@@ -34,17 +34,21 @@ from keboola.component.exceptions import UserException
 
 from configuration import AuthConfiguration, AuthType
 
-logger = logging.getLogger(__name__)
-
 USER_AGENT = "keboola.ex-azure-service-bus"
 
 _SAS_KEY_RE = re.compile(r"(SharedAccessKey=)[^;\s]+", re.IGNORECASE)
 _SIG_RE = re.compile(r"(sig=)[^&;\s]+", re.IGNORECASE)
 
 # Session-mismatch texts the SDK raises as a plain ServiceBusError (spec §6.11); matched
-# case-insensitively against str(error).
+# case-insensitively against str(error). The "enable Sessions" text ("requires sessions") is
+# checked first and always wins, since it can itself contain "non-sessionful" as a substring.
 _SESSION_REQUIRED_TEXT = "requires sessions"
-_SESSION_NOT_USED_TEXTS = ("non-sessionful entity", "is not session", "session is not enabled")
+_SESSION_NOT_USED_TEXTS = (
+    "non-sessionful entity",
+    "is not session",
+    "session is not enabled",
+    "not require sessions",  # [inferred] reverse-mismatch phrasing, e.g. "does not require sessions"
+)
 
 
 def redact_secrets(text: str, secrets: Iterable[str] = ()) -> str:
@@ -155,11 +159,17 @@ def to_user_exception(
     return UserException(f"{message} (details: {detail})")
 
 
+def _invalid_connection_string(auth: AuthConfiguration, error: ValueError) -> UserException:
+    """Shared ``ValueError`` -> ``UserException`` mapping for a malformed connection string (§6.11);
+    used by both the data-plane and management-plane connection-string builders."""
+    return UserException(f"Invalid connection string: {redact_secrets(str(error), (auth.connection_string,))}")
+
+
 def _connection_string_data_client(auth: AuthConfiguration, extra: dict[str, Any]) -> ServiceBusClient:
     try:
         return ServiceBusClient.from_connection_string(conn_str=auth.connection_string, user_agent=USER_AGENT, **extra)
     except ValueError as e:
-        raise UserException(f"Invalid connection string: {redact_secrets(str(e), (auth.connection_string,))}") from e
+        raise _invalid_connection_string(auth, e) from e
 
 
 def _service_principal_data_client(auth: AuthConfiguration, extra: dict[str, Any]) -> ServiceBusClient:
@@ -179,7 +189,10 @@ _DATA_BUILDERS: dict[AuthType, Callable[[AuthConfiguration, dict[str, Any]], Ser
 
 
 def _connection_string_admin_client(auth: AuthConfiguration) -> ServiceBusAdministrationClient:
-    return ServiceBusAdministrationClient.from_connection_string(auth.connection_string)
+    try:
+        return ServiceBusAdministrationClient.from_connection_string(auth.connection_string)
+    except ValueError as e:
+        raise _invalid_connection_string(auth, e) from e
 
 
 def _service_principal_admin_client(auth: AuthConfiguration) -> ServiceBusAdministrationClient:
