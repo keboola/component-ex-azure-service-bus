@@ -307,6 +307,18 @@ uv run ruff format --check src tests
 uv run ty check
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+Service Bus speaks AMQP, which HTTP cassette recorders (VCR) cannot capture, so every test runs
+offline against an in-repo SDK double instead of a live namespace:
+
+- `tests/fakes/broker.py` — `FakeBroker`, a stand-in for `azure-servicebus` that models queues,
+  subscriptions, dead-letter sub-queues, sessions, partitions, locks, deferral and the management
+  API; `tests/fakes/test_broker.py` checks the double against the broker behaviour it models.
+- `tests/unit/` — one test module per source module.
+- `tests/functional/` — the datadir suite: it runs `src/component.py` end to end on the configs in
+  `tests/setup/configs.json` (dummy credentials only) against the fake broker and checks the output
+  tables, manifests, state and exit codes, including every sync action; `test_sanitisation.py`
+  fails if a committed fixture carries anything but the dummy secrets.
+
 Or run the same checks the CI image runs, in Docker:
 
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
