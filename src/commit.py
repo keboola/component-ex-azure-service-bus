@@ -289,8 +289,8 @@ def is_qualifying(message: Any, now: datetime) -> bool:
         message.state == ServiceBusMessageState.ACTIVE
         and (message.delivery_count or 0) == 0
         and (expires_at is None or expires_at > now)
-        # [inferred] an activated scheduled message keeps its scheduled_enqueue_time_utc (spec §6.4
-        # step 3, probed in Phase 7 §9), so the property alone marks it as once-scheduled -- skipped.
+        # An activated scheduled message keeps its scheduled_enqueue_time_utc [live, Phase 7] (and can
+        # even report SCHEDULED on 7.14.3), so the property alone marks it as once-scheduled -- skipped.
         and message.scheduled_enqueue_time_utc is None
     )
 

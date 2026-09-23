@@ -560,7 +560,7 @@
   },
   {
     "name": "37_run_c4_full_fetch",
-    "description": "C4 full fetch exports DEFERRED / SCHEDULED states and skips an expired message.",
+    "description": "C4 full fetch exports a DEFERRED message with its state and skips a scheduled message pending activation and an expired message.",
     "config": {
       "action": "run",
       "parameters": {

@@ -1,7 +1,9 @@
+import logging
 from datetime import timedelta
 from typing import Any
 
 import pytest
+from azure.servicebus import ServiceBusMessageState
 from azure.servicebus.exceptions import ServiceBusError
 from keboola.component.exceptions import UserException
 
@@ -9,10 +11,11 @@ import receiver as receiver_mod
 from client import ServiceBusConnector
 from configuration import AuthConfiguration, Configuration
 from entity import EntityInfo, EntityRef
-from receiver import PeekPager
+from receiver import PeekPager, is_pending_activation
 from settlement import BatchProcessor, UnreadableHandler, make_settler
 from state import PeekCursor
 from stats import RunStats
+from tests.fakes.broker import DEFAULT_START, make_message
 from tests.fakes.recording import RecordingSink
 
 SAS = "Endpoint=sb://ns.servicebus.windows.net/;SharedAccessKeyName=k;SharedAccessKey=c2VjcmV0"
@@ -83,7 +86,7 @@ def test_cursor_for_other_entity_resets(broker):
     assert len(sink.rows) == 1
 
 
-def test_full_fetch_states_and_expired_skipped(broker):
+def test_full_fetch_states_and_expired_skipped(broker, caplog):
     q = broker.add_queue("q")
     d = q.send(b"d")
     q.defer_existing(d)
@@ -91,8 +94,12 @@ def test_full_fetch_states_and_expired_skipped(broker):
     q.send(b"e", ttl_seconds=1)
     broker.clock.advance(5)
     p, sink, stats = pager(broker, fetch_mode="full_fetch")
-    assert p.run() is None
-    assert sorted(r["state"] for r in sink.rows) == ["DEFERRED", "SCHEDULED"] and stats.expired_skipped == 1
+    with caplog.at_level(logging.INFO):
+        assert p.run() is None
+    assert [r["state"] for r in sink.rows] == ["DEFERRED"]  # the pending scheduled message is skipped
+    assert stats.expired_skipped == 1 and stats.skipped_scheduled == 1
+    assert "skipped_scheduled=1" in stats.summary_line()
+    assert any("Skipped 1 scheduled message(s)" in r.getMessage() for r in caplog.records)
 
 
 def test_incremental_refused_on_partitioned(broker):
@@ -193,12 +200,82 @@ def test_partitioned_full_fetch_skips_without_retry(broker):
 
 def test_scheduled_message_does_not_stop_watermark(broker):
     q = broker.add_queue("q")
-    q.send(b"sched", scheduled_at=broker.clock.now() + timedelta(hours=2))
     q.send(b"old")
     t0 = broker.clock.now() + timedelta(seconds=1)
-    p, sink, _ = pager(broker, fetch_mode="full_fetch", t0=t0)
+    broker.clock.advance(5)
+    q.send(b"sched", scheduled_at=broker.clock.now() + timedelta(hours=2))  # sent after T0: its enqueue time
+    p, sink, stats = pager(broker, fetch_mode="full_fetch", t0=t0)
     p.run()
-    assert sorted(r["body"] for r in sink.rows) == ["old", "sched"]
+    assert [r["body"] for r in sink.rows] == ["old"] and stats.skipped_scheduled == 1
+    assert stats.stop_reason == "end_of_entity"  # skipped and counted, never a watermark stop
+
+
+def test_incremental_exports_a_scheduled_message_once_after_it_activates(broker):
+    q = broker.add_queue("q")
+    due = broker.clock.now() + timedelta(minutes=30)
+    q.send(b"a")
+    pending = q.send(b"sched", scheduled_at=due)
+    p, sink, stats = pager(broker)
+    cursor = p.run()
+    assert [r["body"] for r in sink.rows] == ["a"] and stats.skipped_scheduled == 1
+    assert cursor.last_sequence_number == pending  # past the pending number: activation assigns a new one
+    broker.clock.advance(1800)
+    later = q.send(b"b")
+    p2, sink2, stats2 = pager(broker, cursor=cursor)
+    cursor2 = p2.run()
+    rows = [(r["body"], r["sequence_number"], r["state"]) for r in sink2.rows]
+    # exported exactly once, under its new sequence number; the state column keeps the broker's quirk
+    assert rows == [("sched", str(pending + 1), "SCHEDULED"), ("b", str(later), "ACTIVE")]
+    assert stats2.skipped_scheduled == 0 and cursor2.last_sequence_number == later
+    assert [r["body"] for r in sink.rows + sink2.rows].count("sched") == 1
+
+
+def test_pending_scheduled_message_with_a_lapsed_ttl_counts_as_scheduled(broker):
+    q = broker.add_queue("q")
+    q.send(b"s", scheduled_at=broker.clock.now() + timedelta(hours=1), ttl_seconds=1)
+    broker.clock.advance(5)  # expires_at_utc (send time + TTL) has passed, but it is not even active yet
+    p, sink, stats = pager(broker, fetch_mode="full_fetch")
+    p.run()
+    assert sink.rows == [] and stats.skipped_scheduled == 1 and stats.expired_skipped == 0
+
+
+def test_session_full_fetch_skips_pending_scheduled_messages(broker):
+    s = broker.add_queue("s", sessions=True)
+    s.send(b"a", session_id="A")
+    s.send(b"later", session_id="A", scheduled_at=broker.clock.now() + timedelta(hours=1))
+    p, sink, stats = pager(broker, fetch_mode="full_fetch", queue="s", session=True)
+    p.run()
+    assert [r["body"] for r in sink.rows] == ["a"] and stats.skipped_scheduled == 1
+
+
+def test_activated_message_reporting_scheduled_is_exported(broker):
+    q = broker.add_queue("q")
+    due = broker.clock.now() + timedelta(seconds=10)
+    q.send(b"sched", scheduled_at=due)
+    broker.clock.advance(10)
+    p, sink, stats = pager(broker, fetch_mode="full_fetch")
+    p.run()
+    [row] = sink.rows
+    assert row["body"] == "sched" and row["state"] == "SCHEDULED" and stats.skipped_scheduled == 0
+
+
+def test_pending_activation_rule():
+    scheduled = ServiceBusMessageState.SCHEDULED
+    due = DEFAULT_START + timedelta(hours=1)
+    # pending: a SCHEDULED peek reports its send time, before the schedule [live, Phase 7]
+    assert is_pending_activation(make_message(state=scheduled, scheduled_enqueue_time_utc=due))
+    assert is_pending_activation(make_message(state=scheduled, enqueued_time_utc=None, scheduled_enqueue_time_utc=due))
+    assert is_pending_activation(make_message(state=scheduled))  # no schedule time: nothing proves activation
+    # activated but reporting SCHEDULED: enqueued at (or after) its schedule
+    assert not is_pending_activation(
+        make_message(state=scheduled, enqueued_time_utc=due, scheduled_enqueue_time_utc=due)
+    )
+    later = due + timedelta(seconds=1)
+    assert not is_pending_activation(
+        make_message(state=scheduled, enqueued_time_utc=later, scheduled_enqueue_time_utc=due)
+    )
+    assert not is_pending_activation(make_message(state=ServiceBusMessageState.ACTIVE, scheduled_enqueue_time_utc=due))
+    assert not is_pending_activation(make_message(state=ServiceBusMessageState.DEFERRED))
 
 
 def test_fail_policy_in_peek_is_not_recycled(broker):

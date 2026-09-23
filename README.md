@@ -142,6 +142,12 @@ of only this run's messages; `full_fetch` × `full_load` mirrors what the entity
 `incremental_fetch` × `incremental_load` accumulates; `incremental_fetch` × `full_load` is a delta
 of newly peeked messages.
 
+In Peek mode, deferred messages are exported with `state` = `DEFERRED`. Expired messages that
+Service Bus has not purged yet, and scheduled messages that are not active yet, are skipped and
+counted in the run summary (`expired_skipped`, `skipped_scheduled`). A scheduled message is
+exported once Service Bus activates it. Activation gives it a new sequence number and enqueue time,
+so the message is exported exactly once, under that new sequence number.
+
 Dev branches
 ------------
 
@@ -180,6 +186,10 @@ flattened `body_*` columns followed by `body_unmapped` (`json_flatten` mode). Ti
 `YYYY-MM-DD HH:MM:SS.ffffff` UTC; `application_properties` / `message_annotations` stay JSON
 because their key set is producer-defined and varies per message; the fixed AMQP header /
 properties fields are flattened into their own scalar columns instead.
+
+`state` is the value Service Bus reports (`ACTIVE`, `DEFERRED` or `SCHEDULED`). With
+azure-servicebus 7.14.3, a message that was activated from a schedule can still report
+`SCHEDULED`. The extractor exports that value as reported and does not rewrite it.
 
 Body formats and JSON flattening
 ---------------------------------

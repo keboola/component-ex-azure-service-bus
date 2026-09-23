@@ -69,6 +69,7 @@ class RunStats:
     recoveries: int = 0
     unreadable_recycles: int = 0
     expired_skipped: int = 0
+    skipped_scheduled: int = 0
     max_delivery_count: int = 0
     orphans_guarded: list[int] = field(default_factory=list)
     unreadable: Counter[str] = field(default_factory=Counter)
@@ -117,6 +118,7 @@ class RunStats:
             ("recoveries", self.recoveries),
             ("unreadable_recycles", self.unreadable_recycles),
             ("expired_skipped", self.expired_skipped),
+            ("skipped_scheduled", self.skipped_scheduled),
             ("max_delivery_count", self.max_delivery_count),
         )
         tokens.extend(f"{name}={value}" for name, value in optional_counts if value)

@@ -28,6 +28,12 @@ def test_summary_line_mentions_counts():
     s = RunStats(mode="defer_commit", received=3, deferred=3, committed=2, stop_reason="idle")
     line = s.summary_line()
     assert "received=3" in line and "deferred=3" in line and "committed=2" in line and "stop=idle" in line
+    assert "skipped_scheduled" not in line  # zero counters are omitted
+
+
+def test_summary_line_shows_skipped_scheduled():
+    s = RunStats(mode="peek", received=2, written=1, skipped_scheduled=1, stop_reason="end_of_entity")
+    assert "skipped_scheduled=1" in s.summary_line()
 
 
 def test_effective_settings_marks_defaults(caplog):

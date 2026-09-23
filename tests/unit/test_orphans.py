@@ -264,11 +264,11 @@ def test_skipped_messages_never_count_toward_k(broker):
     start = broker.clock.now()
     for _ in range(40):
         q.send(b"expired", ttl_seconds=1)
+    for _ in range(40):
+        q.send(b"activated", scheduled_at=start + timedelta(seconds=2))  # re-enqueued during the advance
     broker.clock.advance(5)
     for _ in range(40):
         q.send(b"scheduled", scheduled_at=start + timedelta(hours=1))
-    for _ in range(40):
-        q.send(b"activated", scheduled_at=start - timedelta(minutes=1))
     for _ in range(40):
         q.send(b"redelivered", delivery_count=2)
     orphan = q.send(b"o")

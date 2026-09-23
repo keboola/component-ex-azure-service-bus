@@ -9,7 +9,8 @@ writes them because RECEIVE_AND_DELETE has already deleted them on the broker. S
 
 ``PeekPager`` exports C4 by peeking -- nothing is locked, settled or deleted: incremental fetch pages
 from the stored cursor, full fetch from the start (cursor mode on partitioned entities, one held
-receiver per session on session entities).
+receiver per session on session entities). Expired messages and scheduled messages pending
+activation are skipped and counted; a scheduled message is exported once active.
 
 Any failure that is neither the processor's own ``UserException`` (``fail`` policy, flatten cap, abort
 share -- the run ends, after the stop drain in the receive loop) nor a configuration / auth / entity
@@ -190,10 +191,25 @@ def _renew_session_if_needed(receiver: Any, now: datetime) -> None:
 
 
 def _after_watermark(message: Any, t0: datetime) -> bool:
-    """Enqueued at or after T0. ``SCHEDULED`` messages never count: their enqueue time may be the
-    future scheduled time [inferred]."""
+    """Enqueued at or after T0. ``SCHEDULED``-state messages never count -- harmless either way: a
+    pending one is skipped in C4 (``is_pending_activation``), and a message activated from a schedule
+    can still report ``SCHEDULED`` on 7.14.3 [live, Phase 7], so ignoring it at most delays a stop."""
     enqueued = message.enqueued_time_utc
     return message.state != ServiceBusMessageState.SCHEDULED and enqueued is not None and enqueued >= t0
+
+
+def is_pending_activation(message: Any) -> bool:
+    """A scheduled message that has not activated yet: C4 skips it and exports its activated copy.
+
+    Phase-7 probe [live]: activation re-enqueues a scheduled message under a new sequence number with
+    the activation time as its ``enqueued_time_utc`` (``scheduled_enqueue_time_utc`` survives), while a
+    peeked pending one reports its send time -- before its schedule. A received activated message can
+    still report ``SCHEDULED`` on 7.14.3 [live]; that a peek of one can too is [inferred]. So a
+    ``SCHEDULED`` message enqueued at or after its schedule is the activated copy, never pending."""
+    if message.state != ServiceBusMessageState.SCHEDULED:
+        return False
+    scheduled, enqueued = message.scheduled_enqueue_time_utc, message.enqueued_time_utc
+    return scheduled is None or enqueued is None or enqueued < scheduled
 
 
 def _describe(error: BaseException, secrets: Iterable[str]) -> str:
@@ -565,7 +581,7 @@ class PeekPager:
             raise UserException(_PARTITIONED_INCREMENTAL)
         start = self._start() if incremental else 1
         self._deadline = self._monotonic() + self.config.limits.max_duration_seconds
-        expired = self._stats.expired_skipped
+        expired, scheduled = self._stats.expired_skipped, self._stats.skipped_scheduled
         unreadable = self.processor.unreadable
         retries_enabled = unreadable.retries_enabled
         try:
@@ -581,6 +597,12 @@ class PeekPager:
             logger.info(
                 "Skipped %d expired message(s) that Service Bus has not purged yet.",
                 self._stats.expired_skipped - expired,
+            )
+        if self._stats.skipped_scheduled > scheduled:
+            logger.info(
+                "Skipped %d scheduled message(s) that are not active yet; each is exported once Service Bus "
+                "activates it, under the new sequence number it gets then.",
+                self._stats.skipped_scheduled - scheduled,
             )
         return self._new_cursor(start) if incremental else None
 
@@ -734,9 +756,10 @@ class PeekPager:
         return None
 
     def _export(self, receiver: Any, page: Sequence[Any]) -> tuple[StopReason | None, list[int]]:
-        """Write one page: drop what this run already processed, skip the expired, stop before the
-        first message at or after T0 or at ``max_messages``. Returns the stop (if any) and the
-        sequence numbers that asked for a fresh-connection retry."""
+        """Write one page: drop what this run already processed, skip the scheduled messages pending
+        activation and the expired ones, stop before the first message at or after T0 or at
+        ``max_messages``. Returns the stop (if any) and the sequence numbers that asked for a
+        fresh-connection retry."""
         limits = self.config.limits
         now = self._clock()
         selected: list[Any] = []
@@ -748,6 +771,13 @@ class PeekPager:
             if limits.max_messages > 0 and self._taken + len(selected) >= limits.max_messages:
                 stop = StopReason.MAX_MESSAGES
                 break
+            if is_pending_activation(message):
+                # Processed, so the cursor moves past it: its activated copy gets a new, higher sequence
+                # number. Checked before expiry: a pending message's expires_at_utc counts from its send
+                # time (the SDK adds time_to_live to enqueued_time_utc [source]).
+                self._stats.skipped_scheduled += 1
+                self._mark_processed(seq)
+                continue
             expires_at = message.expires_at_utc
             if expires_at is not None and expires_at < now:  # expired, not purged yet: peek still returns it [live]
                 self._stats.expired_skipped += 1

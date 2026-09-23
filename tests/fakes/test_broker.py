@@ -242,7 +242,8 @@ def test_peek_cursor_mode_explicit_start_and_page_cap(broker):
 
 
 def test_scheduled_messages(broker):
-    due = broker.clock.now() + timedelta(hours=1)
+    sent_at = broker.clock.now()
+    due = sent_at + timedelta(hours=1)
     sub = broker.add_subscription("t", "s")
     sub.send(b"s", scheduled_at=due)
     q = broker.add_queue("q")
@@ -253,10 +254,59 @@ def test_scheduled_messages(broker):
     with sas_client().get_queue_receiver("q", prefetch_count=1, keep_alive=0) as r:
         [peeked] = r.peek_messages(10)
         assert peeked.state is ServiceBusMessageState.SCHEDULED
-        assert peeked.enqueued_time_utc == due and peeked.scheduled_enqueue_time_utc == due
+        # a pending scheduled message reports its send time as its enqueue time [live, Phase 7]
+        assert peeked.enqueued_time_utc == sent_at and peeked.scheduled_enqueue_time_utc == due
         assert r.receive_messages() == []
         broker.clock.advance(3600)
-        assert r.receive_messages()[0].sequence_number == seq
+        [received] = r.receive_messages()
+    # activation re-enqueues it: a new sequence number, the activation time as its enqueue time, the
+    # schedule time kept -- and the received copy still reports SCHEDULED (7.14.3 quirk) [live, Phase 7]
+    assert received.sequence_number == seq + 1 and q.state_of(seq) is None
+    assert received.enqueued_time_utc == due and received.scheduled_enqueue_time_utc == due
+    assert received.state is ServiceBusMessageState.SCHEDULED
+
+
+def test_scheduled_activation_rekeys_before_later_sends(broker):
+    now = broker.clock.now()
+    q = broker.add_queue("q")
+    first = q.send(b"a")
+    pending = q.send(b"s", scheduled_at=now + timedelta(minutes=10), ttl_seconds=60)
+    admin = client_mod.ServiceBusAdministrationClient.from_connection_string(SAS)
+    runtime = admin.get_queue_runtime_properties("q")
+    assert (runtime.active_message_count, runtime.scheduled_message_count) == (1, 1)
+    broker.clock.advance(600)
+    later = q.send(b"b")  # the broker's timer fired first: the activated copy takes the next number
+    activated = pending + 1
+    assert q.sequence_numbers() == [first, activated, later] and later == activated + 1
+    assert q.state_of(activated) == "ACTIVE"  # the broker's own view; snapshots report the quirk
+    runtime = admin.get_queue_runtime_properties("q")
+    assert (runtime.active_message_count, runtime.scheduled_message_count) == (3, 0)
+    with sas_client().get_queue_receiver("q", prefetch_count=1, keep_alive=0) as r:
+        peeked = r.peek_messages(10, sequence_number=activated)[0]
+        # [inferred] a peek of an activated message may report SCHEDULED too: the fake assumes the worst case
+        assert peeked.sequence_number == activated and peeked.state is ServiceBusMessageState.SCHEDULED
+        assert peeked.enqueued_time_utc == peeked.scheduled_enqueue_time_utc == now + timedelta(minutes=10)
+        assert peeked.expires_at_utc == now + timedelta(minutes=11)  # the TTL runs from the activation
+        [received] = r.receive_messages()
+        assert received.sequence_number == first
+        [received] = r.receive_messages()
+        r.defer_message(received)
+        [deferred] = r.peek_messages(1, sequence_number=activated)
+        assert deferred.state is ServiceBusMessageState.DEFERRED  # deferral wins over the quirk
+
+
+def test_scheduled_activation_keeps_partition_and_shows_in_subscriptions(broker):
+    now = broker.clock.now()
+    pq = broker.add_queue("pq", partitioned=True)
+    pq.send(b"x", partition=3)
+    pending = pq.send(b"s", partition=3, scheduled_at=now + timedelta(seconds=30))
+    sub = broker.add_subscription("t", "s")
+    sub.send(b"s", scheduled_at=now + timedelta(seconds=30))
+    broker.clock.advance(30)
+    assert pq.sequence_numbers()[-1] == pending + 1  # the same partition's counter
+    with sas_client().get_subscription_receiver("t", "s", prefetch_count=1, keep_alive=0) as r:
+        [peeked] = r.peek_messages(10)  # activated: it reached the subscription
+    assert peeked.sequence_number == 2 and peeked.state is ServiceBusMessageState.SCHEDULED
 
 
 def test_expired_messages_are_peeked_but_never_received(broker):

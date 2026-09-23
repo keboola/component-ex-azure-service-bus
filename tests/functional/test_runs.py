@@ -286,11 +286,11 @@ def test_37_run_c4_full_fetch(fake_broker, tmp_path, monkeypatch, capsys):
     q.send(b"expired", enqueued_at=now - timedelta(hours=2), ttl_seconds=3600)
     result = run_case("37_run_c4_full_fetch", tmp_path, monkeypatch, capsys)
     assert result.exit_code == 0
-    assert [(row["body"], row["state"]) for row in result.tables["q.csv"]] == [
-        ("deferred", "DEFERRED"),
-        ("scheduled", "SCHEDULED"),
-    ]
-    assert summary(result)["expired_skipped"] == "1"
+    # the scheduled message is not active yet: skipped and counted, exported once it activates
+    assert [(row["body"], row["state"]) for row in result.tables["q.csv"]] == [("deferred", "DEFERRED")]
+    tokens = summary(result)
+    assert tokens["expired_skipped"] == "1" and tokens["skipped_scheduled"] == "1"
+    assert "Skipped 1 scheduled message(s)" in result.log
 
 
 def test_38_run_c4_incremental_partitioned_refused(fake_broker, tmp_path, monkeypatch, capsys):

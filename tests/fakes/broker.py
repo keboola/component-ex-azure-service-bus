@@ -27,6 +27,14 @@ Modelling notes beyond the Task-4 table:
   a session-enabled subscription dead-letters a message sent without ``session_id`` [live];
   ``get_subscription`` has no ``enable_partitioning`` (neither has ``SubscriptionProperties``;
   it is read from ``get_topic``).
+- Scheduled messages (Phase-7 probe [live]): a pending one reports its send time as
+  ``enqueued_time_utc``. Once due, the broker activates it lazily (on the sweep, and before a send
+  takes its sequence number, like the broker's timer): the root entity re-enqueues it under a new
+  sequence number from the same partition's counter, with the activation time as its enqueue time
+  and ``scheduled_enqueue_time_utc`` kept. Every snapshot of an activated message reports
+  ``state = SCHEDULED`` unless it is deferred (seen on received messages on 7.14.3 [live]; assumed
+  for peeks too, the worst case [inferred]), while the broker's own logic -- receivability,
+  ``state_of``, runtime counts, subscription visibility -- treats it as ACTIVE.
 """
 
 import copy
@@ -414,6 +422,7 @@ class _Record:
     expires_at: datetime | None
     delivery_count: int = 0
     deferred: bool = False
+    activated: bool = False  # re-enqueued from a schedule (``FakeEntity._activate_due``)
     locked_until: datetime | None = None
     lock_token: UUID | None = None
     holder: FakeReceiver | None = None
@@ -422,12 +431,25 @@ class _Record:
     def session_id(self) -> str | None:
         return self.attrs.get("session_id")
 
+    def pending(self, now: datetime) -> bool:
+        """Scheduled and not active yet (a sub-queue record never re-enqueues; it only waits)."""
+        return self.scheduled_at is not None and not self.activated and self.scheduled_at > now
+
     def state(self, now: datetime) -> ServiceBusMessageState:
+        """The broker's own view: an activated message is ACTIVE."""
         if self.deferred:
             return ServiceBusMessageState.DEFERRED
-        if self.scheduled_at is not None and self.scheduled_at > now:
+        if self.pending(now):
             return ServiceBusMessageState.SCHEDULED
         return ServiceBusMessageState.ACTIVE
+
+    def reported_state(self, now: datetime) -> ServiceBusMessageState:
+        """What a received or peeked snapshot reports: an activated message that is not deferred
+        reports SCHEDULED (the 7.14.3 quirk, worst case -- see the module notes)."""
+        state = self.state(now)
+        if self.activated and state is ServiceBusMessageState.ACTIVE:
+            return ServiceBusMessageState.SCHEDULED
+        return state
 
 
 class FakeEntity:
@@ -502,8 +524,10 @@ class FakeEntity:
         correlation_id: str | None = None,
         **extra: Any,
     ) -> int:
-        """Store a message and return its sequence number. A scheduled message's enqueue time is its
-        scheduled time. ``extra``: ``delivery_count``, ``time_to_live``, ``expires_at_utc``,
+        """Store a message and return its sequence number. The enqueue time is ``enqueued_at`` or
+        now -- for a scheduled message too: until it activates it reports its send time [live, Phase
+        7]; the number returned for it is that of the pending record, activation assigns a new one
+        (module notes). ``extra``: ``delivery_count``, ``time_to_live``, ``expires_at_utc``,
         ``annotations``, the AMQP header / properties fields and ``to``, ``reply_to``, ``dead_letter_*``..."""
         root = self._parent or self
         if not 0 <= partition < (PARTITION_COUNT if root.partitioned else 1):
@@ -515,7 +539,7 @@ class FakeEntity:
         delivery_count = extra.pop("delivery_count", 0)
         ttl = extra.pop("time_to_live", None if ttl_seconds is None else timedelta(seconds=ttl_seconds))
         now = self._broker.clock.now()
-        enqueued = _ms_precision(scheduled_at if scheduled_at is not None else enqueued_at or now)
+        enqueued = _ms_precision(enqueued_at or now)
         expires = extra.pop("expires_at_utc") if "expires_at_utc" in extra else None if ttl is None else enqueued + ttl
         unknown = set(extra) - _SEND_EXTRAS
         if unknown:
@@ -530,6 +554,7 @@ class FakeEntity:
             "time_to_live": ttl,
             **extra,
         }
+        root._activate_due()  # the broker's timer: a message due before this send takes its number first
         seq = root._next_sequence_number(partition)
         scheduled = None if scheduled_at is None else _ms_precision(scheduled_at)
         kind = _body_kind(body_type)
@@ -557,6 +582,8 @@ class FakeEntity:
         self._dead_letter(self._get(seq), reason, description)
 
     def state_of(self, seq: int) -> str | None:
+        """The broker's own state (an activated message is ``ACTIVE``); ``None`` once it is gone --
+        including a scheduled message's pending number after its activation."""
         self._sweep()
         record = self._records.get(seq)
         return None if record is None else record.state(self._broker.clock.now()).name
@@ -603,7 +630,7 @@ class FakeEntity:
         return (
             not record.deferred
             and record.lock_token is None
-            and (record.scheduled_at is None or record.scheduled_at <= now)
+            and not record.pending(now)
             and not self._expired(record, now)
             and (session_id is None or record.session_id == session_id)
         )
@@ -615,8 +642,9 @@ class FakeEntity:
         return record.locked_until is not None and record.locked_until > now
 
     def _sweep(self) -> None:
-        """Expire lapsed session and message locks (the broker's timers, observed lazily). A sub-queue
-        sweeps its parent first: a lapse there can dead-letter into it (the parent never sweeps a child)."""
+        """Expire lapsed session and message locks and activate due scheduled messages (the broker's
+        timers, observed lazily). A sub-queue sweeps its parent first: a lapse there can dead-letter
+        into it (the parent never sweeps a child)."""
         if self._parent is not None:
             self._parent._sweep()
         now = self._broker.clock.now()
@@ -629,6 +657,34 @@ class FakeEntity:
                 self._locked.discard(seq)
             elif not self._lock_holds(record, now):
                 self._unlock(record, redelivered=True)
+        self._activate_due()
+
+    def _activate_due(self) -> None:
+        """Activate the root entity's due scheduled messages, in schedule order. Activation
+        re-enqueues a message [live, Phase 7]: a new sequence number from its partition's counter, the
+        activation time (the schedule time, or the send time for a schedule in the past) as its enqueue
+        time, a TTL counted from then; ``scheduled_at`` is kept. A pending message is never locked."""
+        if self._parent is not None:
+            return
+        now = self._broker.clock.now()
+        due = [
+            (scheduled_at, record)
+            for record in self._records.values()
+            if (scheduled_at := record.scheduled_at) is not None and not record.activated and scheduled_at <= now
+        ]
+        for scheduled_at, record in sorted(due, key=lambda item: (item[0], item[1].seq)):
+            del self._records[record.seq]
+            partition = (record.seq >> 48) - FIRST_PARTITION_ID if self.partitioned else 0
+            activated_at = max(scheduled_at, record.enqueued_at)
+            ttl = record.attrs.get("time_to_live")
+            moved = replace(
+                record,
+                seq=self._next_sequence_number(partition),
+                enqueued_at=activated_at,
+                expires_at=record.expires_at if ttl is None else activated_at + ttl,
+                activated=True,
+            )
+            self._records[moved.seq] = moved
 
     def _lock(self, record: _Record, receiver: FakeReceiver) -> None:
         record.locked_until, record.lock_token, record.holder = self._deadline(), self._broker._token(), receiver
@@ -668,7 +724,7 @@ class FakeEntity:
             "enqueued_time_utc": record.enqueued_at,
             "expires_at_utc": record.expires_at,
             "scheduled_enqueue_time_utc": record.scheduled_at,
-            "state": record.state(self._broker.clock.now()),
+            "state": record.reported_state(self._broker.clock.now()),
         }
         return FakeReceivedMessage(
             copy.deepcopy(record.body),
@@ -719,7 +775,8 @@ class FakeEntity:
 
     def _peek(self, receiver: FakeReceiver, start: int, count: int) -> list[FakeReceivedMessage]:
         """Everything stored with ``seq >= start`` -- deferred, locked and expired-not-purged included;
-        a subscription does not show scheduled messages (they wait at the topic [live])."""
+        a subscription does not show pending scheduled messages (they wait at the topic [live]) but
+        does show activated ones."""
         self._sweep()
         now, session_id = self._broker.clock.now(), receiver._session_filter()
         hide_scheduled = self.kind == "subscription" and self._parent is None

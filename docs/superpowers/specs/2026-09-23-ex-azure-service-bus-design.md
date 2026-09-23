@@ -233,7 +233,7 @@ sign-off (approval given 2026-09-23, §15 — this spec is the sign-off artifact
 | A5a. Session-enabled entities — all sessions (`NEXT_AVAILABLE_SESSION` loop until timeout) | **In scope** | `source.session_enabled`; loop in §6.5. |
 | A5b. Explicit list of session ids | **Excluded** — maintainer decision (round 1): out of v1. | Signed off 2026-09-23. |
 | A6. Deferred messages by sequence number as a user-facing source | **Excluded** — niche (users rarely hold sequence numbers); the primitive is used internally by C2 (H2/H3). | Signed off 2026-09-23. |
-| A7. Scheduled / deferred messages via peek (state column) | **In scope** within C4 | `state` column = `SCHEDULED` / `DEFERRED`; queues only — subscription peek does not show scheduled topic messages [live]. |
+| A7. Scheduled / deferred messages via peek (state column) | **In scope** within C4 | deferred messages are exported with `state` = `DEFERRED`; a scheduled message is skipped while pending activation (counted as `skipped_scheduled`) and exported once active, under the new sequence number activation assigns [live, Phase 7] (lead decision P4-7, §6.7); subscription peek does not show pending scheduled topic messages [live]. |
 | A8. Partitioned entities | **In scope**, per mode | C1/C3 unaffected; C2 commits per partition + best-effort orphan scan + run WARNING [decided]; D4 watermark approximate + WARNING; C4 `incremental_fetch` refused (`full_fetch` allowed) (§6.7). |
 | A9. Several sources per configuration | **In scope** | Config rows, one source per row (Tier A). |
 
@@ -300,7 +300,7 @@ sign-off (approval given 2026-09-23, §15 — this spec is the sign-off artifact
 | E18. `time_to_live` | **In scope** | `time_to_live_seconds` FLOAT |
 | E19. `expires_at_utc` | **In scope** | `expires_at_utc` TIMESTAMP |
 | E20. `scheduled_enqueue_time_utc` | **In scope** | `scheduled_enqueue_time_utc` TIMESTAMP |
-| E21. `state` | **In scope** | `state` STRING (`ACTIVE` / `DEFERRED` / `SCHEDULED`) |
+| E21. `state` | **In scope** | `state` STRING (`ACTIVE` / `DEFERRED` / `SCHEDULED`), as the broker reports it (§6.9) |
 | E22. `body_type` | **In scope** | `body_type` STRING (`DATA` / `VALUE` / `SEQUENCE`) |
 | E23. AMQP message annotations | **In scope** | `message_annotations` STRING (JSON) |
 | E24. AMQP header / properties extras | **In scope** | fixed scalar columns: `amqp_durable` BOOLEAN, `amqp_priority` INTEGER, `amqp_first_acquirer` BOOLEAN, `amqp_user_id` STRING, `amqp_content_encoding` STRING, `amqp_creation_time_utc` TIMESTAMP, `amqp_absolute_expiry_time_utc` TIMESTAMP, `amqp_group_sequence` INTEGER, `amqp_reply_to_group_id` STRING |
@@ -628,7 +628,8 @@ after H5, on the main thread:
 3. Skip without counting toward the stop rule: `SCHEDULED`; `ACTIVE` with `delivery_count ≥ 1`
    (redelivered stragglers); `ACTIVE` past `expires_at_utc` (expired, not yet purged — peeks as
    `ACTIVE`, `delivery_count 0` [live]); `ACTIVE` carrying a `scheduled_enqueue_time_utc`
-   (**[inferred]**: an activated scheduled message keeps that property — verified in Phase 7, §9).
+   (an activated scheduled message keeps that property [live, Phase 7]; on 7.14.3 it can even
+   report `SCHEDULED`, skipped above).
 4. **Stop after K consecutive qualifying messages** (`ACTIVE`, `delivery_count == 0`, not expired,
    never scheduled) with no `DEFERRED` among them, or at the end of the entity.
    **K = max(100, 2 × (batch_size + prefetch_count + 1))** (carried item 2). Why this bound: a
@@ -664,7 +665,8 @@ after H5, on the main thread:
 **Orphan recovery guard:** an orphan whose peeked `delivery_count ≥ max_delivery_count − 1` (from L2
 metadata; 9 when unknown) is not recovered and is listed (first 20 sequence numbers) in a WARNING.
 The guard uses the broker's delivery count because it survives failed runs (state does not);
-whether a deferred receive at MaxDeliveryCount dead-letters the message is **unverified** (§10).
+deferred receives count toward MaxDeliveryCount, and a deferred message received by sequence number
+often enough is dead-lettered [live, Phase 7] (§10 risk 7) — the reason the guard exists.
 
 **Explicit C2 limits (spec + UI tooltip + README):** (1) **exclusive consumer** — one defer-commit
 config per entity path and no other application deferring there (a foreign deferral looks like an
@@ -696,7 +698,9 @@ another application's deferrals.
   `max_duration_seconds` elapsed; **watermark** — every message of the batch has
   `enqueued_time_utc ≥ T0` (the batch is still processed; redelivered messages keep their original
   enqueue time [live]; messages whose `state` is `SCHEDULED` are ignored by every watermark check —
-  their `enqueued_time_utc` may be the future scheduled time [inferred, Phase-7 probe]); **C2 state
+  harmless either way: a pending one is skipped in C4 (§6.7), and a message activated from a
+  schedule can still report `SCHEDULED` on 7.14.3 [live, Phase 7], so ignoring it at most delays a
+  stop); **C2 state
   budget** — the serialised **projected output state** (the whole `state.json` this run would write:
   pending set + peek cursor + flatten registry + carried keys) reaches 256 KiB (Keboola documents a
   ~1 MB state limit [docs: developers.keboola.com config-file]) → stop + WARNING; the unreadable
@@ -785,7 +789,8 @@ another application's deferrals.
   `max_messages`, `max_duration_seconds`, or (with `stop_at_job_start`) the first non-`SCHEDULED`
   message enqueued at or after T0 (not exported; `SCHEDULED` messages never stop the peek, §6.5).
   The cursor becomes the highest sequence number **processed** — written, skipped as unreadable
-  (§6.6) or skipped as expired — so a skipped last message is not re-peeked forever; messages
+  (§6.6), skipped as expired or skipped as pending activation (below) — so a skipped last message
+  is not re-peeked forever; messages
   after a watermark / limit stop were not processed and are peeked again next run. A partitioned
   entity detected mid-run (heuristic) → `UserException` "use Full Fetch" (peek is non-destructive,
   so aborting is safe; the cursor stays).
@@ -798,10 +803,24 @@ another application's deferrals.
   locked by other consumers are skipped and deferred-only sessions are invisible — WARNING once per
   run; the peek briefly holds the session lock [live]). The watermark on partitioned / session
   entities is approximate (WARNING).
-- **Expired-not-purged** messages (peek returns them [live]) are skipped and counted (INFO).
-  `SCHEDULED` / `DEFERRED` messages are exported with their `state` (A7); a scheduled message is
-  exported once as `SCHEDULED` under incremental fetch (its sequence number is assigned at
-  scheduling time), which the README states.
+- **Expired-not-purged** messages (peek returns them [live]) are skipped and counted (INFO,
+  `expired_skipped`). `DEFERRED` messages are exported with their `state` (A7).
+- **Scheduled messages (lead decision P4-7, after the Phase-7 probe):** activation re-enqueues a
+  scheduled message — it gets a **new sequence number** and a new `enqueued_time_utc` (the
+  activation time), while `scheduled_enqueue_time_utc` survives [live, Phase 7]; a peeked pending
+  message reports its send time as `enqueued_time_utc` [live, Phase 7]. Exporting the pending record
+  would export the message twice under two primary keys, so C4 (both fetch modes) **skips a message
+  pending activation**: counted as `skipped_scheduled` (summary, plus one INFO line per run), marked
+  processed so the incremental cursor moves past its old sequence number (the activated copy gets a
+  higher one), never counted toward `max_messages`; it is exported once active, under its new
+  sequence number. *Pending* = `state == SCHEDULED` and not (`scheduled_enqueue_time_utc` and
+  `enqueued_time_utc` both set and `enqueued_time_utc ≥ scheduled_enqueue_time_utc`): a received
+  message activated from a schedule can still report `SCHEDULED` on 7.14.3 [live, Phase 7], and a
+  peek of one may too [inferred] — its enqueue time (the activation time) is at or after the
+  schedule, the pending record's (the send time) before it. The check runs before the expiry check:
+  a pending message's `expires_at_utc` counts from its send time (the SDK adds `time_to_live` to
+  `enqueued_time_utc` [source]). The `state` column is not rewritten (§6.9); the README states the
+  skip.
 
 ### 6.8 State layout (row-scoped `state.json`)
 
@@ -876,6 +895,9 @@ another application's deferrals.
 - **Value formats:** timestamps `YYYY-MM-DD HH:MM:SS.ffffff` in UTC (verified against a typed
   import in Phase 7); `None` → empty; booleans `true` / `false`; JSON columns compact
   (`ensure_ascii=False`), bytes decoded UTF-8 with replacement, datetimes ISO-8601.
+- **`state`** is the broker-reported value (`ACTIVE` / `DEFERRED` / `SCHEDULED`), never rewritten:
+  a message activated from a schedule can report `SCHEDULED` on 7.14.3 [live, Phase 7] — in C1–C3
+  and, once active, in C4 (§6.7) it is exported with that value.
 - **Why `application_properties` / `message_annotations` stay JSON:** they are producer-defined key
   maps whose key set varies per message (the "variable-length" case the output checklist allows);
   flattening them would make the column set unbounded. The fixed-key AMQP header / properties are
@@ -1031,7 +1053,8 @@ messages carry `(details: <redacted SDK message>)` like the writer.
   body format, load type, PK, batch / prefetch — `(default)` marked.
 - **Run summary** (J8/J9): received, written, completed / deferred / deleted-on-receive, committed
   (H5) + already-gone, orphans recovered / skipped by the guard, unreadable (per reason and
-  disposition), settlement failures, recoveries, stop reason, **delivery-count high-water mark**,
+  disposition), settlement failures, recoveries, C4 skips (`expired_skipped`, `skipped_scheduled`,
+  §6.7), stop reason, **delivery-count high-water mark**,
   duration; WARNINGs for C3 (at-most-once), best-effort / impossible orphan recovery, scan cap,
   state budget, approximate watermark, prefetch > 1.
 - `user_agent="keboola.ex-azure-service-bus"`; `client_identifier =
@@ -1133,7 +1156,7 @@ only dummies may appear, and surfaced errors must be redacted.
 | `34_run_c3_receive_and_delete` | run | C3, at-most-once WARNING, stop drain writes buffer |
 | `35_run_c3_prefetch_refused` | run fail | J10 |
 | `36_run_c4_incremental_two_runs` | two-run | H1 cursor, nothing settled, second run from cursor |
-| `37_run_c4_full_fetch` | run | full fetch, SCHEDULED / DEFERRED state column, expired skipped |
+| `37_run_c4_full_fetch` | run | full fetch, DEFERRED state column, pending SCHEDULED and expired skipped (`skipped_scheduled`, `expired_skipped`) |
 | `38_run_c4_incremental_partitioned_refused` | run fail | J6 |
 | `39_run_c4_leftover_pending_carried` | run | C4 carries `pending_commit` + WARNING |
 | `40_run_c1_leftover_pending_committed` | run | H5 in C1 after a C2 period |
@@ -1173,7 +1196,8 @@ mapping; the L1 counts log line; range encoding, state merge and whole-state bud
 chunking / bisection / retry; K computation and scan skip rules; body decoding matrix; flatten
 naming / collisions / hashed registry / cap / input-registry column rule / `body_unmapped`; column mapping and formats; manifest
 fields incl. legacy vs authoritative and the `write_always` switch; unreadable retry budget and
-progress accounting; session lock renewal; peek re-peek dedupe; `SCHEDULED` watermark exclusion).
+progress accounting; session lock renewal; peek re-peek dedupe; `SCHEDULED` watermark exclusion;
+C4 skip of scheduled messages pending activation and the single export after activation).
 
 ## 9. Deployment & validation (cf-dev, Phase 7)
 
@@ -1237,12 +1261,15 @@ No blockers. Ranked risks:
    `dao.py` `OUTPUT_MANIFEST_LEGACY_EXCLUDES`] — **[inferred]** the legacy queue does not honour it;
    the component does not override the library and warns in C1 / C3 on such projects (§6.9), and
    the Phase-7 manifest check stays.
-5. **[inferred]** a peeked `SCHEDULED` message's `enqueued_time_utc` may be its future scheduled
-   time — hence the watermark ignores `SCHEDULED` messages (Phase-7 probe).
-6. **[inferred]** `scheduled_enqueue_time_utc` persists after activation (H3 skip rule) — Phase-7
-   probe; if false, activated scheduled messages count toward K (harmless: they are
-   never-delivered-like).
-7. **[unverified]** deferred receives at MaxDeliveryCount — guarded by the delivery-count guard.
+5. **Wrong and harmless** — the assumption that a peeked `SCHEDULED` message's `enqueued_time_utc`
+   may be its future scheduled time: it reports its **send time** [live, Phase 7]. The watermark
+   still ignores `SCHEDULED`-state messages (a pending one is skipped in C4, an activated one may
+   report `SCHEDULED`, §6.5, §6.7).
+6. **Confirmed** — `scheduled_enqueue_time_utc` survives activation [live, Phase 7], so the H3 skip
+   rule holds. Activation also assigns a new sequence number and enqueue time, which is why C4
+   skips scheduled messages pending activation (P4-7, §6.7).
+7. **Confirmed** — deferred receives count toward MaxDeliveryCount and can dead-letter the message
+   [live, Phase 7]; the orphan delivery-count guard (§6.4) stays.
 8. **[inferred]** Storage column-name length cap (64) and dash handling; timestamp literal format
    for typed imports; import semantics for typed tables with new columns — Phase-7 checks.
 9. **[inferred]** row-level sync actions receive merged root parameters; SAS Manage can list
@@ -1316,7 +1343,7 @@ this spec against it. Every `corrected:` item is folded into the sections cited.
 | 2 | K stop rule vs no-progress guard | §6.4 step 4: K = max(100, 2 × (batch_size + prefetch_count + 1)), derived from the §6.5 no-progress guard |
 | 3 | commit client `retry_total=0` vs J4 | §6.3: component-level bounded retry of transient errors; exhausted → the run fails safely (H5 runs before any receive, input state intact) |
 | 4 | dev-branch C2 + main C2 = two consumers | §2.5 stated plainly (branch H5 vs main H3 race) |
-| 5 | `scheduled_enqueue_time_utc`-after-activation assumption | §6.4 step 3 labelled [inferred]; §9 item 10 probe; §10 risk 6 |
+| 5 | `scheduled_enqueue_time_utc`-after-activation assumption | §6.4 step 3 (confirmed [live, Phase 7]); §9 item 10 probe; §10 risk 6 |
 | 6 | stale "only if K2" pin wording | §3.1 / §7 pins list no `websocket-client`; §11 is the only K2 mention |
 
 ## 14. Phase gates (pointers — the standards live in the checklists)
@@ -1399,3 +1426,4 @@ differ):**
 | P4-5 | JSON key `type` vs metadata column `body_type`: the registry reserves every metadata name, so `type` → `body_type_2` (unit-tested); the prefix claim is corrected | §6.10 |
 | P4-6 | Approval item 6 wording: `path_sha1 → column` registry | §15 |
 | P4-R3 | `to_user_exception` also maps management-plane `AzureError`s (denied → names the Data Receiver role / Manage rights; `ResourceNotFoundError` → not found) | §6.11 |
+| P4-7 | (After the Phase-7 probe: activation gives a scheduled message a new sequence number.) C4, both fetch modes, skips `SCHEDULED` messages pending activation, counts them as `skipped_scheduled` and exports them once active, under their new sequence number; the `state` column keeps the broker-reported value | §4-A7, §6.5, §6.7, §6.9, §6.12, §10 |
