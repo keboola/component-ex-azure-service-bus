@@ -21,12 +21,17 @@ def test_load_defaults_and_roundtrip():
 
 
 def test_unknown_version_rejected():
-    with pytest.raises(UserException, match="reset"):
+    with pytest.raises(UserException, match="Reset the row state"):
         ExtractorState.load({"version": 99})
 
 
 def test_unknown_keys_ignored():
     assert ExtractorState.load({"version": 1, "legacy": 1}).version == 1
+
+
+def test_malformed_state_rejected():
+    with pytest.raises(UserException, match="malformed"):
+        ExtractorState.load({"version": 1, "pending_commit": "not-a-list"})
 
 
 def test_builder_groups_by_session_and_partition():

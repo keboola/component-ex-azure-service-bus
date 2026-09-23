@@ -117,8 +117,8 @@ class ExtractorState(BaseModel):
         version = raw.get("version", STATE_VERSION)
         if version != STATE_VERSION:
             raise UserException(
-                f"Unsupported state version {version}: this component understands state version 1, "
-                "reset the row state; the next run starts without a cursor, pending set or column registry."
+                f"Unsupported state version {version}: this component understands state version 1. "
+                "Reset the row state; the next run starts without a cursor, pending set or column registry."
             )
         try:
             return cls.model_validate(raw)
