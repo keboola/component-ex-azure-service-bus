@@ -25,3 +25,5 @@ docs/superpowers/*-lifecycle.md
 docs/superpowers/research/
 .claude/loop.md
 secrets.json
+.env
+.env.*
