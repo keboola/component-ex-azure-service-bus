@@ -76,8 +76,12 @@ dead-letter sub-queues:
 - **Fetch mode** — shown only for Peek mode: `incremental_fetch` (sequence-number cursor, default)
   or `full_fetch` (re-peek the whole entity every run). Incremental fetch is refused on partitioned
   entities, session entities, and sub-queues — use full fetch there.
-- **Idle timeout** — how long one receive call waits before the entity is treated as drained
-  (destructive modes only).
+- **Idle timeout** — how long one receive call waits for new messages (destructive modes only).
+  When a receive returns nothing, the run peeks the entity to check that it is really drained: it
+  ends only when no message in scope is left, and otherwise reconnects and continues — a busy or
+  throttled namespace can briefly hand out nothing. If the run stops while messages remain (Max
+  Messages, Max Duration, or repeated empty receives), a warning says how many are left; a
+  throttled namespace is reported in the run summary.
 
 Limits
 ------

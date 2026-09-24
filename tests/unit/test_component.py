@@ -36,10 +36,13 @@ def _isolate_platform(monkeypatch):
         monkeypatch.delenv(name, raising=False)
     from client import RedactingFilter
 
-    root = logging.getLogger()
-    level = root.level
+    root, servicebus = logging.getLogger(), logging.getLogger("azure.servicebus")
+    level, sb_state = root.level, (servicebus.level, servicebus.propagate, list(servicebus.handlers))
     yield
     root.setLevel(level)
+    servicebus.setLevel(sb_state[0])
+    servicebus.propagate = sb_state[1]
+    servicebus.handlers[:] = sb_state[2]
     for handler in list(root.handlers):
         if getattr(handler, "_keboola_owned", False):
             root.removeHandler(handler)
@@ -305,6 +308,25 @@ def test_prefetch_above_one_warns(broker, tmp_path, monkeypatch, caplog):
     with caplog.at_level(logging.WARNING):
         component(tmp_path, monkeypatch, params).execute_action()
     assert any("prefetch_count is 5" in m for m in warnings_logged(caplog))
+
+
+def test_throttled_empty_receive_is_counted_retried_and_summarised(broker, tmp_path, monkeypatch, caplog):
+    """Phase 8: a throttled, empty receive with messages left is retried on a fresh connection; the
+    SDK's server-busy report is counted into the summary (with the tier hint), never printed."""
+    q = broker.add_queue("q")
+    for _ in range(3):
+        q.send(b"x")
+    broker.inject_empty_receive(on_call=1, throttled=True)
+    monkeypatch.setattr("receiver.EMPTY_RECEIVE_BACKOFF_SECONDS", (0, 0, 0, 0, 0))
+    with caplog.at_level(logging.INFO):
+        component(tmp_path, monkeypatch, PARAMS).execute_action()
+    messages = [r.getMessage() for r in caplog.records]
+    summary = next(m for m in messages if m.startswith("mode=complete "))
+    assert "received=3 written=3" in summary and "empty_receive_retries=1 throttled=1" in summary
+    assert "stop=idle" in summary
+    assert any(m.startswith("Service Bus throttled 1 request(s) of this run (ServerBusy)") for m in messages)
+    assert not any("AMQP error occurred" in m for m in messages)  # the SDK's own line stays out of the log
+    assert q.sequence_numbers() == []
 
 
 def test_summary_counts_the_run_warnings(broker, tmp_path, monkeypatch, caplog):

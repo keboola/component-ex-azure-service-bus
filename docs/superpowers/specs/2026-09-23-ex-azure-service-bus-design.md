@@ -442,7 +442,7 @@ described here, not written as JSON.
 - `fetch_mode` — enum, default `incremental_fetch`: `incremental_fetch` · `full_fetch`; shown only
   when `settlement_mode = peek`.
 - `idle_timeout_seconds` — integer 1–300, default 10; shown only for the destructive modes (one
-  receive call waits this long; an empty result means the entity is drained).
+  receive call waits this long; an empty result is verified by a peek before the run stops, §6.5).
 - Button: **Preview Messages** (`previewMessages`) — the row's access check. (Phase 8: the row's
   **Test Connection** and **Show Entity Details** buttons were removed; Test Connection is a root
   button only.)
@@ -732,7 +732,8 @@ another application's deferrals.
   message whose `locked_until_utc` is within 10 s is renewed from the main thread (D10). **`write_always`
   switch (§6.9):** C1 arms it just before its first `complete_message`, C3 as soon as a receive call
   (the stop drain included) first returns messages, before writing them; C2 never.
-- **Stop conditions (checked between batches):** empty receive (idle); `max_messages` reached;
+- **Stop conditions (checked between batches):** empty receive (idle) — **verified first (Phase 8)**,
+  see *Empty receives* below; `max_messages` reached;
   `max_duration_seconds` elapsed; **watermark** — every message of the batch has
   `enqueued_time_utc ≥ T0` (the batch is still processed; redelivered messages keep their original
   enqueue time [live]; messages whose `state` is `SCHEDULED` are ignored by every watermark check —
@@ -743,6 +744,36 @@ another application's deferrals.
   pending set + peek cursor + flatten registry + carried keys) reaches 256 KiB (Keboola documents a
   ~1 MB state limit [docs: developers.keboola.com config-file]) → stop + WARNING; the unreadable
   abort share (§6.6).
+- **Empty receives (Phase 8, lead decision):** an empty receive is not proof of a drained entity
+  [live: a 1M-message C1 run (batch 5000, prefetch 1000) stopped `idle` after 77,077 messages with
+  927,756 still active and no error; the Standard-tier namespace reported ServerBusy (throttling), and
+  pyamqp re-flows link credit only when the local credit reaches 0, so a stalled refill is a second
+  candidate]. On an empty receive of a plain entity the loop peeks one page (250, the broker's cap)
+  past the highest *processed* sequence number (the stop drain's abandoned messages sit below it and
+  redeliver; from the start in cursor mode on a fresh receiver on partitioned entities) and counts the
+  messages a receive would still hand out: not `DEFERRED` (C2's own and foreign deferrals stay in the
+  entity), not pending activation, not expired, and — with `stop_at_job_start` — enqueued before T0.
+  None → stop `idle`. Otherwise the loop closes the receiver **and** its client (a fresh link and
+  connection), backs off 2 / 4 / 8 / 16 / 30 s (bounded by `max_duration_seconds`) and continues —
+  no stop drain: the receive just returned empty and pyamqp works only inside calls. The retry counter
+  resets when a receive returns messages; the 6th consecutive empty-but-not-drained receive stops the
+  run as `receive_stalled`. A peek cannot see another consumer's message lock [live, Phase 8: a
+  locked message peeks `ACTIVE`, `locked_until_utc` None, `delivery_count` 0], so messages locked by a
+  competing consumer look receivable: such a run spends the retries (~2 min at the default idle
+  timeout) and ends `receive_stalled` with the WARNING below — nothing is lost. Session entities
+  keep their `NEXT_AVAILABLE_SESSION` loop (a peek there needs a session).
+- **Messages left behind:** after a `max_messages`, `max_duration` or `receive_stalled` stop, a
+  WARNING names what is left — peeked on plain entities ("N receivable message(s) are still in …",
+  "at least 250" when the page is full), the management active count on session entities (also after
+  `no_more_sessions` when `stop_at_job_start` is off; skipped in C2, whose deferrals count as active,
+  and without management access). A partial extraction never looks like a complete drain.
+- **Throttling (Phase 8):** the SDK reports every retryable AMQP error at INFO before retrying; a
+  `ThrottleCounter` handler on `azure.servicebus` counts the `com.microsoft:server-busy` reports
+  without printing them (the logger reaches the job log only in debug mode). A non-zero count is a
+  summary token (`throttled=`) and a WARNING with the tier hint (Standard: about 1,000 operations per
+  second per namespace — lower batch / prefetch, fewer concurrent consumers, or Premium). A
+  `ServiceBusServerBusyError` that surfaces (retries exhausted, a sync action) maps to a throttling
+  `UserException` (§6.11).
 - **Watermark on partitioned entities:** receive order is not enqueue order [live], so the stop is
   approximate (can end early or late, never loses data) → run WARNING, not a refusal.
 - **Sessions (A5a):** loop `NEXT_AVAILABLE_SESSION` receivers (`max_wait_time = idle_timeout`);
@@ -1059,6 +1090,7 @@ another application's deferrals.
 | entity `ReceiveDisabled` | `MessagingEntityDisabledError` | `UserException` |
 | management call denied (SP without Data Receiver, SAS without Manage) / unknown topic — the endpoint's own 401 / 403, never a token failure (next rows) | `ClientAuthenticationError`, `HttpResponseError` 401 / 403 / `ResourceNotFoundError` (azure.core) | `UserException` naming the Data Receiver role / Manage rights, or "not found", always with `(details: …)` (a Listen-only SAS listing returns `[]` instead, §5.4) |
 | unknown namespace host | `ServiceBusConnectionError` at connect | `UserException` "cannot reach namespace" |
+| throttled namespace (ServerBusy) surfacing after the SDK's retries — a sync action, a commit, recoveries exhausted [Phase 8] | `ServiceBusServerBusyError` | `UserException` "the namespace is throttled … Standard tier about 1,000 operations per second … fewer consumers or Premium"; in the receive loop a recycle first (§6.5) |
 | SP credentials rejected — wrong / expired secret, unknown client ID or tenant (the Entra ID token cannot be acquired) | data plane: plain `ServiceBusError` "Handler failed: Authentication failed: AADSTS…" [live: "Authentication failed: AADSTS…"; the "Handler failed" wrapper and its `inner_exception` = the credential's error per SDK source]; management plane: azure-identity's `ClientAuthenticationError` "Authentication failed: AADSTS…" re-raised unchanged (an unknown tenant fails in MSAL's authority discovery with no AADSTS code), or `CredentialUnavailableError` [SDK source, identity 1.25] | `UserException` "The service principal credentials were rejected (check tenant ID, client ID and client secret). (details: …)" on every path — sync actions, the pre-checks and runs (never recycled). `client.is_credential_failure` recognises it (an AADSTS code, `CredentialUnavailableError`, or raised inside azure-identity, following `inner_exception`); `is_management_denied` excludes it, so it is never reported as a missing role |
 | session entity without `session_enabled` (or the reverse) | `ServiceBusError` text / L2 mismatch | `UserException` "enable / disable Sessions" |
 | refused combinations (J10), state version, table name, flatten cap, unreadable share, commit retries exhausted, recoveries exhausted on a `ServiceBusError` | component checks | `UserException` |
@@ -1078,7 +1110,9 @@ messages carry `(details: <redacted SDK message>)` like the writer.
 - stdout = INFO / WARNING, stderr = ERROR (library default handler).
 - **`azure.*` loggers:** level CRITICAL (the SDK logs its own ERROR tracebacks for errors the component
   handles); INFO when the root logger is at DEBUG (the platform `debug` parameter, consumed by the
-  component base — no `debug` field in the model), always through the redaction filter.
+  component base — no `debug` field in the model), always through the redaction filter. Phase 8:
+  `azure.servicebus` is always at INFO for the `ThrottleCounter` and propagates to the job log only
+  in debug mode (§6.5).
 - **Platform debug runs record HTTP** (keboola-component 1.11: `KBC_COMPONENT_RUN_MODE=debug` wraps the
   run in `keboola.vcr` and writes a cassette to `/data/out/files/` [source: `base.py`,
   `vcr/recorder.py`]). Only the management-plane and Entra ID token calls are HTTP (AMQP sockets are
@@ -1090,10 +1124,11 @@ messages carry `(details: <redacted SDK message>)` like the writer.
   body format, load type, PK, batch / prefetch — `(default)` marked.
 - **Run summary** (J8/J9): received, written, completed / deferred / deleted-on-receive, committed
   (H5) + already-gone, orphans recovered / skipped by the guard, unreadable (per reason and
-  disposition), settlement failures, recoveries, C4 skips (`expired_skipped`, `skipped_scheduled`,
-  §6.7), stop reason, **delivery-count high-water mark**,
-  duration; WARNINGs for C3 (at-most-once), best-effort / impossible orphan recovery, scan cap,
-  state budget, approximate watermark, prefetch > 1.
+  disposition), settlement failures, recoveries, empty-receive retries and throttled requests (§6.5,
+  Phase 8), C4 skips (`expired_skipped`, `skipped_scheduled`, §6.7), stop reason, **delivery-count
+  high-water mark**, duration; WARNINGs for C3 (at-most-once), best-effort / impossible orphan
+  recovery, scan cap, state budget, approximate watermark, prefetch > 1, messages left behind and
+  throttling (§6.5).
 - `user_agent="keboola.ex-azure-service-bus"`; `client_identifier =
   "kbc-<KBC_CONFIGID or local>-<KBC_CONFIGROWID or root>"` (≤ 64 chars; `KBC_CONFIGID` may be a hash
   for inline-config jobs — used only as a label).
@@ -1474,3 +1509,4 @@ differ):**
 | P4-10 | (Phase 8, maintainer report: a row-level **Test Connection** answered "Internal Server Error" while Preview Messages worked.) Not reproducible afterwards with the same payload (local, production image, platform UI); the namespace was throttled during a concurrent 1M-message drain at the time. The component can only exit 0 / 1 inside a sync action, so an HTTP 500 means the action outlived the platform's 30-second limit. Every sync action now gives up after 20 seconds with a user error (§5.4); a reproducible instance was found live — a session entity without an available session took ~34 s through the SDK's accept retries — and that peek no longer retries. The UI's use of `runtime.tag` for sync actions is recorded as verified | §5.4 |
 | P4-11 | (Phase 8, maintainer decision.) The row form's **Test Connection** and **Show Entity Details** buttons are removed, and so is the `entityInfo` action; `testConnection` is the root management probe only (a row source is ignored) and a Listen-only SAS is pointed at the row's **Preview Messages**, which proves entity access | §4-I, §5.2, §5.4, §5.6, §8 |
 | P4-12 | (Phase 8, maintainer decision.) **Max Duration** moves to the Advanced section (`advanced.max_duration_seconds`) with default 3000 s (was `limits.max_duration_seconds`, 3600): below the default one-hour job timeout, which the component is not told, leaving time for the import. Like every advanced value it is its default while `advanced_options` is off; a leftover `limits.max_duration_seconds` is ignored | §2.1, §4-D, §5.2, §5.5 |
+| P4-13 | (Phase 8, live: a 1M-message C1 run stopped `idle` after 77,077 messages with 927,756 still active.) An empty receive is verified by a peek before the run stops idle; if receivable messages remain, the loop reopens the connection, backs off and continues (at most 5 times in a row, then `receive_stalled`); a stop that leaves messages behind logs a WARNING with the remaining count; throttling (ServerBusy) is counted quietly into the summary with a tier hint; the idle-timeout tooltip no longer says an empty result means drained | §5.2, §6.5, §6.11, §6.12 |

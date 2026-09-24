@@ -15,7 +15,7 @@ from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from typing import Any, NamedTuple
 
-from azure.servicebus import ServiceBusClient, ServiceBusMessageState, ServiceBusReceiveMode
+from azure.servicebus import ServiceBusClient, ServiceBusReceiveMode
 from azure.servicebus.exceptions import OperationTimeoutError, SessionCannotBeLockedError
 from keboola.component.exceptions import UserException
 
@@ -29,6 +29,7 @@ from receiver import (
     after_watermark,
     close_quietly,
     enter_receiver,
+    is_pending_activation,
     log_recovery,
     receiver_profile,
     renew_session_if_needed,
@@ -50,20 +51,6 @@ class _PageResult(NamedTuple):
 
     stop: StopReason | None
     retried: list[int]
-
-
-def is_pending_activation(message: Any) -> bool:
-    """A scheduled message that has not activated yet: C4 skips it and exports its activated copy.
-
-    Phase-7 probe [live]: activation re-enqueues a scheduled message under a new sequence number with
-    the activation time as its ``enqueued_time_utc`` (``scheduled_enqueue_time_utc`` survives), while a
-    peeked pending one reports its send time -- before its schedule. A received activated message can
-    still report ``SCHEDULED`` on 7.14.3 [live]; that a peek of one can too is [inferred]. So a
-    ``SCHEDULED`` message enqueued at or after its schedule is the activated copy, never pending."""
-    if message.state != ServiceBusMessageState.SCHEDULED:
-        return False
-    scheduled, enqueued = message.scheduled_enqueue_time_utc, message.enqueued_time_utc
-    return scheduled is None or enqueued is None or enqueued < scheduled
 
 
 class PeekPager:

@@ -90,12 +90,15 @@ def fake_broker(monkeypatch: pytest.MonkeyPatch) -> Iterator[FakeBroker]:
     monkeypatch.setattr(columns, "utc_now", clock.now)
     monkeypatch.setattr(time, "monotonic", lambda: (clock.now() - start).total_seconds())
     monkeypatch.setattr(time, "sleep", clock.advance)
-    root, azure = logging.getLogger(), logging.getLogger("azure")
-    levels = root.level, azure.level
+    root, azure, servicebus = logging.getLogger(), logging.getLogger("azure"), logging.getLogger("azure.servicebus")
+    levels = root.level, azure.level, servicebus.level, servicebus.propagate, list(servicebus.handlers)
     yield broker
     # Undo what ComponentBase / configure_logging / a sync action leave on the loggers.
     root.setLevel(levels[0])
     azure.setLevel(levels[1])
+    servicebus.setLevel(levels[2])
+    servicebus.propagate = levels[3]
+    servicebus.handlers[:] = levels[4]
     for handler in list(root.handlers):
         if getattr(handler, "_keboola_owned", False):
             root.removeHandler(handler)

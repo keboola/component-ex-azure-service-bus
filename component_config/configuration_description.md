@@ -11,7 +11,7 @@ Each row reads one queue, one topic subscription, or one of their dead-letter / 
 - **Sessions** — enable when the entity requires sessions (not available on sub-queues, which never require sessions).
 - **Settlement mode** — `complete` (delete right after each batch is written, default), `defer_commit` (delete only once the next run proves the previous import succeeded — requires this row to be the entity's only consumer), `receive_and_delete` (delete on receive, at-most-once), or `peek` (never delete — for browsing an entity someone else consumes).
 - **Fetch mode** (peek only) — `incremental_fetch` (sequence-number cursor; not available on partitioned or session entities, or sub-queues) or `full_fetch` (re-peek the whole entity every run).
-- **Idle timeout** — how long one receive call waits before the entity is treated as drained (destructive modes only).
+- **Idle timeout** — how long one receive call waits for new messages (destructive modes only). An empty receive is checked with a peek: the run ends only when no message in scope is left, and otherwise reconnects and continues; a run that stops while messages remain says how many in a warning.
 
 ### Limits
 

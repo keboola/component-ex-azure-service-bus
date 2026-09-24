@@ -366,10 +366,12 @@ def test_c1_drain_uses_abandon(broker):
     q = broker.add_queue("q")
     for _ in range(4):
         q.send(b"a")
-    loop, _, _, _ = build(broker, limits={"max_messages": 1})
+    loop, _, stats, _ = build(broker, limits={"max_messages": 1})
     loop.run()
     ops = [op for op, _ in broker.receivers[0].operations]
-    assert ops == ["receive_messages", "complete_message", "receive_messages", "abandon_message", "abandon_message"]
+    drain = ["receive_messages", "complete_message", "receive_messages", "abandon_message", "abandon_message"]
+    assert ops == [*drain, "peek_messages"]  # then the remaining-count peek (Phase 8): the 3 left are counted
+    assert "3 receivable message(s) are still in 'q'" in stats.warnings["messages_remaining"]
 
 
 def test_stop_drain_failure_is_logged_not_fatal(broker, caplog):
@@ -602,3 +604,126 @@ def test_tracker_credential_failures_are_mapped_not_counted():
     with pytest.raises(UserException, match="^The service principal credentials were rejected"):
         tracker.failure(ServiceBusError(message=f"Handler failed: {token_error}.", error=token_error))
     assert tracker.count == 0
+
+
+# --- an empty receive is verified before the run stops idle (Phase 8, spec §6.5) -------------------------
+
+
+def test_transient_empty_receive_reopens_and_drains_everything(broker):
+    # Live, Phase 8: one empty receive stopped a 1M-message C1 run after 77k with 927k still active.
+    q = broker.add_queue("q")
+    for i in range(10):
+        q.send(f"m{i}".encode())
+    broker.inject_empty_receive(on_call=2)
+    loop, sink, stats, _ = build(broker, advanced={"batch_size": 3})
+    started = broker.clock.now()
+    assert loop.run() is StopReason.IDLE
+    assert len(sink.rows) == 10 and q.sequence_numbers() == [] and stats.completed == 10
+    assert stats.empty_receive_retries == 1 and "messages_remaining" not in stats.warnings
+    assert len(broker.receivers) == 2 and broker.receivers[0].closed  # a fresh receiver after the empty one
+    assert len(broker.clients) == 2 and broker.clients[0].closed  # ... on a fresh connection
+    assert broker.clock.now() - started >= timedelta(seconds=2)  # the first backoff
+
+
+def test_truly_drained_entity_stops_idle_after_one_check(broker):
+    q = broker.add_queue("q")
+    for _ in range(3):
+        q.send(b"a")
+    loop, sink, stats, _ = build(broker)
+    assert loop.run() is StopReason.IDLE
+    assert len(sink.rows) == 3 and stats.empty_receive_retries == 0 and not stats.warnings
+    (receiver,) = broker.receivers
+    peeks = [details for op, details in receiver.operations if op == "peek_messages"]
+    assert peeks == [{"max_message_count": 250, "sequence_number": 4}]  # past the highest processed number
+
+
+def test_only_deferred_scheduled_expired_or_newer_messages_left_stops_idle(broker):
+    q = broker.add_queue("q")
+    q.defer_existing(q.send(b"deferred"))  # e.g. a foreign or C2 deferral: only a deferred receive gets it
+    q.send(b"scheduled", scheduled_at=broker.clock.now() + timedelta(hours=1))
+    q.send(b"expired", ttl_seconds=1)
+    broker.clock.advance(5)  # the TTL passed, the broker has not purged it (a peek still returns it)
+    t0 = broker.clock.now()
+    broker.clock.advance(1)
+    q.send(b"newer")  # enqueued after T0: out of scope with stop_at_job_start
+    broker.inject_empty_receive(on_call=1)  # so the drain check, not the watermark, decides
+    loop, sink, stats, _ = build(broker, t0=t0)
+    assert loop.run() is StopReason.IDLE
+    assert sink.rows == [] and stats.empty_receive_retries == 0 and not stats.warnings
+    peeks = [details for op, details in broker.receivers[0].operations if op == "peek_messages"]
+    assert peeks == [{"max_message_count": 250, "sequence_number": 1}]  # nothing processed yet: from the start
+
+
+def test_newer_messages_count_without_the_job_start_stop(broker):
+    q = broker.add_queue("q")
+    t0 = broker.clock.now()
+    broker.clock.advance(1)
+    q.send(b"newer")
+    broker.inject_empty_receive(on_call=1)
+    loop, sink, stats, _ = build(broker, t0=t0, limits={"stop_at_job_start": False})
+    assert loop.run() is StopReason.IDLE
+    assert [r["body"] for r in sink.rows] == ["newer"] and stats.empty_receive_retries == 1
+
+
+def test_empty_receive_retry_cap_stops_with_the_remaining_count(broker, caplog):
+    q = broker.add_queue("q")
+    for _ in range(4):
+        q.send(b"a")
+    for call in range(1, 10):
+        broker.inject_empty_receive(on_call=call, throttled=True)
+    loop, sink, stats, _ = build(broker)
+    started = broker.clock.now()
+    with caplog.at_level(logging.INFO, logger="receiver"):
+        assert loop.run() is StopReason.RECEIVE_STALLED
+    assert sink.rows == [] and stats.empty_receive_retries == 6 and len(broker.receivers) == 6
+    assert broker.clock.now() - started >= timedelta(seconds=2 + 4 + 8 + 16 + 30)  # every backoff was taken
+    warning = stats.warnings["messages_remaining"]
+    assert "4 receivable message(s) are still in 'q'" in warning and "receive_stalled" in warning
+    assert "throttled" in warning
+    assert sum("reopening the connection" in r.getMessage() for r in caplog.records) == 5
+    assert len(q.sequence_numbers()) == 4  # nothing lost: the messages stay for the next run
+
+
+def test_max_duration_bounds_the_empty_receive_retries(broker):
+    q = broker.add_queue("q")
+    q.send(b"a")
+    for call in range(1, 10):
+        broker.inject_empty_receive(on_call=call)
+    loop, _, stats, _ = build(broker, advanced={"max_duration_seconds": 60})
+    assert loop.run() is StopReason.MAX_DURATION
+    assert stats.empty_receive_retries < 6 and "max_duration" in stats.warnings["messages_remaining"]
+
+
+def test_partitioned_drain_check_peeks_from_the_start_on_a_fresh_receiver(broker):
+    p = broker.add_queue("q", partitioned=True)
+    p.send(b"x", partition=3)
+    broker.inject_empty_receive(on_call=1)
+    loop, sink, stats, _ = build(broker, info=EntityInfo(partitioned=True))
+    assert loop.run() is StopReason.IDLE
+    assert len(sink.rows) == 1 and stats.empty_receive_retries == 1
+    peekers = [r for r in broker.receivers if [op for op, _ in r.operations] == ["peek_messages"]]
+    assert [r.operations[0][1]["sequence_number"] for r in peekers] == [0, 0]  # cursor mode, from the start
+
+
+def test_session_entity_warns_when_sessions_ran_out_with_messages_left(broker):
+    """Sessions cannot be peeked without a session: the management count backs the warning."""
+    import client as client_mod
+
+    q = broker.add_queue("q", sessions=True)
+    q.send(b"a", session_id="s1")
+    q.send(b"b", session_id="s2")
+    other_consumer = client_mod.ServiceBusClient.from_connection_string(conn_str=SAS)
+    with other_consumer.get_queue_receiver("q", session_id="s2", prefetch_count=1, keep_alive=0):
+        source = {"entity_type": "queue", "queue_name": "q", "session_enabled": True}
+        loop, sink, stats, _ = build(broker, source=source, limits={"stop_at_job_start": False})
+        assert loop.run() is StopReason.NO_MORE_SESSIONS
+    assert [r["body"] for r in sink.rows] == ["a"]
+    assert "Service Bus reports 1 active message(s) in 'q'" in stats.warnings["messages_remaining"]
+
+
+def test_session_entity_with_the_job_start_stop_does_not_warn_when_sessions_ran_out(broker):
+    q = broker.add_queue("q", sessions=True)
+    q.send(b"a", session_id="s1")
+    loop, _, stats, _ = build(broker, source={"entity_type": "queue", "queue_name": "q", "session_enabled": True})
+    assert loop.run() is StopReason.NO_MORE_SESSIONS
+    assert not stats.warnings and broker.admin_calls == []  # newer messages may remain by design: no count

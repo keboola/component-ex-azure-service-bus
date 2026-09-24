@@ -28,6 +28,7 @@ from azure.servicebus.exceptions import (
     ServiceBusCommunicationError,
     ServiceBusConnectionError,
     ServiceBusError,
+    ServiceBusServerBusyError,
 )
 from azure.servicebus.management import ServiceBusAdministrationClient
 from keboola.component.exceptions import UserException
@@ -102,11 +103,44 @@ class RedactingFilter(logging.Filter):
         return True
 
 
+# The SDK reports every retryable AMQP error at INFO before it retries (7.14.3, pyamqp transport:
+# "AMQP error occurred: (...), condition: (b'com.microsoft:server-busy'), ..."); a throttled request
+# is recognised by that condition. The retry line that follows names the same error, so only the
+# condition line is counted.
+_THROTTLE_CONDITION = "com.microsoft:server-busy"
+_THROTTLE_LINE = "AMQP error occurred"
+
+
+class ThrottleCounter(logging.Handler):
+    """Counts the SDK's reports of throttled requests (ServerBusy) and prints nothing (§6.12): the
+    count goes into the run summary, the SDK's own lines and tracebacks stay out of the job log."""
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.INFO)
+        self.count = 0
+
+    def emit(self, record: logging.LogRecord) -> None:
+        message = record.getMessage()
+        if _THROTTLE_LINE in message and _THROTTLE_CONDITION in message:
+            self.count += 1
+
+
+_THROTTLE_COUNTER = ThrottleCounter()
+
+
+def throttled_requests() -> int:
+    """How many throttled requests (ServerBusy) the SDK reported since ``configure_logging``."""
+    return _THROTTLE_COUNTER.count
+
+
 def configure_logging(secrets: Iterable[str], debug: bool) -> None:
-    """Install one :class:`RedactingFilter` on every root handler and gate the azure loggers (§6.12).
+    """Install one :class:`RedactingFilter` on every root handler, gate the azure loggers and count
+    throttling (§6.12).
 
     Idempotent: a filter installed by an earlier call is replaced, never duplicated. ``azure.*``
-    loggers are set to INFO when ``debug`` (platform debug mode) else CRITICAL.
+    loggers are set to INFO when ``debug`` (platform debug mode) else CRITICAL. ``azure.servicebus``
+    always emits INFO to the :class:`ThrottleCounter` (reset here) and reaches the job log only in
+    debug mode, so the count needs no SDK line in a normal job log.
     """
     root = logging.getLogger()
     redacting_filter = RedactingFilter(secrets)
@@ -116,6 +150,13 @@ def configure_logging(secrets: Iterable[str], debug: bool) -> None:
                 handler.removeFilter(existing)
         handler.addFilter(redacting_filter)
     logging.getLogger("azure").setLevel(logging.INFO if debug else logging.CRITICAL)
+    servicebus = logging.getLogger("azure.servicebus")
+    servicebus.setLevel(logging.INFO)
+    servicebus.propagate = debug
+    for existing in [h for h in servicebus.handlers if isinstance(h, ThrottleCounter)]:
+        servicebus.removeHandler(existing)
+    _THROTTLE_COUNTER.count = 0
+    servicebus.addHandler(_THROTTLE_COUNTER)
 
 
 def is_session_mismatch(error: BaseException) -> bool:
@@ -219,6 +260,12 @@ def to_user_exception(
         message = f"The entity{target} was not found in the namespace."
     elif isinstance(error, MessagingEntityDisabledError):
         message = f"The entity{target} is disabled for receiving."
+    elif isinstance(error, ServiceBusServerBusyError):
+        message = (
+            f"Azure Service Bus is throttling the namespace{of_target} (ServerBusy): it reached its throughput "
+            "limit (Standard tier: about 1,000 operations per second shared by every client of the namespace). "
+            "Try again later, run fewer consumers at once, or use the Premium tier."
+        )
     elif isinstance(error, ServiceBusConnectionError | ServiceBusCommunicationError):
         message = (
             f"Could not reach the Service Bus namespace for{target}. "

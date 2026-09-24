@@ -67,6 +67,8 @@ class RunStats:
     orphans_recovered: int = 0
     settlement_failures: int = 0
     recoveries: int = 0
+    empty_receive_retries: int = 0
+    throttled: int = 0
     unreadable_recycles: int = 0
     expired_skipped: int = 0
     skipped_scheduled: int = 0
@@ -88,6 +90,19 @@ class RunStats:
             return
         self.warnings[key] = message
         logger.warning("%s", message)
+
+    def note_throttled(self, count: int) -> None:
+        """Record the throttled requests the SDK reported this run (``client.throttled_requests``);
+        any at all is a WARNING with the tier hint -- it is what stalls receives (§6.5)."""
+        self.throttled = count
+        if count:
+            self.warn(
+                "throttled",
+                f"Service Bus throttled {count} request(s) of this run (ServerBusy): the namespace reached its "
+                "throughput limit (Standard tier: about 1,000 operations per second, shared by every client of the "
+                "namespace). The SDK retried them; if runs slow down, stall or stop before the entity is drained, "
+                "lower Batch Size / Prefetch Count, run fewer consumers at once, or use the Premium tier.",
+            )
 
     def note_delivery_count(self, n: int) -> None:
         """Feed the J8 delivery-count high-water mark from every message read this run."""
@@ -116,6 +131,8 @@ class RunStats:
             ("orphans_guarded", len(self.orphans_guarded)),
             ("settlement_failures", self.settlement_failures),
             ("recoveries", self.recoveries),
+            ("empty_receive_retries", self.empty_receive_retries),
+            ("throttled", self.throttled),
             ("unreadable_recycles", self.unreadable_recycles),
             ("expired_skipped", self.expired_skipped),
             ("skipped_scheduled", self.skipped_scheduled),

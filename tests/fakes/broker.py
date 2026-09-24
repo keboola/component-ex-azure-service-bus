@@ -58,6 +58,7 @@ Modelling notes beyond the Task-4 table:
 
 import copy
 import itertools
+import logging
 import threading
 import warnings
 from collections import defaultdict, deque
@@ -1048,6 +1049,8 @@ class FakeReceiver:
             raise ValueError("The max_message_count must be greater than 0")
         entity = self._open()
         self._broker._raise_injected("receive")
+        if self._broker._take_empty_receive():
+            return []
         messages = entity._receive(self, max_message_count or self.prefetch_count)
         self._cursor = messages[-1].sequence_number if messages else self._cursor
         return messages
@@ -1478,6 +1481,7 @@ class FakeBroker:
         self._entities: dict[str, FakeEntity] = {}  # queues and subscriptions by main path
         self._topics: dict[str, _Topic] = {}
         self._injections: dict[str, dict[int, Exception]] = {"receive": {}, "peek": {}}
+        self._empty_receives: dict[int, bool] = {}  # receive call number -> log the SDK's server-busy line
         self._call_numbers: dict[str, int] = {"receive": 0, "peek": 0}
         self._commit_errors: deque[Exception] = deque()
         self._body_errors: dict[int, int] = defaultdict(int)
@@ -1555,6 +1559,14 @@ class FakeBroker:
         raises ``error`` once."""
         self._injections["receive"][on_call] = error
 
+    def inject_empty_receive(self, *, on_call: int, throttled: bool = False) -> None:
+        """The ``on_call``-th ``receive_messages`` that reaches the broker returns ``[]`` although
+        messages are available -- what a throttled namespace or a stalled link-credit refill looks like
+        to the caller [live, Phase 8: a 1M-message C1 run got an empty receive after 77k messages with
+        927k still active, while the namespace reported ServerBusy]. ``throttled`` also logs the SDK's
+        INFO line for a retried ``server-busy`` AMQP error, as 7.14.3 does before retrying."""
+        self._empty_receives[on_call] = throttled
+
     def inject_peek_error(self, error: Exception, *, on_call: int) -> None:
         """The ``on_call``-th ``peek_messages`` that reaches the broker (1-based, across all receivers)
         raises ``error`` once."""
@@ -1575,6 +1587,20 @@ class FakeBroker:
         injected = self._injections[kind].pop(self._call_numbers[kind], None)
         if injected is not None:
             raise injected
+
+    def _take_empty_receive(self) -> bool:
+        """Whether the current receive call (numbered by ``_raise_injected``) was injected empty."""
+        throttled = self._empty_receives.pop(self._call_numbers["receive"], None)
+        if throttled is None:
+            return False
+        if throttled:  # pyamqp transport, 7.14.3: logged at INFO for every retryable AMQP error
+            logging.getLogger("azure.servicebus._base_handler").info(
+                "AMQP error occurred: (%r), condition: (%r), description: (%r).",
+                None,
+                b"com.microsoft:server-busy",
+                "The request was terminated because the namespace is being throttled.",
+            )
+        return True
 
     def _wait_while_unresponsive(self) -> None:
         """Block a receiver open or a management call until the test sets ``unresponsive`` -- the

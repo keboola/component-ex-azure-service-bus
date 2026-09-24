@@ -371,13 +371,40 @@ def test_redacting_filter_masks_preformatted_exc_text():
     assert "c2VjcmV0" not in record.exc_text and "s3cr3t" not in record.exc_text
 
 
-def test_configure_logging_levels_and_filter():
+@pytest.fixture
+def restore_azure_loggers():
+    import logging
+
+    from client import RedactingFilter
+
+    azure, servicebus = logging.getLogger("azure"), logging.getLogger("azure.servicebus")
+    saved = azure.level, servicebus.level, servicebus.propagate, list(servicebus.handlers)
+    yield
+    azure.setLevel(saved[0])
+    servicebus.setLevel(saved[1])
+    servicebus.propagate = saved[2]
+    servicebus.handlers[:] = saved[3]
+    for other in logging.getLogger().handlers:  # configure_logging touched every root handler (pytest's included)
+        for installed in [f for f in other.filters if isinstance(f, RedactingFilter)]:
+            other.removeFilter(installed)
+
+
+def test_server_busy_maps_to_a_throttling_message():
+    from azure.servicebus.exceptions import ServiceBusServerBusyError
+
+    from client import to_user_exception
+
+    text = str(to_user_exception(ServiceBusServerBusyError(message="The request was terminated."), "q"))
+    assert text.startswith("Azure Service Bus is throttling the namespace of 'q' (ServerBusy)")
+    assert "Premium tier" in text and "(details: The request was terminated." in text
+
+
+def test_configure_logging_levels_and_filter(restore_azure_loggers):
     import logging
 
     from client import RedactingFilter, configure_logging
 
     root = logging.getLogger()
-    azure_level = logging.getLogger("azure").level
     handler = logging.StreamHandler()
     root.addHandler(handler)
     try:
@@ -389,7 +416,33 @@ def test_configure_logging_levels_and_filter():
         assert sum(isinstance(f, RedactingFilter) for f in handler.filters) == 1  # no duplicates
     finally:
         root.removeHandler(handler)
-        for other in root.handlers:  # configure_logging touched every root handler (pytest's included)
-            for installed in [f for f in other.filters if isinstance(f, RedactingFilter)]:
-                other.removeFilter(installed)
-        logging.getLogger("azure").setLevel(azure_level)
+
+
+@pytest.mark.parametrize("debug", [False, True])
+def test_configure_logging_counts_throttling_quietly(restore_azure_loggers, debug):
+    """Phase 8: the SDK's INFO report of a retried server-busy error is counted (reset by every
+    configure_logging) and reaches the job log only in debug mode; other SDK lines are not counted."""
+    import logging
+
+    from client import ThrottleCounter, configure_logging, throttled_requests
+
+    root = logging.getLogger()
+    seen: list[str] = []
+    handler = logging.Handler()
+    handler.emit = lambda record: seen.append(record.getMessage())  # ty: ignore[invalid-assignment]
+    root.addHandler(handler)
+    try:
+        configure_logging(["x"], debug=debug)
+        sdk = logging.getLogger("azure.servicebus._base_handler")
+        line = "AMQP error occurred: (%r), condition: (%r), description: (%r)."
+        sdk.info(line, None, b"com.microsoft:server-busy", "throttled")
+        sdk.info(line, None, b"amqp:link:detach-forced", "detached")
+        sdk.info("'q' has an exception (ServiceBusServerBusyError('server-busy')). Retrying...")
+        assert throttled_requests() == 1
+        assert bool([m for m in seen if "server-busy" in m]) is debug
+        configure_logging(["x"], debug=debug)
+        assert throttled_requests() == 0  # a fresh count per run
+        servicebus = logging.getLogger("azure.servicebus")
+        assert sum(isinstance(h, ThrottleCounter) for h in servicebus.handlers) == 1
+    finally:
+        root.removeHandler(handler)

@@ -7,6 +7,13 @@ local receive buffer -- C1 / C2 abandon the drained messages so they are availab
 writes them because RECEIVE_AND_DELETE has already deleted them on the broker. Session entities loop
 ``NEXT_AVAILABLE_SESSION`` receivers, one session at a time.
 
+An empty receive is not trusted as "drained" (Phase 8, live: a 1M-message C1 run stopped idle after
+77k messages with 927k still active -- a throttled Standard-tier namespace or a stalled link-credit
+refill hands out nothing without an error). The loop peeks past the highest processed sequence number
+and stops idle only when nothing receivable is left; otherwise it reopens the connection, backs off
+and continues, up to ``MAX_EMPTY_RECEIVE_RETRIES`` consecutive times. A run that stops while
+messages remain says so in a WARNING with the remaining count.
+
 Any failure that is neither the processor's own ``UserException`` (``fail`` policy, flatten cap, abort
 share -- the run ends, after the stop drain in the receive loop) nor a configuration / auth / entity
 error closes the receiver and its client and opens fresh ones. ``RecoveryTracker`` caps those
@@ -37,7 +44,7 @@ from keboola.component.exceptions import UserException
 
 from client import ServiceBusConnector, is_credential_failure, is_session_mismatch, redact_secrets, to_user_exception
 from configuration import Configuration, SettlementMode
-from entity import EntityInfo, EntityRef
+from entity import EntityInfo, EntityRef, load_entity_info
 from settlement import LOCK_RENEW_MARGIN, BatchProcessor, BatchResult, safe_settle
 from state import STATE_BUDGET_BYTES
 from stats import RunStats
@@ -50,6 +57,11 @@ MAX_RECOVERIES = 5
 SESSION_ACCEPT_WAIT_SECONDS = 5
 DRAIN_WAIT_SECONDS = 1
 CATCH_UP_POLL_SECONDS = 1
+# An empty receive while receivable messages remain (module doc): reopen and back off, this many times in a
+# row at most; the drain check peeks one page (the broker's cap) past the highest processed sequence number.
+MAX_EMPTY_RECEIVE_RETRIES = 5
+EMPTY_RECEIVE_BACKOFF_SECONDS = (2, 4, 8, 16, 30)
+DRAIN_CHECK_PEEK_COUNT = 250
 
 # Errors a fresh connection cannot fix (spec §6.11); plus the session mismatch (``is_session_mismatch``)
 # and rejected service-principal credentials (``is_credential_failure``, a plain ServiceBusError).
@@ -76,6 +88,11 @@ class StopReason(StrEnum):
     NO_MORE_SESSIONS = "no_more_sessions"
     SESSION_REVISITED = "session_revisited"
     END_OF_ENTITY = "end_of_entity"
+    RECEIVE_STALLED = "receive_stalled"
+
+
+# Stops that can leave receivable messages behind: the run warns with the remaining count (module doc).
+_PARTIAL_STOPS = frozenset({StopReason.MAX_MESSAGES, StopReason.MAX_DURATION, StopReason.RECEIVE_STALLED})
 
 
 def is_fatal(error: BaseException) -> bool:
@@ -185,10 +202,25 @@ def renew_session_if_needed(receiver: Any, now: datetime) -> None:
 
 def after_watermark(message: Any, t0: datetime) -> bool:
     """Enqueued at or after T0. ``SCHEDULED``-state messages never count -- harmless either way: a
-    pending one is skipped in C4 (``peek.is_pending_activation``), and a message activated from a schedule
+    pending one is skipped in C4 (``is_pending_activation``), and a message activated from a schedule
     can still report ``SCHEDULED`` on 7.14.3 [live, Phase 7], so ignoring it at most delays a stop."""
     enqueued = message.enqueued_time_utc
     return message.state != ServiceBusMessageState.SCHEDULED and enqueued is not None and enqueued >= t0
+
+
+def is_pending_activation(message: Any) -> bool:
+    """A scheduled message that has not activated yet: C4 skips it and exports its activated copy, and
+    the receive loop's drain check ignores it.
+
+    Phase-7 probe [live]: activation re-enqueues a scheduled message under a new sequence number with
+    the activation time as its ``enqueued_time_utc`` (``scheduled_enqueue_time_utc`` survives), while a
+    peeked pending one reports its send time -- before its schedule. A received activated message can
+    still report ``SCHEDULED`` on 7.14.3 [live]; that a peek of one can too is [inferred]. So a
+    ``SCHEDULED`` message enqueued at or after its schedule is the activated copy, never pending."""
+    if message.state != ServiceBusMessageState.SCHEDULED:
+        return False
+    scheduled, enqueued = message.scheduled_enqueue_time_utc, message.enqueued_time_utc
+    return scheduled is None or enqueued is None or enqueued < scheduled
 
 
 def _describe(error: BaseException, secrets: Iterable[str]) -> str:
@@ -254,6 +286,8 @@ class ReceiveLoop:
         self._armed = False
         self._deadline = 0.0
         self._wait: float = config.source.idle_timeout_seconds  # 1 s while catching up
+        self._highest_processed: int | None = None  # the drain check peeks past it on non-partitioned entities
+        self._empty_retries = 0  # consecutive empty receives while receivable messages remained
 
     def run(self) -> StopReason:
         self._deadline = self._monotonic() + self._config.advanced.max_duration_seconds
@@ -261,6 +295,7 @@ class ReceiveLoop:
             reason = self._consume(catch_up_until=None)
             if self._catch_up_due(reason):
                 reason = self._catch_up()
+            self._warn_if_messages_remain(reason)
         finally:
             self._close()
         self._stats.stop_reason = reason.value
@@ -301,6 +336,7 @@ class ReceiveLoop:
         batch = self._receive(receiver, self._batch_count(), self._wait)
         if not batch:
             return self._on_empty(catch_up_until)
+        self._empty_retries = 0
         result = self._process(receiver, batch)
         if self._config.limits.stop_at_job_start and self._is_watermark_batch(batch):
             return self._on_watermark(receiver)
@@ -398,6 +434,8 @@ class ReceiveLoop:
         if result.progressed:
             self._tracker.progress()
         self._taken += len(batch) - len(result.retried)
+        # Not the stop drain's messages: C1 / C2 abandon those, so they are available again below this mark.
+        self._highest_processed = max(self._highest_processed or 0, *(message.sequence_number for message in batch))
         return result
 
     def _is_watermark_batch(self, batch: Sequence[Any]) -> bool:
@@ -408,10 +446,123 @@ class ReceiveLoop:
         if self._sessions:
             self._finish_session()  # this session is drained: on to the next one
             return None
-        if catch_up_until is None:
-            return StopReason.IDLE
-        self._sleep(CATCH_UP_POLL_SECONDS)
+        if catch_up_until is not None:
+            self._sleep(CATCH_UP_POLL_SECONDS)
+            return None
+        remaining = len(self._receivable_messages())
+        if not remaining:
+            return StopReason.IDLE  # verified: nothing a receive would hand out is left
+        return self._retry_empty_receive(remaining)
+
+    def _retry_empty_receive(self, remaining: int) -> StopReason | None:
+        """An empty receive although ``remaining`` receivable messages were peeked: reopen the connection
+        (a fresh link and connection clear a stalled credit refill) after a backoff that lets a throttled
+        namespace recover, at most ``MAX_EMPTY_RECEIVE_RETRIES`` times in a row; ``max_duration`` still
+        bounds the run (the next step's stop check)."""
+        self._empty_retries += 1
+        self._stats.empty_receive_retries += 1
+        if self._empty_retries > MAX_EMPTY_RECEIVE_RETRIES:
+            return StopReason.RECEIVE_STALLED
+        backoff = EMPTY_RECEIVE_BACKOFF_SECONDS[min(self._empty_retries, len(EMPTY_RECEIVE_BACKOFF_SECONDS)) - 1]
+        logger.info(
+            "A receive returned no messages although %s receivable message(s) are still in '%s' (a throttled "
+            "namespace or a stalled link); reopening the connection in %d s (retry %d of %d).",
+            f"at least {remaining}" if remaining >= DRAIN_CHECK_PEEK_COUNT else remaining,
+            self._entity.path,
+            backoff,
+            self._empty_retries,
+            MAX_EMPTY_RECEIVE_RETRIES,
+        )
+        # No stop drain: the receive just returned empty, so the local buffer is empty, and with no
+        # keep-alive thread nothing arrives before the next call [source: pyamqp works only inside calls].
+        self._close()
+        self._sleep(min(backoff, max(0.0, self._deadline - self._monotonic())))
         return None
+
+    def _receivable_messages(self) -> list[Any]:
+        """One peek page of what a receive would still hand out: past the highest processed sequence
+        number (from the start in cursor mode on a fresh receiver on partitioned entities, whose
+        sequence numbers are per partition), keeping messages that are neither deferred (C2's own and
+        foreign deferrals stay in the entity), nor pending activation, nor expired, nor -- with
+        ``stop_at_job_start`` -- enqueued at or after T0. Peeking locks nothing."""
+        if self._client is None:
+            self._client = self._connector.receive_client()
+        now = self._clock()
+        if self._info.is_partitioned or self._receiver is None:
+            kwargs = receiver_profile(self._connector, ServiceBusReceiveMode.PEEK_LOCK, 1, session_wait=None)
+            peeker = enter_receiver(self._entity.open_receiver(self._client, **kwargs))
+            start = 0 if self._info.is_partitioned else (self._highest_processed or 0) + 1
+            try:
+                page = peeker.peek_messages(DRAIN_CHECK_PEEK_COUNT, sequence_number=start)
+            finally:
+                close_quietly(peeker)
+        else:
+            start = (self._highest_processed or 0) + 1
+            page = self._receiver.peek_messages(DRAIN_CHECK_PEEK_COUNT, sequence_number=start)
+        watermark = self._config.limits.stop_at_job_start
+        return [
+            message
+            for message in page
+            if message.state != ServiceBusMessageState.DEFERRED
+            and not is_pending_activation(message)
+            and (message.expires_at_utc is None or message.expires_at_utc >= now)
+            and not (watermark and after_watermark(message, self._t0))
+        ]
+
+    def _warn_if_messages_remain(self, reason: StopReason) -> None:
+        """A partial extraction must never look like a complete drain: after a stop that can leave
+        messages behind (and, on session entities without the job-start stop, after the session loop
+        ran out of sessions) a WARNING names what is left -- peeked on plain entities, from the
+        management counts on session entities (a peek there needs a session). Best effort: a failed
+        count never changes the run's outcome."""
+        try:
+            if self._sessions:
+                text = self._remaining_by_count(reason)
+            elif reason in _PARTIAL_STOPS:
+                remaining = len(self._receivable_messages())
+                text = None
+                if remaining:
+                    shown = f"at least {remaining}" if remaining >= DRAIN_CHECK_PEEK_COUNT else str(remaining)
+                    text = f"{shown} receivable message(s) are still in '{self._entity.path}'"
+            else:
+                return
+        except Exception as error:  # noqa: BLE001 -- the count is informative only
+            logger.debug("Could not count the messages left: %s", _describe(error, self._connector.secrets))
+            return
+        if text is None:
+            return
+        hints = {
+            StopReason.MAX_MESSAGES: "Max Messages was reached",
+            StopReason.MAX_DURATION: "Max Duration was reached (Advanced options)",
+            StopReason.RECEIVE_STALLED: (
+                f"Service Bus returned no messages to {MAX_EMPTY_RECEIVE_RETRIES + 1} receives in a row although "
+                "messages were available -- typically a throttled namespace (see the throttling warning, if any)"
+            ),
+            StopReason.NO_MORE_SESSIONS: (
+                "no further session was handed out -- they may be locked by another consumer, or the namespace "
+                "was throttled"
+            ),
+        }
+        self._stats.warn(
+            "messages_remaining",
+            f"The run stopped before the entity was drained: {text}. Stop reason: {reason.value} "
+            f"({hints.get(reason, 'see the stop reason')}). The next run continues with them.",
+        )
+
+    def _remaining_by_count(self, reason: StopReason) -> str | None:
+        """Session entities: the management count of active messages (``None`` without management
+        access). Skipped in C2, whose own deferrals count as active, and after the session loop ran out
+        of sessions with ``stop_at_job_start`` on, when newer messages are expected to remain."""
+        if self._mode is SettlementMode.DEFER_COMMIT:
+            return None
+        if reason is StopReason.NO_MORE_SESSIONS and self._config.limits.stop_at_job_start:
+            return None
+        if reason not in _PARTIAL_STOPS and reason is not StopReason.NO_MORE_SESSIONS:
+            return None
+        counts = load_entity_info(self._connector, self._entity).counts
+        if not counts or not counts["active"]:
+            return None
+        return f"Service Bus reports {counts['active']} active message(s) in '{self._entity.path}'"
 
     def _on_watermark(self, receiver: Any) -> StopReason | None:
         if self._info.is_partitioned:

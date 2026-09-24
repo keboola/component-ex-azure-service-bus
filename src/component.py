@@ -25,7 +25,7 @@ from keboola.component.exceptions import UserException
 from keboola.component.sync_actions import MessageType, SelectElement, ValidationResult
 
 from body import FlattenRegistry
-from client import ServiceBusConnector, configure_logging, redact_secrets, to_user_exception
+from client import ServiceBusConnector, configure_logging, redact_secrets, throttled_requests, to_user_exception
 from columns import format_timestamp, metadata_column_names, render_preview, utc_now
 from commit import ForeignDeferralProbe, OrphanScanner, PendingCommitter
 from configuration import (
@@ -348,6 +348,7 @@ class Component(ComponentBase):
     def _finish(self, config: Configuration, run: RunContext) -> None:
         """Write the new row state once, at the end (spec §6.8), and log the run summary (§6.12)."""
         self.write_state_file(self._projected_state(run).to_dict())
+        run.stats.note_throttled(throttled_requests())
         run.stats.log_summary()
 
     # --- sync actions (spec §5.4) ---------------------------------------------------------------------

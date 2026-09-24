@@ -196,7 +196,7 @@
           "minimum": 1,
           "maximum": 300,
           "options": {
-            "tooltip": "One receive call waits up to this long for new messages. An empty result means the entity is drained and the run ends.",
+            "tooltip": "One receive call waits up to this long for new messages. When a receive returns nothing, the run peeks the entity to check that it is really drained: it ends only when no message in scope is left, and otherwise reconnects and continues (a busy or throttled namespace can briefly hand out nothing). If the run has to stop while messages remain, a warning says how many are left.",
             "dependencies": {
               "settlement_mode": [
                 "complete",
