@@ -14,6 +14,12 @@ Modelling notes beyond the Task-4 table:
   [live]); sub-queues keep the original number.
 - Locks lapse lazily: every operation first expires lapsed locks. A lapsed ACTIVE message gets
   ``delivery_count += 1`` and at ``max_delivery_count`` moves to the DLQ (``MaxDeliveryCountExceeded``).
+  A PEEK_LOCK deferred receive counts the delivery at once and toward MaxDeliveryCount, so repeated
+  deferred receives dead-letter the message [live, Phase 7]; when a receive brings the count to
+  ``max_delivery_count``, the message is still handed out and moves to the DLQ when that receive's
+  lock is released without a complete -- a lapse, an abandon or a re-defer -- the same moment a
+  non-deferred message's last failed delivery does [inferred timing: the probe confirmed the
+  dead-lettering, not its exact moment].
   Message locks of a closed receiver stay until they lapse (7.14.3 does not release them on close);
   closing a session receiver, or letting its session lock lapse, releases the session together
   with its unsettled messages.
@@ -698,13 +704,18 @@ class FakeEntity:
         self._locked.add(record.seq)
 
     def _unlock(self, record: _Record, *, redelivered: bool) -> None:
+        """Release a lock without a complete. A non-deferred message counts the failed delivery now; a
+        deferred one counted it on its deferred receive. Either way, a release that leaves the count at
+        ``max_delivery_count`` dead-letters it (a sub-queue has no DLQ of its own)."""
         record.locked_until, record.lock_token, record.holder = None, None, None
         self._locked.discard(record.seq)
-        if redelivered and not record.deferred:  # a deferred message counts its deliveries on receive
+        if not record.deferred:  # (a first-time defer arrives here already deferred: nothing to count)
+            if not redelivered:
+                return
             record.delivery_count += 1
-            if self._parent is None and record.delivery_count >= self.max_delivery_count:
-                description = f"Message could not be consumed after {record.delivery_count} delivery attempts."
-                self._dead_letter(record, "MaxDeliveryCountExceeded", description)
+        if self._parent is None and record.delivery_count >= self.max_delivery_count:
+            description = f"Message could not be consumed after {record.delivery_count} delivery attempts."
+            self._dead_letter(record, "MaxDeliveryCountExceeded", description)
 
     def _dead_letter(self, record: _Record, reason: str | None, description: str | None) -> None:
         """Move to the DLQ keeping sequence number, enqueue time and delivery count [live]."""

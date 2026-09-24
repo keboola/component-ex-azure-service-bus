@@ -75,6 +75,15 @@ def test_render_preview():
     assert "a\\|b" in lines[2] and "y" * 121 not in lines[2]
 
 
+def test_render_preview_escapes_every_text_cell():
+    message = make_message(b"l1\r\nl2|l3\rl4\nl5", sequence_number=3, message_id="id|1\n2", subject="s\r\nt|u")
+    _header, _separator, row = render_preview([message]).split("\n")  # one row: no line break leaked
+    assert "\r" not in row
+    cells = row.split(" | ")
+    assert cells[2:4] == ["id\\|1 2", "s t\\|u"]  # message id, subject
+    assert cells[-1] == "l1 l2\\|l3 l4 l5 |"  # CRLF -> one space, a lone CR -> a space
+
+
 def test_utc_now_is_the_aware_utc_wall_clock():
     before = datetime.now(UTC)
     value = utc_now()

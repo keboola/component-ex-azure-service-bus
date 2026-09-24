@@ -1087,7 +1087,7 @@
     }
   },
   {
-    "name": "67_run_flatten_cross_row_state_discard",
+    "name": "67_run_flatten_discarded_state",
     "description": "C4 json_flatten: a run whose state is discarded never adds a column the next run misses.",
     "config": {
       "action": "run",

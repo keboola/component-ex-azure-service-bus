@@ -196,15 +196,14 @@ class SyncActionConfiguration(AuthConfiguration):
         return self.source.topic_name if self.source is not None else None
 
 
-class Configuration(AuthConfiguration):
-    """The full row configuration: root auth fields plus the row's sections."""
+class EntityConfiguration(AuthConfiguration):
+    """Auth plus the row's validated, normalised ``source``: what every action that opens the entity
+    needs. The row-level sync actions (``testConnection`` with a source, ``previewMessages``,
+    ``entityInfo``, spec §5.4) validate only this, so a half-edited unrelated field -- an invalid
+    table name, a batch size out of range -- never blocks them; the other sections are ignored.
+    ``Configuration`` extends it, so a run and the sync actions read the source identically."""
 
     source: SourceConfig
-    limits: LimitsConfig = Field(default_factory=LimitsConfig)
-    body: BodyConfig = Field(default_factory=BodyConfig)
-    destination: DestinationConfig = Field(default_factory=DestinationConfig)
-    advanced: AdvancedConfig = Field(default_factory=AdvancedConfig)
-    advanced_options: bool = False
 
     @model_validator(mode="after")
     def _normalise_source(self) -> Self:
@@ -229,6 +228,16 @@ class Configuration(AuthConfiguration):
         if source.sub_queue is not SubQueue.NONE:
             source.session_enabled = False
         return self
+
+
+class Configuration(EntityConfiguration):
+    """The full row configuration: root auth fields, the row's source and its other sections."""
+
+    limits: LimitsConfig = Field(default_factory=LimitsConfig)
+    body: BodyConfig = Field(default_factory=BodyConfig)
+    destination: DestinationConfig = Field(default_factory=DestinationConfig)
+    advanced: AdvancedConfig = Field(default_factory=AdvancedConfig)
+    advanced_options: bool = False
 
     @model_validator(mode="after")
     def _apply_advanced_gate(self) -> Self:

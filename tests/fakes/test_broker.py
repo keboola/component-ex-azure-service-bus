@@ -775,3 +775,55 @@ def test_credential_failure_spares_sas_clients(broker):
     assert [queue.name for queue in admin.list_queues()] == ["q"]
     with sas_client().get_queue_receiver("q", prefetch_count=1, keep_alive=0) as receiver:
         assert len(receiver.peek_messages(1)) == 1
+
+
+# --- Phase 8: deferred receives count toward MaxDeliveryCount [live] -------------------------------
+
+
+def _defer_receives(r, seq: int, times: int) -> None:
+    for _ in range(times):
+        (message,) = r.receive_deferred_messages([seq])
+        r.defer_message(message)
+
+
+@pytest.mark.parametrize("release", ["defer", "abandon", "lapse"])
+def test_deferred_receive_reaching_the_max_dead_letters_on_release(broker, release):
+    q = broker.add_queue("q", max_delivery_count=3)
+    seq = q.send(b"a")
+    q.defer_existing(seq)
+    with sas_client().get_queue_receiver("q", prefetch_count=1, keep_alive=0) as r:
+        _defer_receives(r, seq, 2)
+        assert q.state_of(seq) == "DEFERRED" and q.delivery_count(seq) == 2
+        (message,) = r.receive_deferred_messages([seq])  # the receive that reaches the max still hands it out
+        assert message.delivery_count == 2 and q.delivery_count(seq) == 3 and q.state_of(seq) == "DEFERRED"
+        if release == "defer":
+            r.defer_message(message)
+        elif release == "abandon":
+            r.abandon_message(message)
+        else:
+            broker.clock.advance(61)
+    assert q.state_of(seq) is None
+    with sas_client().get_queue_receiver("q", sub_queue=DLQ, prefetch_count=1, keep_alive=0) as r:
+        (dead,) = r.peek_messages(1, sequence_number=1)
+    assert dead.sequence_number == seq and dead.delivery_count == 3
+    assert dead.dead_letter_reason == "MaxDeliveryCountExceeded"
+
+
+def test_deferred_receive_reaching_the_max_can_still_complete(broker):
+    q = broker.add_queue("q", max_delivery_count=2)
+    seq = q.send(b"a")
+    q.defer_existing(seq)
+    with sas_client().get_queue_receiver("q", prefetch_count=1, keep_alive=0) as r:
+        _defer_receives(r, seq, 1)
+        (message,) = r.receive_deferred_messages([seq])
+        r.complete_message(message)
+    assert q.sequence_numbers() == [] and q.dead_letter.sequence_numbers() == []
+
+
+def test_deferred_receives_below_the_max_stay_deferred(broker):
+    q = broker.add_queue("q")  # max_delivery_count 10
+    seq = q.send(b"a")
+    q.defer_existing(seq)
+    with sas_client().get_queue_receiver("q", prefetch_count=1, keep_alive=0) as r:
+        _defer_receives(r, seq, 9)
+    assert q.state_of(seq) == "DEFERRED" and q.delivery_count(seq) == 9

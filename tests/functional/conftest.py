@@ -201,8 +201,8 @@ def run_chain(
 ) -> list[CaseResult]:
     """Run ``names`` in order on the same broker, each in ``<tmp_path>/run<N>``. A run starts from
     the previous run's ``out/state.json`` -- or from the previous run's *input* state when that run
-    wrote none (it failed) or its index is in ``discard_state`` (another row of the same job failed,
-    so the platform discarded the job's state, spec §2.1 / §6.10). ``before_each(i)`` seeds the
+    wrote none (it failed) or its index is in ``discard_state`` (the platform discarded the run's
+    state, e.g. the job failed after its upload or the import failed, spec §2.1 / §6.10). ``before_each(i)`` seeds the
     broker or injects faults right before run ``i`` (0-based)."""
     results: list[CaseResult] = []
     current = state
@@ -248,6 +248,18 @@ def peek_stored(queue: str, sub_queue: ServiceBusSubQueue | None = None) -> list
     client = FakeServiceBusClient.from_connection_string(DUMMY_CONNECTION_STRING)
     with client, client.get_queue_receiver(queue, sub_queue=sub_queue) as receiver:
         return receiver.peek_messages(250, sequence_number=1)
+
+
+def receive_deferred(queue: str, sequence_number: int, *, times: int) -> None:
+    """Receive a deferred message ``times`` times through the fake SDK (PEEK_LOCK), re-deferring it
+    each time -- what defer-commit recoveries whose state was never saved leave behind. Every deferred
+    receive counts toward the message's delivery count [live]. Call it before the run: it adds a
+    client and a receiver to the broker's records."""
+    client = FakeServiceBusClient.from_connection_string(DUMMY_CONNECTION_STRING)
+    with client, client.get_queue_receiver(queue, prefetch_count=1, keep_alive=0) as receiver:
+        for _ in range(times):
+            (message,) = receiver.receive_deferred_messages([sequence_number])
+            receiver.defer_message(message)
 
 
 def summary(result: CaseResult) -> dict[str, str]:

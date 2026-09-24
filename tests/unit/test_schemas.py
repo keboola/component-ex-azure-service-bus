@@ -80,6 +80,22 @@ def test_async_selects_declare_empty_enum():
             assert prop.get("enum") == [], prop
 
 
+def test_async_autoload_is_array_form():
+    # The Keboola UI autoloads only an array (json-editor `helpers.ts` `shouldAutoload`: not
+    # `Array.isArray(autoload)` -> false; `[]` loads on open, a path list once those fields are set);
+    # a boolean `true` never autoloads, whatever older docs say.
+    autoloads = {
+        name: prop["options"]["async"]["autoload"]
+        for name, prop, _ in list(walk(ROOT_SCHEMA)) + list(walk(ROW_SCHEMA))
+        if "autoload" in prop.get("options", {}).get("async", {})
+    }
+    assert autoloads == {
+        "source.queue_name": [],
+        "source.topic_name": [],
+        "source.subscription_name": ["parameters.source.topic_name"],
+    }
+
+
 def test_message_id_primary_key_warns():
     props = {path: prop for path, prop, _ in walk(ROW_SCHEMA)}
     text = json.dumps(props["destination.primary_key"])

@@ -185,18 +185,25 @@ def _preview_body_text(message: Any) -> str:
         return "<unreadable body>"
 
 
+def _preview_cell(text: str) -> str:
+    """One markdown table cell: every line break (CRLF, LF or a lone CR) becomes one space and ``|``
+    is escaped, so a sender-supplied value can never end the row or add a column."""
+    return text.replace("\r\n", " ").replace("\r", " ").replace("\n", " ").replace("|", "\\|")
+
+
 def render_preview(messages: Sequence[Any], body_chars: int = 120) -> str:
     """The ``previewMessages`` sync action's markdown table (spec §5.4): sequence number, enqueued
     time, message id, subject, state and the first ``body_chars`` characters of the text-decoded
-    body. Nothing is settled here -- ``messages`` are peeked by the caller. The body is cut to
-    ``body_chars`` *before* newline / pipe escaping, so escaping never splits a ``\\|`` pair across
-    the cut."""
+    body. Nothing is settled here -- ``messages`` are peeked by the caller. The free-text cells
+    (message id, subject, body) go through the same escaping; the body is cut to ``body_chars``
+    *before* it, so escaping never splits a ``\\|`` pair across the cut."""
     rows = ["| Sequence Number | Enqueued (UTC) | Message ID | Subject | State | Body |", "|---|---|---|---|---|---|"]
     for message in messages:
-        body = _preview_body_text(message)[:body_chars].replace("\n", " ").replace("|", "\\|")
+        message_id = _preview_cell(_str(getattr(message, "message_id", None)))
+        subject = _preview_cell(_str(getattr(message, "subject", None)))
+        body = _preview_cell(_preview_body_text(message)[:body_chars])
         rows.append(
             f"| {message.sequence_number} | {format_timestamp(getattr(message, 'enqueued_time_utc', None))} "
-            f"| {_str(getattr(message, 'message_id', None))} | {_str(getattr(message, 'subject', None))} "
-            f"| {message.state.name} | {body} |"
+            f"| {message_id} | {subject} | {message.state.name} | {body} |"
         )
     return "\n".join(rows)

@@ -45,9 +45,11 @@ and the body as text, base64 or flattened JSON columns.
 - **State and output become durable only after the job succeeds [source: docker-bundle
   `Runner.php`, job-queue `JobHandler.php` / `JobRowHandler.php`].** `out/state.json` of run N is
   visible to run N+1 **iff** run N's container exited 0 **and** every output-mapping import of the
-  job succeeded. Rows execute sequentially; each row's output imports are queued and awaited after
-  all rows; state is then persisted for all rows — all-or-nothing across the job. Nothing the
-  container does is durable in Storage before it exits, so "delete the message after it is in
+  job succeeded. A multi-row configuration runs as a container job with **one child job per row**
+  [live, Phase 7], so this holds **per row**: each row has its own state, saved only if that row's
+  own job succeeds and its imports succeed — another row failing does not discard it [inferred from
+  the job structure, Phase-8 audit; supersedes the Phase-3 "all-or-nothing across the job" reading].
+  Nothing the container does is durable in Storage before it exits, so "delete the message after it is in
   Storage" is impossible inside the container. This is the fact every settlement mode (§2.3) is
   measured against.
 - **`write_always` tables are uploaded even when the job fails [source: `keboola/output-mapping`
@@ -80,9 +82,9 @@ and the body as text, base64 or flattened JSON columns.
   handling, destination. Each row has its own `state.json` (C2 pending-commit set, C4 cursor,
   flattening column registry). **Rows run sequentially by default**; parallelism is opt-in and not
   enabled. The component always receives one merged `config.json` (root + row `parameters`).
-- **Do not rely on row ordering for durability.** Row N's output is *not* guaranteed to be in
-  Storage when row N+1 runs (imports are queued and awaited after all rows [source]), and row
-  state is persisted all-or-nothing after the whole job. Every row is self-contained.
+- **Do not rely on row ordering for durability.** Each row runs as its own child job with its own
+  state (§2.1); a row never reads another row's output or state, and parallel rows are opt-in, so
+  nothing may assume row N's output is in Storage when row N+1 runs. Every row is self-contained.
 - **Secrets → `#`-prefixed keys:** `#connection_string`, `#client_secret` (encrypted at rest as
   `KBC::ProjectSecure`; the container receives plaintext).
 - **Sync actions:** `testConnection`, `listQueues`, `listTopics`, `listSubscriptions`,
@@ -496,6 +498,14 @@ guard (§2.5); a leftover key is ignored.
   `runtime.tag` (writer lesson) — branch builds cannot exercise the buttons before a release.
 - Row-level sync actions receive the root `parameters` merged with the row's [inferred — verified in
   Phase 6/7; the actions only need the fields they read, via partial models (§7)].
+- **Each action validates only what it reads (Phase 8):** the list actions and the root
+  `testConnection` validate the auth block (plus, for `listSubscriptions`, the selected topic); the
+  row-level `testConnection`, `previewMessages` and `entityInfo` validate auth + `source`
+  (`EntityConfiguration`, with the run's source normalisation) and ignore every other section, so a
+  half-edited unrelated field (an invalid table name, a batch size out of range) never blocks them.
+  Only `run` validates the whole row. The auth block is parsed inside the action (not in
+  `Component.__init__`), so its validation error reaches the UI through the sync-action error path
+  (stderr, exit 1).
 
 ### 5.5 UI scope & config shape
 
@@ -533,7 +543,7 @@ unmet (writer precedent, passed its Phase-7 fresh-config gate); the model defaul
 |---|---|---|
 | `auth_type`, `entity_type`, `sub_queue`, `settlement_mode`, `fetch_mode`, `body_format`, `unreadable_body`, `load_type`, `primary_key` | `enum` + `enum_titles` | stores the value; titles e.g. "Delete After Batch Is Written (Default)", "Delete On Next Successful Run (Safest)", "Delete On Receive (At Most Once)", "Peek Only (Never Delete)" |
 | `settlement_mode` tooltip | markdown tooltip | one line per mode with its guarantee and loss window (§2.3); C3 warns explicitly; C2 names the exclusive-consumer rule |
-| `queue_name`, `topic_name`, `subscription_name` | creatable async `select`, `autoload` | queues/topics autoload; subscriptions autoload watching `topic_name`; tooltip: "listing needs a service principal or a Manage connection string — with a Listen-only connection string type the name" |
+| `queue_name`, `topic_name`, `subscription_name` | creatable async `select`, `autoload` | queues/topics autoload (`"autoload": []`); subscriptions autoload watching `topic_name` (`["parameters.source.topic_name"]`) — the UI autoloads only an **array** (`[]` on open, a path list once those fields are set; a boolean `true` never autoloads) [source: keboola/ui json-editor `helpers.ts` `shouldAutoload`, Phase 8]; tooltip: "listing needs a service principal or a Manage connection string — with a Listen-only connection string type the name" |
 | `#connection_string`, `#client_secret` | password | |
 | `session_enabled`, `stop_at_job_start`, `advanced_options` | checkbox | |
 | integers | number input with `minimum` / `maximum` | |
@@ -937,11 +947,11 @@ another application's deferrals.
   | C3 `receive_and_delete` | `false` → `true` when the first receive returns messages | nothing uploaded, table unchanged (no receive has returned messages, so it was never armed) | rows written so far are upserted | the table is replaced by the rows written so far |
   | C4 `peek` | never | nothing uploaded, table unchanged; the next run re-peeks from the saved cursor | n/a (nothing is deleted) | n/a |
 
-  A successful job always uploads the table (`write_always` is irrelevant then). Separately, and
-  **independently of `write_always`**: output imports are queued per row and state is saved
-  all-or-nothing per job (§2.1), so a row that succeeds while **another row of the same job fails**
-  can have its table imported while its output state is discarded [lead reading of the source,
-  §2.1] — the reason for the flatten column rule in §6.10, which holds in every mode.
+  A successful job always uploads the table (`write_always` is irrelevant then). Separately: a
+  run's output state is durable only if its **own** (row) job succeeds **and** its imports succeed
+  (§2.1), so a job that fails after a `write_always` upload, or an import that fails after the job,
+  discards the run's state — possibly with its rows already in Storage. That is the reason for the
+  flatten column rule in §6.10, which holds in every mode.
 - **Empty run (G5):** header-only CSV + manifest; succeeds. With `full_load` this empties the table
   (mirror / delta semantics, §2.4).
 - **Rows sharing one table:** fixed-schema rows may share a table name (use the composite PK when
@@ -981,8 +991,8 @@ another application's deferrals.
     file" [docs]). So a table must never gain a column that the registry of the *saved* state does
     not contain — otherwise the next run (starting from that state) omits it and every later import
     fails, while C1 / C3 keep deleting messages. A run cannot know whether its state will be saved:
-    its own job may fail after a `write_always` upload (§6.9), and — independently of
-    `write_always` — another row of the same job may fail after this row's import was queued (§2.1).
+    its own job may still fail after a `write_always` upload (§6.9), and an import that fails after
+    the job discards the state too (§2.1).
   - **Reserved column `body_unmapped`** (STRING, JSON): always present in flatten mode, last in the
     column order, reserved in the registry (a JSON key `unmapped` becomes `body_unmapped_2`). Per
     row it holds a compact JSON object `{"<column name>": "<value>", …}` keyed by the **registry
@@ -995,8 +1005,7 @@ another application's deferrals.
     registered (name assigned, cap checked), its values go to `body_unmapped`, and it is saved in the
     output state's registry; it becomes a real column from the **next** run. Invariant: no job adds a
     column that is outside the registry it started from, and saved registries only grow, so the
-    latest saved registry always covers every column of the table — whatever the job outcome and
-    whatever the other rows do.
+    latest saved registry always covers every column of the table — whatever the job outcome.
   - **Resulting behaviour (README "known behaviour"):** every key lands in `body_unmapped` in the run
     that first sees it and is a column from the next run (a one-run column lag in every mode); the
     first-ever run, and the first run after a state reset, put every key in `body_unmapped`; keys
@@ -1078,7 +1087,7 @@ state):
 
 | Module | Responsibility |
 |---|---|
-| `src/configuration.py` | Pydantic v2 models: `AuthConfiguration` (flat root auth fields, writer's `_validate_auth`), `SourceConfig`, `LimitsConfig`, `BodyConfig`, `DestinationConfig`, `AdvancedConfig`, `Configuration` (merged root + row); `StrEnum`s for every enum; `extra="ignore"`; `ValidationError` → `UserException` with field paths; §5.3 validators. Partial models: `AuthConfiguration` (list actions, root `testConnection`), `SyncActionConfiguration` (auth + a possibly partial `source`: `testConnection`'s root-vs-row branch, `listSubscriptions`' topic), `Configuration` (run and row actions). |
+| `src/configuration.py` | Pydantic v2 models: `AuthConfiguration` (flat root auth fields, writer's `_validate_auth`), `SourceConfig`, `LimitsConfig`, `BodyConfig`, `DestinationConfig`, `AdvancedConfig`, `Configuration` (merged root + row); `StrEnum`s for every enum; `extra="ignore"`; `ValidationError` → `UserException` with field paths; §5.3 validators. Partial models: `AuthConfiguration` (list actions, root `testConnection`), `SyncActionConfiguration` (auth + a possibly partial `source`: `testConnection`'s root-vs-row branch, `listSubscriptions`' topic), `EntityConfiguration` (auth + the validated, normalised `source`: row `testConnection`, `previewMessages`, `entityInfo`), `Configuration` (extends `EntityConfiguration`; `run` only). |
 | `src/client.py` | `ServiceBusConnector` — credential factory (SAS / SP), `receive_client()`, `commit_client()` (`retry_total=0`), `admin_client()`, `user_agent`; `redact_secrets`, `to_user_exception` (§6.11). Pyamqp only. |
 | `src/entity.py` | `EntityRef` (entity type, names, sub-queue → receiver kwargs, entity path, derived table name, state key); `EntityInfo` (L2 metadata or heuristics: sessions, partitioning, lock duration, max delivery count); `partition_of(seq)`; management helpers for the dropdowns and `entityInfo`. |
 | `src/receiver.py` | `ReceiveLoop` — batches, sessions loop, stop conditions, lock renewal, stop drain, recycling with cap + no-progress guard, catch-up wait; the helpers it shares with the peek pager: `RecoveryTracker`, `StopReason`, receiver profile (§6.2), open / close / session-renew helpers, the watermark test. |
@@ -1090,7 +1099,7 @@ state):
 | `src/columns.py` | fixed column catalogue (name → base type), message → metadata row mapping (E1–E25), value formatting (timestamps, JSON, bytes), `previewMessages` markdown rendering. |
 | `src/output.py` | `OutputTable` — one streaming CSV writer for every body format (flatten: fixed columns + input-registry columns + `body_unmapped`, §6.10); manifest (schema, PK, incremental, `has_header`, `write_always` false until `arm_write_always()`; on the legacy queue the library omits the key and the component only warns, §6.9) via a callback into `ComponentBase.write_manifest`; context manager that flushes and closes on exit, including on exceptions. |
 | `src/stats.py` | `RunStats` counters, effective-settings line, summary, WARNING aggregation. |
-| `src/component.py` | `Component(ComponentBase)`: `__init__` parses `AuthConfiguration` and builds the `ServiceBusConnector` (lazy — no network in `__init__`); `run()` ≤ 30 lines delegating to `_load_run_config`, `_start_run`, `_open_output`, `_commit_pending`, `_reconcile_deferrals`, `_consume`, `_peek`, `_finish`; `@sync_action`s (§5.4, read through the typed partial models); the scaffold's `__main__` guard (`UserException` → exit 1 with redacted message, else exit 2). |
+| `src/component.py` | `Component(ComponentBase)`: the `ServiceBusConnector` is a cached property built on first use — by `run()` before any step, or inside a sync action so an auth validation error takes the sync-action error path — from `AuthConfiguration`; building it installs the redacting log filter (no network until a client is opened); `run()` ≤ 30 lines delegating to `_load_run_config`, `_start_run`, `_open_output`, `_commit_pending`, `_reconcile_deferrals`, `_consume`, `_peek`, `_finish`; `@sync_action`s (§5.4, read through the typed partial models); the scaffold's `__main__` guard (`UserException` → exit 1 with redacted message, else exit 2). |
 
 - **Typing:** built-in generics, `collections.abc` iterators, full hints, `@staticmethod` where
   `self` is unused; ruff with `I`, `UP`, `G` (template config); PEP 758 `except A, B:` is valid on
@@ -1112,7 +1121,8 @@ patches `ServiceBusClient`, `ServiceBusAdministrationClient` and `ClientSecretCr
 `client.py` with fakes backed by a **`FakeBroker`** that models entities, sub-queues, sessions,
 partitions (`seq >> 48`), message states (ACTIVE / DEFERRED / SCHEDULED), locks with a controllable
 clock, delivery counts, the peek 250 cap, deferred-receive rules (one partition per call, RAD ≤ 250,
-all-or-nothing `MessageNotFoundError`), settlement, dead-lettering (rejected on DLQ), NEXT_AVAILABLE
+all-or-nothing `MessageNotFoundError`, each PEEK_LOCK deferred receive counting toward
+MaxDeliveryCount and dead-lettering at it), settlement, dead-lettering (rejected on DLQ), NEXT_AVAILABLE
 sessions (`OperationTimeoutError` when none), the management plane (lists / properties / 401 for a
 Listen SAS) and failure injection (auth errors, a `TypeError` on the N-th receive, body-access
 errors, lock loss). `from_connection_string` validates through the real SDK parser offline (writer
@@ -1158,7 +1168,7 @@ only dummies may appear, and surfaced errors must be redacted.
 | `26_run_c2_orphan_recovery_plain` | run | H3 plain: orphan recovered → row → re-deferred; K stop; skip rules |
 | `27_run_c2_orphan_scan_locked_cluster` | run | locked messages peek as never-delivered; K > cluster keeps scanning past them |
 | `28_run_c2_orphan_scan_cap_warning` | run | page cap → WARNING |
-| `29_run_c2_orphan_guard_delivery_count` | run | recovery guard WARNING |
+| `29_run_c2_orphan_guard_delivery_count` | run | recovery guard WARNING; the orphan reaches the threshold through nine earlier deferred receives |
 | `30_run_c2_partitioned` | run | per-partition commit groups, best-effort scan WARNING |
 | `31_run_c2_session_entity` | two-run | per-session commit, "recovery impossible" WARNING |
 | `32_run_c2_dlq` | two-run | sub-queue commit, best-effort WARNING |
@@ -1196,7 +1206,7 @@ only dummies may appear, and surfaced errors must be redacted.
 | `64_run_missing_creds` | run fail | auth validation |
 | `65_run_failure_write_always_per_mode` | run fail | the §6.9 table: C1 / C3 failing after one settled batch leave the CSV + a `write_always: true` manifest; C1 failing before the first complete, C3 failing before any receive returned messages, C2 failing mid-run and C4 failing mid-run (peek-error injection) leave `write_always: false` |
 | `66_run_flatten_failed_run_new_keys` | three-run (C2) | run 1 fails after writing rows with key `a` → CSV has no `body_a`, `body_unmapped` filled, no state; run 2 (from run 1's input state) succeeds → still no `body_a`, `body_unmapped` filled, registry saved; run 3 → `body_a` is a column |
-| `67_run_flatten_cross_row_state_discard` | two-run (C4) | simulates another row failing: run 1 succeeds with new keys (header has no new columns); run 2 starts from run 1's **input** state (as if the job's state was discarded) → its header equals run 1's, so the next import can never miss a column |
+| `67_run_flatten_discarded_state` | two-run (C4) | state discarded (e.g. the job failed after the upload): run 1 succeeds with new keys (header has no new columns); run 2 starts from run 1's **input** state → its header equals run 1's, so the next import can never miss a column |
 | `68_run_unreadable_fail_writes_rest_first` | run fail (C3) | policy `fail`, one unreadable body in a batch of 3 → the 2 readable rows are in the CSV (manifest `write_always: true`), then exit 1 |
 | `69_run_flatten_cap_writes_rest_first` | run fail (C3) | registry cap reached mid-batch → the whole batch is written (over-cap key in `body_unmapped`), then exit 1 |
 
@@ -1314,11 +1324,13 @@ this spec against it. Every `corrected:` item is folded into the sections cited.
   parallel" conflicts with `config-rows.md`; the spec follows `config-rows.md`: sequential by
   default, parallelism opt-in.)
 - `[config-rows.md]` → corrected: the reference says "outputs from row N are committed to Storage
-  before row N+1 starts"; docker-bundle `Runner.php` only **queues** each row's imports and awaits
-  them after all rows, then persists state for all rows (all-or-nothing). Folded: §2.1 states the
-  source-verified behaviour, §2.2 says not to rely on row ordering for durability (every row is
-  self-contained), §2.1 / §6.9 use it to justify `write_always`. Sequential-by-default rows, per-row
-  state and the single merged `config.json` (§2.2, §6.8, §8 fixtures) follow the reference.
+  before row N+1 starts"; the Phase-3 reading of docker-bundle `Runner.php` (each row's imports
+  queued and awaited after all rows, state persisted for all rows at once) was in turn superseded in
+  Phase 8: a multi-row configuration runs one child job per row [live, Phase 7], each with its own
+  state, durable only if that row's job and its imports succeed. Folded: §2.1 states it, §2.2 says
+  not to rely on row ordering (every row is self-contained), §2.1 / §6.9 justify `write_always` by the
+  row's own job failing. Sequential-by-default rows, per-row state and the single merged
+  `config.json` (§2.2, §6.8, §8 fixtures) follow the reference.
 - `[extraction-modes.md]` → correct — `destination.load_type` always visible; `source.fetch_mode`
   gated to peek; the fetch-mode field omitted for the destructive modes under the "only one mode
   possible" clause; `date_window` not offered with the reason; both delta / staging pairings stated
@@ -1362,8 +1374,8 @@ this spec against it. Every `corrected:` item is folded into the sections cited.
 
 - **Phase 4 (implementation)** — static gate: `component-checklist-review` on `architecture`,
   `typing`, `configuration`, `error-handling`, `logging`, `output-state`, `infra` (owner
-  `component-develop`, `## Exit gate`). Design choices that pre-satisfy it: §7 (client in `__init__`,
-  thin `run()`), §5.3 (typed model, aliases, `extra`), §6.8–§6.9 (manifest + state), §6.11–§6.12.
+  `component-develop`, `## Exit gate`). Design choices that pre-satisfy it: §7 (connector built on
+  first use, thin `run()`), §5.3 (typed model, aliases, `extra`), §6.8–§6.9 (manifest + state), §6.11–§6.12.
 - **Phase 5 (tests)** — `testing`, `credentials`, `output-state`; the case list is §8; the AMQP note
   replaces cassettes with the SDK-mock harness.
 - **Phase 6 (portal)** — `schema-ui`, `sync-actions`, `component-config`, `configuration`; portal
@@ -1406,7 +1418,7 @@ differ):**
 | G1 | `write_always` starts `false`; C1 switches it on just before the first complete, C3 when its first receive returns messages (cycle-2 refinement); never in C2 / C4; per-mode × load-type table | §2.1, §6.1, §6.9 |
 | G2 | Flatten mode carries the reserved JSON column `body_unmapped`; a run materialises the input-state registry columns + `body_unmapped` — superseded in detail by G4 | §6.10 |
 | G3 | Unreadable-body retries have their own recycle budget; dispositions count as progress; the abort share is reachable before any cap | §6.5, §6.6 |
-| G4 (cycle 2) | In **every** mode a run writes exactly the input-state registry columns + `body_unmapped`; new keys always go to `body_unmapped` in the run that discovers them and are columns from the next run (the cross-row state discard is independent of `write_always`) | §6.9, §6.10 |
+| G4 (cycle 2) | In **every** mode a run writes exactly the input-state registry columns + `body_unmapped`; new keys always go to `body_unmapped` in the run that discovers them and are columns from the next run (the cross-row state discard is independent of `write_always`) [Phase 8: state is per row — the cross-row reason is withdrawn; the rule stands on the job failing after a `write_always` upload and on import failures, §6.9 / §6.10] | §6.9, §6.10 |
 | G5 (cycle 2) | `fail` policy and the flatten cap: record, write and settle the readable rest of the batch, then raise | §6.6, §6.10 |
 
 **Decisions the author made while applying them (flagged to the lead):**

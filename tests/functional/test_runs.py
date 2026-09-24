@@ -11,7 +11,7 @@ from pathlib import Path
 from azure.servicebus.exceptions import ServiceBusServerBusyError
 
 from state import iter_ranges
-from tests.functional.conftest import run_case, run_twice, summary
+from tests.functional.conftest import receive_deferred, run_case, run_twice, summary
 
 EXPECTED = Path(__file__).resolve().parent / "expected"
 
@@ -191,9 +191,11 @@ def test_28_run_c2_orphan_scan_cap_warning(fake_broker, tmp_path, monkeypatch, c
 
 
 def test_29_run_c2_orphan_guard_delivery_count(fake_broker, tmp_path, monkeypatch, capsys):
-    q = fake_broker.add_queue("q")
-    orphan = q.send(b"orphan", delivery_count=9)
+    q = fake_broker.add_queue("q")  # max_delivery_count 10: the guard threshold is 9
+    orphan = q.send(b"orphan")
     q.defer_existing(orphan)
+    receive_deferred("q", orphan, times=9)  # nine earlier recoveries whose state was lost
+    assert q.delivery_count(orphan) == 9 and q.state_of(orphan) == "DEFERRED"
     result = run_case("29_run_c2_orphan_guard_delivery_count", tmp_path, monkeypatch, capsys)
     assert result.exit_code == 0
     assert "were not recovered because their delivery count" in result.stderr
@@ -365,7 +367,7 @@ def test_43_run_session_mismatch(fake_broker, tmp_path, monkeypatch, capsys):
     fake_broker.add_queue("q", sessions=True).send(b"x", session_id="A")
     result = run_case("43_run_session_mismatch", tmp_path, monkeypatch, capsys)
     assert result.exit_code == 1
-    assert "Sessions" in result.stderr
+    assert "enable Sessions" in result.stderr
 
 
 def test_44_run_dlq_c1(fake_broker, tmp_path, monkeypatch, capsys):

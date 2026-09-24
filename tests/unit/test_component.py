@@ -496,6 +496,73 @@ def test_entity_info_listen_sas(broker, tmp_path, monkeypatch, capsys):
     assert err.startswith("Entity details need a connection string with Manage rights")
 
 
+# --- sync actions validate only auth + source (spec §5.4); auth is parsed lazily ---------------------------
+
+UNRELATED_INVALID = {
+    "table_name": {"destination": {"table_name": "_not a table name_"}},
+    "batch_size": {"advanced_options": True, "advanced": {"batch_size": 0}},
+}
+
+
+@pytest.mark.parametrize("unrelated", UNRELATED_INVALID.values(), ids=UNRELATED_INVALID.keys())
+@pytest.mark.parametrize("action", ["testConnection", "previewMessages", "entityInfo"])
+def test_entity_sync_actions_ignore_unrelated_invalid_fields(broker, tmp_path, monkeypatch, capsys, action, unrelated):
+    broker.add_queue("q").send(b"x")
+    component(tmp_path, monkeypatch, {**PARAMS, **unrelated}, action=action).execute_action()
+    assert sync_result(capsys)["status"] == "success"
+
+
+@pytest.mark.parametrize("unrelated", UNRELATED_INVALID.values(), ids=UNRELATED_INVALID.keys())
+def test_run_still_validates_the_whole_row(broker, tmp_path, monkeypatch, unrelated):
+    broker.add_queue("q").send(b"x")
+    with pytest.raises(UserException, match="Validation Error"):
+        component(tmp_path, monkeypatch, {**PARAMS, **unrelated}).execute_action()
+
+
+@pytest.mark.parametrize("action", ["previewMessages", "entityInfo"])
+def test_entity_sync_actions_still_validate_the_source(broker, tmp_path, monkeypatch, capsys, action):
+    params = {"#connection_string": SAS, "source": {"entity_type": "queue"}}
+    err = sync_failure(capsys, component(tmp_path, monkeypatch, params, action=action))
+    assert err == (
+        "Validation Error: configuration: Value error, `source.queue_name` is required when `entity_type` is `queue`."
+    )
+
+
+def test_preview_normalises_the_source_like_a_run(broker, tmp_path, monkeypatch, capsys):
+    q = broker.add_queue("q", sessions=True)
+    q.dead_letter_existing(q.send(b"x", session_id="a"), "reason", "description")
+    params = with_source(sub_queue="dead_letter", session_enabled=True)  # a sub-queue has no sessions
+    component(tmp_path, monkeypatch, params, action="previewMessages").execute_action()
+    assert sync_result(capsys)["type"] == "table"
+    assert "session_id" not in broker.receivers[0].kwargs
+
+
+@pytest.mark.parametrize("action", ["listQueues", "listTopics", "testConnection"])
+def test_missing_credentials_fail_through_the_sync_action(broker, tmp_path, monkeypatch, capsys, action):
+    comp = component(tmp_path, monkeypatch, {}, action=action)  # auth is no longer parsed in __init__
+    err = sync_failure(capsys, comp)  # the sync-action wrapper writes the message to stderr and exits 1
+    assert (
+        err
+        == "Validation Error: configuration: Value error, `#connection_string` is required for connection_string auth."
+    )
+
+
+def test_run_without_credentials_is_a_validation_error(broker, tmp_path, monkeypatch):
+    comp = component(tmp_path, monkeypatch, {"source": PARAMS["source"]})
+    with pytest.raises(UserException, match="`#connection_string` is required"):
+        comp.execute_action()
+
+
+def test_building_the_connector_installs_log_redaction(broker, tmp_path, monkeypatch):
+    from client import RedactingFilter
+
+    root = logging.getLogger()
+    comp = component(tmp_path, monkeypatch, PARAMS)
+    assert not any(isinstance(f, RedactingFilter) for h in root.handlers for f in h.filters)
+    assert comp._connector.secrets == (SAS,)
+    assert root.handlers and all(any(isinstance(f, RedactingFilter) for f in h.filters) for h in root.handlers)
+
+
 # --- the __main__ guard ----------------------------------------------------------------------------------
 
 

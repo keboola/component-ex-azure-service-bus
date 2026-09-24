@@ -22,12 +22,34 @@ def _scanned() -> list[Path]:
     return [path for path in paths if path.is_file()]
 
 
+# (pattern, allowed values): a SAS key may only be a dummy, a SAS token signature only the mask.
+_SAS_VALUES = (
+    (re.compile(r"SharedAccessKey=([^;\"\s]+)"), DUMMY_KEYS),
+    (re.compile(r"sig=([^&;\"\s]+)"), {"***"}),
+)
+
+
+def leaked_sas_values(text: str) -> list[str]:
+    """Every ``SharedAccessKey=`` / ``sig=`` value in ``text`` that is neither allowed nor a ``<...>``
+    placeholder -- each occurrence checked on its own."""
+    return [
+        value
+        for pattern, allowed in _SAS_VALUES
+        for value in pattern.findall(text)
+        if value not in allowed and not PLACEHOLDER.fullmatch(value)
+    ]
+
+
+def test_leak_check_inspects_every_value():
+    # a masked signature elsewhere in the same file must not excuse a real one
+    text = '{"a": "sr=x&sig=***&se=1", "b": "sig=<signature>", "c": "sr=x&sig=abc%2Bdef&se=1"}'
+    assert leaked_sas_values(text) == ["abc%2Bdef"]
+    assert leaked_sas_values("SharedAccessKey=<key>;SharedAccessKey=cmVhbA==") == ["cmVhbA=="]
+
+
 def test_committed_fixtures_hold_only_dummy_secrets():
     for path in _scanned():
-        text = path.read_text(errors="ignore")
-        for key in re.findall(r"SharedAccessKey=([^;\"\s]+)", text):
-            assert key in DUMMY_KEYS or PLACEHOLDER.fullmatch(key), path
-        assert "sig=" not in text or "sig=***" in text, path
+        assert leaked_sas_values(path.read_text(errors="ignore")) == [], path
 
 
 def test_functional_configs_hold_only_dummy_client_secrets():

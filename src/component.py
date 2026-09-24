@@ -13,6 +13,7 @@ import logging
 import sys
 from dataclasses import dataclass
 from datetime import datetime
+from functools import cached_property
 from typing import Any, Literal, NamedTuple
 
 from azure.servicebus import NEXT_AVAILABLE_SESSION, ServiceBusReceiveMode
@@ -29,6 +30,7 @@ from configuration import (
     AuthConfiguration,
     BodyFormat,
     Configuration,
+    EntityConfiguration,
     FetchMode,
     SettlementMode,
     SyncActionConfiguration,
@@ -91,12 +93,17 @@ class RunContext:
 class Component(ComponentBase):
     """Extractor for Azure Service Bus queues, subscriptions and dead-letter queues."""
 
-    def __init__(self) -> None:
-        super().__init__()
-        # Partial model: the list actions and the root testConnection carry no row fields (spec §7).
-        self._auth = AuthConfiguration(**self.configuration.parameters)
-        self._connector = ServiceBusConnector(self._auth, self._client_identifier())
-        configure_logging(self._connector.secrets, debug=logging.getLogger().isEnabledFor(logging.DEBUG))
+    @cached_property
+    def _connector(self) -> ServiceBusConnector:
+        """The row's connector, built on first use -- by ``run()`` or inside a sync action -- so an
+        invalid auth block surfaces as that action's ``UserException`` (the sync-action wrapper
+        reports it on stderr) instead of failing in ``__init__``, outside it. Only the auth block is
+        parsed: the list actions and the root ``testConnection`` carry no row fields (spec §7).
+        Building it installs the redacting log filter with the row's secrets; before that no secret
+        is known, and ``run()`` builds it before any step logs."""
+        connector = ServiceBusConnector(AuthConfiguration(**self.configuration.parameters), self._client_identifier())
+        configure_logging(connector.secrets, debug=logging.getLogger().isEnabledFor(logging.DEBUG))
+        return connector
 
     def run(self) -> None:
         """Extract one Service Bus entity per row into one Storage table (spec §6.1)."""
@@ -121,6 +128,9 @@ class Component(ComponentBase):
         return f"kbc-{env.config_id or 'local'}-{env.config_row_id or 'root'}"[:64]
 
     def _load_run_config(self) -> Configuration:
+        """The whole row, validated. The connector is built first, so auth errors are reported before
+        row errors (as ever) and the log redaction is in place before any run step logs."""
+        _ = self._connector
         return Configuration(**self.configuration.parameters)
 
     def _start_run(self, config: Configuration) -> RunContext:
@@ -342,12 +352,17 @@ class Component(ComponentBase):
 
     @sync_action("entityInfo")
     def entity_info(self) -> ValidationResult:
-        entity = EntityRef.from_source(Configuration(**self.configuration.parameters).source)
+        entity = EntityRef.from_source(self._entity_configuration().source)
         return ValidationResult(describe_entity(self._connector, entity), MessageType.INFO)
 
     def _sync_configuration(self) -> SyncActionConfiguration:
         """The partial model of the sync actions that must work before the row is complete."""
         return SyncActionConfiguration(**self.configuration.parameters)
+
+    def _entity_configuration(self) -> EntityConfiguration:
+        """The partial model of the sync actions that open the row's entity: auth + source only
+        (spec §5.4), so an unrelated half-edited field never blocks them."""
+        return EntityConfiguration(**self.configuration.parameters)
 
     def _select_elements(
         self, kind: Literal["queues", "topics", "subscriptions"], topic_name: str | None = None
@@ -358,7 +373,7 @@ class Component(ComponentBase):
         """Peek the row's entity from its first message on a PEEK_LOCK receiver with the thread-free
         profile (spec §6.2); a session entity takes the next available session for a moment. The
         messages are ``None`` when a session entity has no session with an available message."""
-        config = Configuration(**self.configuration.parameters)
+        config = self._entity_configuration()
         entity = EntityRef.from_source(config.source)
         sessions = config.source.session_enabled
         kwargs: dict[str, Any] = {

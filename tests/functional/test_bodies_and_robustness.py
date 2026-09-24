@@ -314,11 +314,10 @@ def test_66_run_flatten_failed_run_new_keys(fake_broker, tmp_path, monkeypatch, 
     assert row["body_a"] == "2" and row["body_unmapped"] == ""
 
 
-def test_67_run_flatten_cross_row_state_discard(fake_broker, tmp_path, monkeypatch, capsys):
+def test_67_run_flatten_discarded_state(fake_broker, tmp_path, monkeypatch, capsys):
+    """State discarded, e.g. the job failed after the upload: run 1 succeeds, the platform drops its state."""
     fake_broker.add_queue("q").send(b'{"k":1}')
-    first, second = run_chain(
-        ["67_run_flatten_cross_row_state_discard"] * 2, tmp_path, monkeypatch, capsys, discard_state={0}
-    )
+    first, second = run_chain(["67_run_flatten_discarded_state"] * 2, tmp_path, monkeypatch, capsys, discard_state={0})
     assert first.exit_code == 0 and second.exit_code == 0
     assert first.state is not None and [entry["column"] for entry in first.state["flatten_columns"]] == ["body_k"]
     assert "body_k" not in csv_header(first)

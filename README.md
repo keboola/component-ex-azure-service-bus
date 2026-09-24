@@ -213,8 +213,8 @@ Body formats and JSON flattening
   in a run is not yet a column: its value goes into `body_unmapped` (a compact JSON object keyed by
   the column name it has been assigned), and it becomes a real column starting with the **next**
   run — a one-run column lag that applies after the first-ever run, after any state reset, and
-  after any run whose state was not saved (e.g. because it failed, or because another row of the
-  same job failed).
+  after any run whose state was not saved (e.g. because the job failed after its rows were
+  uploaded, or the table import failed).
 - Column names are capped at 64 characters (longer paths are hashed) and the registry is capped at
   1,000 columns per row; past the cap, new keys still land in `body_unmapped` under a name that is
   not saved, the run's already-written rows are kept, and only then does it fail — switch to `text`
@@ -252,8 +252,9 @@ State
 
 Each row keeps its own `state.json`: the `defer_commit` pending-commit set (grouped by entity /
 session / partition, as sequence-number ranges), the Peek-mode cursor, and the JSON-flatten column
-registry. State is written once, at the end of the run, and — like Storage output — only becomes
-visible to the next run if the whole job succeeds. The whole state is kept under 256 KiB; an
+registry. State is written once, at the end of the run, and only becomes visible to the next run
+if that row's job succeeds and its table import succeeds; a failing row never discards another
+row's state. The whole state is kept under 256 KiB; an
 unrecognised state version fails the run rather than silently reinterpreting it (reset the state
 to recover).
 
