@@ -1,1 +1,444 @@
-{}
+{
+  "type": "object",
+  "title": "Service Bus Entity",
+  "required": [
+    "source"
+  ],
+  "properties": {
+    "source": {
+      "type": "object",
+      "title": "Source",
+      "format": "grid-strict",
+      "required": [
+        "entity_type"
+      ],
+      "propertyOrder": 10,
+      "properties": {
+        "entity_type": {
+          "type": "string",
+          "title": "Entity Type",
+          "description": "Read a queue or one subscription of a topic",
+          "enum": [
+            "queue",
+            "subscription"
+          ],
+          "options": {
+            "enum_titles": [
+              "Queue",
+              "Topic Subscription"
+            ],
+            "grid_columns": 6
+          },
+          "propertyOrder": 1
+        },
+        "sub_queue": {
+          "type": "string",
+          "title": "Sub-Queue",
+          "description": "Read the entity itself or one of its dead-letter queues",
+          "enum": [
+            "none",
+            "dead_letter",
+            "transfer_dead_letter"
+          ],
+          "options": {
+            "enum_titles": [
+              "None (Main Entity)",
+              "Dead-Letter Queue",
+              "Transfer Dead-Letter Queue"
+            ],
+            "tooltip": "- **None** — the queue or subscription itself.\n- **Dead-Letter Queue** — messages that the broker or a consumer dead-lettered.\n- **Transfer Dead-Letter Queue** — messages that could not be forwarded to another entity.\n\nSub-queues never use sessions. A message read from a sub-queue cannot be dead-lettered again, so the **Dead-Letter the Message** unreadable-body policy leaves it in place instead.",
+            "grid_columns": 6
+          },
+          "default": "none",
+          "propertyOrder": 2
+        },
+        "queue_name": {
+          "type": "string",
+          "title": "Queue Name",
+          "description": "Queue to read from",
+          "format": "select",
+          "enum": [],
+          "options": {
+            "async": {
+              "label": "Load Queues",
+              "action": "listQueues",
+              "autoload": [],
+              "cache": false
+            },
+            "creatable": true,
+            "tooltip": "Listing needs a service principal or a connection string with **Manage** rights — with a Listen-only connection string, type the name.",
+            "inputAttributes": {
+              "placeholder": "my-queue"
+            },
+            "dependencies": {
+              "entity_type": "queue"
+            },
+            "grid_columns": 12
+          },
+          "propertyOrder": 3
+        },
+        "topic_name": {
+          "type": "string",
+          "title": "Topic Name",
+          "description": "Topic that owns the subscription",
+          "format": "select",
+          "enum": [],
+          "options": {
+            "async": {
+              "label": "Load Topics",
+              "action": "listTopics",
+              "autoload": [],
+              "cache": false
+            },
+            "creatable": true,
+            "tooltip": "Listing needs a service principal or a connection string with **Manage** rights — with a Listen-only connection string, type the name.",
+            "inputAttributes": {
+              "placeholder": "my-topic"
+            },
+            "dependencies": {
+              "entity_type": "subscription"
+            },
+            "grid_columns": 6
+          },
+          "propertyOrder": 4
+        },
+        "subscription_name": {
+          "type": "string",
+          "title": "Subscription Name",
+          "description": "Subscription of the selected topic to read from",
+          "format": "select",
+          "enum": [],
+          "options": {
+            "async": {
+              "label": "Load Subscriptions",
+              "action": "listSubscriptions",
+              "autoload": [
+                "parameters.source.topic_name"
+              ],
+              "cache": false
+            },
+            "creatable": true,
+            "tooltip": "Listing needs a service principal or a connection string with **Manage** rights — with a Listen-only connection string, type the name. Select the topic first; after changing the topic, click **Load Subscriptions** again.",
+            "inputAttributes": {
+              "placeholder": "my-subscription"
+            },
+            "dependencies": {
+              "entity_type": "subscription"
+            },
+            "grid_columns": 6
+          },
+          "propertyOrder": 5
+        },
+        "session_enabled": {
+          "type": "boolean",
+          "title": "Session-Enabled Entity",
+          "description": "Must match the entity's Requires Session setting",
+          "format": "checkbox",
+          "options": {
+            "tooltip": "Turn on when the queue or subscription was created with **Enable sessions** (Requires Session) — the run fails when this does not match the entity. Messages are then read session by session. Hidden for sub-queues, which never use sessions.",
+            "dependencies": {
+              "sub_queue": "none"
+            },
+            "grid_columns": 12
+          },
+          "default": false,
+          "propertyOrder": 6
+        },
+        "settlement_mode": {
+          "type": "string",
+          "title": "Settlement Mode",
+          "description": "When messages are removed from Service Bus",
+          "enum": [
+            "complete",
+            "defer_commit",
+            "receive_and_delete",
+            "peek"
+          ],
+          "options": {
+            "enum_titles": [
+              "Delete After Batch Is Written (Default)",
+              "Delete On Next Successful Run (Safest)",
+              "Delete On Receive (At Most Once)",
+              "Peek Only (Never Delete)"
+            ],
+            "tooltip": "- **Delete After Batch Is Written** — each batch is deleted right after its rows are written: at-least-once for failures before a batch is deleted, and the rows of already-deleted batches are still uploaded when the job fails later. Loss window: the job is cancelled, times out or is killed mid-write, or the Storage import fails after the job.\n- **Delete On Next Successful Run** — messages are deferred (hidden) and deleted only by the next run, once its state proves the import succeeded: at-least-once end to end. Requires an **exclusive consumer** — one such configuration per queue / subscription and no other application deferring messages there. Deferrals of a failed run are recovered by the next run: best-effort on partitioned entities and sub-queues, not at all on session-enabled entities.\n- **Delete On Receive** — **at-most-once**: the broker deletes each message on delivery, so on top of the losses above, a crash between receive and write loses that batch.\n- **Peek Only** — nothing is locked or deleted; a failed run is re-exported by the next run. Messages that other consumers remove or that expire before the run are never seen, and the entity keeps growing unless something else consumes it.\n\nOn projects still on the legacy job queue, a failed job uploads nothing, so with **Delete After Batch Is Written** or **Delete On Receive** the messages it already deleted are lost — prefer **Delete On Next Successful Run** there. A development branch reads the same production entity: use **Peek Only** or a separate test entity in branches, because the other modes consume production messages.",
+            "grid_columns": 6
+          },
+          "default": "complete",
+          "propertyOrder": 7
+        },
+        "fetch_mode": {
+          "type": "string",
+          "title": "Fetch Mode",
+          "description": "Which messages each peek run exports",
+          "enum": [
+            "incremental_fetch",
+            "full_fetch"
+          ],
+          "options": {
+            "enum_titles": [
+              "Incremental Fetch",
+              "Full Fetch"
+            ],
+            "tooltip": "- **Incremental Fetch** — remembers the highest sequence number exported and peeks only newer messages next run. Not supported on partitioned or session-enabled entities or on sub-queues — use Full Fetch there.\n- **Full Fetch** — peeks the whole entity from the start every run; with **Full Load** the table mirrors what the entity currently holds.",
+            "dependencies": {
+              "settlement_mode": "peek"
+            },
+            "grid_columns": 6
+          },
+          "default": "incremental_fetch",
+          "propertyOrder": 8
+        },
+        "idle_timeout_seconds": {
+          "type": "integer",
+          "title": "Idle Timeout (Seconds)",
+          "description": "How long one receive call waits for messages",
+          "minimum": 1,
+          "maximum": 300,
+          "options": {
+            "tooltip": "One receive call waits up to this long for new messages. When a receive returns nothing, the run peeks the entity to check that it is really drained: it ends only when no message in scope is left, and otherwise reconnects and continues (a busy or throttled namespace can briefly hand out nothing). If the run has to stop while messages remain, a warning says how many are left.",
+            "dependencies": {
+              "settlement_mode": [
+                "complete",
+                "defer_commit",
+                "receive_and_delete"
+              ]
+            },
+            "grid_columns": 6
+          },
+          "default": 10,
+          "propertyOrder": 9
+        },
+        "preview_messages": {
+          "type": "button",
+          "format": "sync-action",
+          "options": {
+            "async": {
+              "label": "Preview Messages",
+              "action": "previewMessages"
+            },
+            "grid_columns": 4
+          },
+          "propertyOrder": 11
+        }
+      }
+    },
+    "limits": {
+      "type": "object",
+      "title": "Run Limits",
+      "format": "grid-strict",
+      "propertyOrder": 20,
+      "properties": {
+        "max_messages": {
+          "type": "integer",
+          "title": "Max Messages",
+          "description": "Maximum messages per run, 0 = no limit",
+          "minimum": 0,
+          "options": {
+            "tooltip": "The run stops after this many messages; the rest stay in Service Bus for the next run. 0 = no limit.",
+            "grid_columns": 6
+          },
+          "default": 0,
+          "propertyOrder": 1
+        },
+        "stop_at_job_start": {
+          "type": "boolean",
+          "title": "Stop at Job Start",
+          "description": "Only read messages enqueued before the job started",
+          "format": "checkbox",
+          "options": {
+            "tooltip": "When on, the run stops once it reaches messages enqueued after the job started, so a busy entity cannot keep the job running; newer messages are read by the next run. Approximate on partitioned and session-enabled entities (the run logs a warning). Scheduled messages are ignored by this check.",
+            "grid_columns": 12
+          },
+          "default": true,
+          "propertyOrder": 2
+        }
+      }
+    },
+    "body": {
+      "type": "object",
+      "title": "Message Body",
+      "format": "grid-strict",
+      "propertyOrder": 30,
+      "properties": {
+        "body_format": {
+          "type": "string",
+          "title": "Body Format",
+          "description": "How the message body is written to the table",
+          "enum": [
+            "text",
+            "base64",
+            "json_flatten"
+          ],
+          "options": {
+            "enum_titles": [
+              "Text",
+              "Base64",
+              "Flatten JSON"
+            ],
+            "tooltip": "- **Text** (default) — the body decoded as text (charset from the message's content type, UTF-8 otherwise) in one `body` column.\n- **Base64** — the raw body bytes, base64-encoded, in one `body` column — for binary payloads.\n- **Flatten JSON** — one `body_<key path>` column per JSON leaf (nested objects flattened, arrays kept as JSON text); there is no raw `body` column. In every settlement mode, a key becomes a column from the run **after** it first appears: in the run that first sees it, its value goes to the JSON column `body_unmapped`, keyed by the key's column name. The first run — and the first run after a state reset — puts every key there. Bodies that are not valid JSON follow **Unreadable Body**; more than 1,000 flattened columns per row fails the run (use Text for such bodies).\n\nFlatten JSON limits: resetting the row's state, or sharing the output table with another Flatten JSON row, can make an import miss previously seen columns and fail — with **Delete After Batch Is Written** or **Delete On Receive** that loses the run's messages. Drop the table when you reset state, give each Flatten JSON row its own table, and prefer **Delete On Next Successful Run** with flattening.\n\n**Changing the body format changes the output columns — drop the existing table first.**",
+            "grid_columns": 6
+          },
+          "default": "text",
+          "propertyOrder": 1
+        },
+        "unreadable_body": {
+          "type": "string",
+          "title": "Unreadable Body",
+          "description": "What to do with a message whose body cannot be written",
+          "enum": [
+            "dead_letter",
+            "leave",
+            "fail"
+          ],
+          "options": {
+            "enum_titles": [
+              "Dead-Letter the Message",
+              "Leave in Service Bus",
+              "Fail the Run"
+            ],
+            "tooltip": "A body is unreadable when it cannot be decoded, is not valid JSON under **Flatten JSON**, or would exceed the 16 MiB table cell limit.\n\n- **Dead-Letter the Message** (default) — moves it to the dead-letter queue (on sub-queues it is left in place instead).\n- **Leave in Service Bus** — not settled; it is delivered again later.\n- **Fail the Run** — the rest of the batch is written and settled first, then the run fails.\n\nWith **Delete On Receive** (already deleted) and **Peek Only** (nothing is settled), the first two policies skip the message with a warning. When more than 10 % of the received messages (and at least 10) are unreadable, the run fails.",
+            "grid_columns": 6
+          },
+          "default": "dead_letter",
+          "propertyOrder": 2
+        }
+      }
+    },
+    "destination": {
+      "type": "object",
+      "title": "Destination",
+      "format": "grid-strict",
+      "propertyOrder": 40,
+      "properties": {
+        "table_name": {
+          "type": "string",
+          "title": "Table Name",
+          "description": "Leave empty to derive the name from the entity",
+          "options": {
+            "tooltip": "Empty = derived from the entity: a queue → `<queue>`, a subscription → `<topic>_<subscription>`, plus `_dead_letter` / `_transfer_dead_letter` for sub-queues; other characters than letters, digits, `-` and `_` become `_`. Different entities can derive the same name (e.g. `orders.eu` and `orders_eu`) — give such rows an explicit name. An explicit name may contain only letters, digits, `-` and `_`, and must not start or end with `-` or `_`. Rows with the Text or Base64 body format may share a table (use the **Source Entity + Sequence Number** key); Flatten JSON rows must not.",
+            "inputAttributes": {
+              "placeholder": "<queue> or <topic>_<subscription>"
+            },
+            "grid_columns": 12
+          },
+          "default": "",
+          "propertyOrder": 1
+        },
+        "load_type": {
+          "type": "string",
+          "title": "Load Type",
+          "description": "How rows are loaded into the Storage table",
+          "enum": [
+            "incremental_load",
+            "full_load"
+          ],
+          "options": {
+            "enum_titles": [
+              "Incremental Load",
+              "Full Load"
+            ],
+            "tooltip": "- **Incremental Load** (default) — upserts rows by the primary key, so a redelivered message updates its row instead of duplicating it.\n- **Full Load** — replaces the table with this run's rows: a staging table of the newly read messages, or — with **Peek Only** and **Full Fetch** — a mirror of what the entity currently holds. A run that reads nothing empties the table.",
+            "grid_columns": 6
+          },
+          "default": "incremental_load",
+          "propertyOrder": 2
+        },
+        "primary_key": {
+          "type": "string",
+          "title": "Primary Key",
+          "description": "Sequence numbers are unique only per entity — use the composite key when several entities share a table",
+          "enum": [
+            "sequence_number",
+            "message_id",
+            "source_entity_sequence_number"
+          ],
+          "options": {
+            "enum_titles": [
+              "Sequence Number",
+              "Message ID",
+              "Source Entity + Sequence Number"
+            ],
+            "tooltip": "- **Sequence Number** (default) — the broker-assigned number, unique within one queue or subscription.\n- **Message ID** — one row per `message_id`, e.g. for producers that set stable business IDs. Producer-set: may be empty or reused, in which case upserts merge different messages.\n- **Source Entity + Sequence Number** — composite key for rows of several entities (including an entity and its dead-letter queue, which keeps the original sequence numbers) sharing one table.\n\n**Changing the primary key changes the table's key — drop the existing table first.**",
+            "grid_columns": 6
+          },
+          "default": "sequence_number",
+          "propertyOrder": 3
+        }
+      }
+    },
+    "advanced_options": {
+      "type": "boolean",
+      "title": "Show Advanced Options",
+      "description": "Run duration, batch size, prefetch and connection-recovery tuning",
+      "format": "checkbox",
+      "default": false,
+      "propertyOrder": 50
+    },
+    "advanced": {
+      "type": "object",
+      "title": "Advanced Options",
+      "format": "grid-strict",
+      "options": {
+        "dependencies": {
+          "advanced_options": true
+        }
+      },
+      "propertyOrder": 60,
+      "properties": {
+        "max_duration_seconds": {
+          "type": "integer",
+          "title": "Max Duration (Seconds)",
+          "description": "Stop reading after this many seconds",
+          "minimum": 60,
+          "maximum": 43200,
+          "options": {
+            "tooltip": "The run stops reading after this many seconds. It is checked between batches, so the rows already read are imported normally and the remaining messages stay in Service Bus for the next run.\n\nThe platform does not tell the component the job timeout, so keep this well below the configuration's job timeout (1 hour by default) to leave time for the import: a job killed by the timeout may import nothing of what it read.",
+            "grid_columns": 12
+          },
+          "default": 3000,
+          "propertyOrder": 1
+        },
+        "batch_size": {
+          "type": "integer",
+          "title": "Batch Size",
+          "description": "Messages per receive call",
+          "minimum": 1,
+          "maximum": 5000,
+          "options": {
+            "tooltip": "Messages are received, written and settled in batches of this size. Memory use grows with batch size × body size — lower it for large message bodies.",
+            "grid_columns": 4
+          },
+          "default": 100,
+          "propertyOrder": 2
+        },
+        "prefetch_count": {
+          "type": "integer",
+          "title": "Prefetch Count",
+          "description": "Messages the client buffers ahead",
+          "minimum": 1,
+          "maximum": 1000,
+          "options": {
+            "tooltip": "1 (default) keeps the client's local buffer minimal; higher values log a warning. **Delete On Receive** requires 1 — buffered messages are already deleted on the broker.",
+            "grid_columns": 4
+          },
+          "default": 1,
+          "propertyOrder": 3
+        },
+        "recovery_wait_seconds": {
+          "type": "integer",
+          "title": "Recovery Wait (Seconds)",
+          "description": "Wait for messages locked by a lost connection",
+          "minimum": 0,
+          "maximum": 330,
+          "options": {
+            "tooltip": "After a connection recovery, messages still locked by the lost connection come back only when their lock expires. Wait up to this long for them in the same run; 0 (default) leaves them to the next run.",
+            "grid_columns": 4
+          },
+          "default": 0,
+          "propertyOrder": 4
+        }
+      }
+    }
+  }
+}

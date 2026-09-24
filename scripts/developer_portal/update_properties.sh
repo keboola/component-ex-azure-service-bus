@@ -25,19 +25,24 @@ update_property() {
     # shellcheck disable=SC2155
     local value=$(<"$file_path")
 
+    # An empty file -- or one holding only `{}` (whitespace ignored), such as a scaffold schema --
+    # would overwrite the populated live property on a tagged deploy, so it is skipped. A plain
+    # non-empty test is not enough: the two-byte `{}` passes it.
+    local compact="${value//[[:space:]]/}"
+    if [ -z "$compact" ] || [ "$compact" = "{}" ]; then
+        echo "$prop_name is empty for $app_id, skipping..."
+        return
+    fi
+
     echo "Updating $prop_name for $app_id"
     echo "$value"
 
-    if [ -n "$value" ]; then
-        docker run --rm \
-            -e KBC_DEVELOPERPORTAL_USERNAME \
-            -e KBC_DEVELOPERPORTAL_PASSWORD \
-            quay.io/keboola/developer-portal-cli-v2:latest \
-            update-app-property "$KBC_DEVELOPERPORTAL_VENDOR" "$app_id" "$prop_name" --value="$value"
-        echo "Property $prop_name updated successfully for $app_id"
-    else
-        echo "$prop_name is empty for $app_id, skipping..."
-    fi
+    docker run --rm \
+        -e KBC_DEVELOPERPORTAL_USERNAME \
+        -e KBC_DEVELOPERPORTAL_PASSWORD \
+        quay.io/keboola/developer-portal-cli-v2:latest \
+        update-app-property "$KBC_DEVELOPERPORTAL_VENDOR" "$app_id" "$prop_name" --value="$value"
+    echo "Property $prop_name updated successfully for $app_id"
 }
 
 app_id="$KBC_DEVELOPERPORTAL_APP"
