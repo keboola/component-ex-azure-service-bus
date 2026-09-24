@@ -100,6 +100,16 @@ def test_malformed_connection_string_admin_client():
         ServiceBusConnector(auth, "id").admin_client()
 
 
+@pytest.mark.parametrize("build", ["receive_client", "commit_client", "admin_client"])
+def test_malformed_tenant_id_is_user_exception(build):
+    # the real ClientSecretCredential rejects a malformed tenant id with ValueError, before any network
+    fields = {**sp_auth().model_dump(by_alias=True), "tenant_id": "not a tenant!"}
+    connector = ServiceBusConnector(AuthConfiguration(**fields), "id")
+    with pytest.raises(UserException, match="Invalid service principal settings") as excinfo:
+        getattr(connector, build)()
+    assert "s3cr3t" not in str(excinfo.value)
+
+
 def test_secrets_tuple():
     assert ServiceBusConnector(sp_auth(), "id").secrets == ("s3cr3t",)
 

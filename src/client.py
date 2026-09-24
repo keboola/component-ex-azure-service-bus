@@ -256,8 +256,18 @@ def _connection_string_data_client(auth: AuthConfiguration, extra: dict[str, Any
         raise _invalid_connection_string(auth, e) from e
 
 
+def _client_secret_credential(auth: AuthConfiguration) -> ClientSecretCredential:
+    """The service-principal credential; azure-identity rejects a malformed tenant id with a
+    ``ValueError`` before any network call -- a user-fixable setting, so exit 1 (§6.11)."""
+    try:
+        return ClientSecretCredential(auth.tenant_id, auth.client_id, auth.client_secret)
+    except ValueError as e:
+        detail = redact_secrets(str(e), (auth.client_secret,))
+        raise UserException(f"Invalid service principal settings: {detail}") from e
+
+
 def _service_principal_data_client(auth: AuthConfiguration, extra: dict[str, Any]) -> ServiceBusClient:
-    credential = ClientSecretCredential(auth.tenant_id, auth.client_id, auth.client_secret)
+    credential = _client_secret_credential(auth)
     return ServiceBusClient(
         fully_qualified_namespace=auth.fully_qualified_namespace,
         credential=credential,
@@ -280,7 +290,7 @@ def _connection_string_admin_client(auth: AuthConfiguration) -> ServiceBusAdmini
 
 
 def _service_principal_admin_client(auth: AuthConfiguration) -> ServiceBusAdministrationClient:
-    credential = ClientSecretCredential(auth.tenant_id, auth.client_id, auth.client_secret)
+    credential = _client_secret_credential(auth)
     return ServiceBusAdministrationClient(
         fully_qualified_namespace=auth.fully_qualified_namespace, credential=credential
     )
