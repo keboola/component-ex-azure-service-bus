@@ -7,7 +7,14 @@ SDK's client-side checks. Argument validation is delegated to real SDK objects b
 closed at once: the connection-string parser, the ``ServiceBusClient`` / ``get_*_receiver`` keyword
 checks (``EntityPath`` mismatch, ``retry_total`` on a receiver, ``sub_queue`` with ``session_id``)
 and ``ClientSecretCredential``'s argument checks. No socket is opened, no thread is started and
-nothing sleeps: time moves only through :class:`FakeClock`.
+nothing sleeps: time moves only through :class:`FakeClock` -- with one real-time exception, the
+``unresponsive`` knob (below).
+
+- ``unresponsive``: a busy or throttled namespace makes the SDK retry internally, so one call simply
+  does not return for a long time [live, 2026-09-24: during a concurrent 60k-message drain of the
+  same Standard-tier namespace, one ``testConnection`` took 8-9 s instead of ~1.5 s]. While
+  ``unresponsive`` holds an unset ``threading.Event``, every receiver open and every management call
+  blocks in real time until the test sets it (at most ``UNRESPONSIVE_CAP_SECONDS``, a safety net).
 
 Modelling notes beyond the Task-4 table:
 - Partitioned sequence numbers count their low 48 bits per partition ("low bits restart at 1"
@@ -51,6 +58,7 @@ Modelling notes beyond the Task-4 table:
 
 import copy
 import itertools
+import threading
 import warnings
 from collections import defaultdict, deque
 from collections.abc import Callable, Iterator
@@ -93,6 +101,7 @@ PEEK_PAGE_MAX = 250  # records per peek call
 RAD_DEFERRED_MAX = 250  # sequence numbers per RECEIVE_AND_DELETE deferred receive [live]
 FIRST_PARTITION_ID = 51  # partition n of a partitioned entity carries id 51 + n in the top 16 bits
 PARTITION_COUNT = 16
+UNRESPONSIVE_CAP_SECONDS = 10.0  # the longest an `unresponsive` call blocks if the test never releases it
 
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 _PEEK_LOCK = ServiceBusReceiveMode.PEEK_LOCK
@@ -1125,6 +1134,7 @@ class FakeReceiver:
         """Attach the link: resolve the entity, authenticate and accept the session (once)."""
         if self._entity is not None:
             return self._entity
+        self._broker._wait_while_unresponsive()
         self._authenticate()
         entity = self._broker._resolve(self)
         if entity.requires_session and self._session is None:
@@ -1326,6 +1336,7 @@ class FakeAdminClient:
 
     def _call(self, operation: str, path: str) -> None:
         self._broker.admin_calls.append((operation, path))
+        self._broker._wait_while_unresponsive()
         if self.credential is not None and self._broker.credential_failure is not None:
             self.credential.get_token(_SERVICE_BUS_SCOPE)  # the bearer-token policy runs before the request
         if self._broker.management_denied:
@@ -1457,6 +1468,7 @@ class FakeBroker:
         self.management_denied = False  # admin calls raise ClientAuthenticationError
         self.credential_failure: str | None = None  # Entra ID error text: SP token requests fail (see module doc)
         self.management_error: Exception | None = None  # admin calls raise this
+        self.unresponsive: threading.Event | None = None  # while unset: opens and admin calls block (module doc)
         self.calls: list[tuple[str, str]] = []  # (data-plane operation, entity path)
         self.admin_calls: list[tuple[str, str]] = []
         self.clients: list[FakeServiceBusClient] = []
@@ -1563,6 +1575,12 @@ class FakeBroker:
         injected = self._injections[kind].pop(self._call_numbers[kind], None)
         if injected is not None:
             raise injected
+
+    def _wait_while_unresponsive(self) -> None:
+        """Block a receiver open or a management call until the test sets ``unresponsive`` -- the
+        SDK retrying a busy or throttled namespace, seen from the caller (module doc)."""
+        if self.unresponsive is not None:
+            self.unresponsive.wait(UNRESPONSIVE_CAP_SECONDS)
 
     def _consume_body_error(self, sequence_number: int) -> bool:
         if self._body_errors[sequence_number] <= 0:

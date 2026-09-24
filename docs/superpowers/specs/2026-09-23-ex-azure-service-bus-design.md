@@ -494,8 +494,20 @@ guard (§2.5); a leftover key is ignored.
 | `previewMessages` | row | peek up to 10 messages; returns a markdown table (sequence number, enqueued time, message id, subject, state, first 120 characters of the text-decoded body); nothing locked or settled (session caveat as above) | mapped `UserException` |
 | `entityInfo` | row | management `get_*` + runtime properties (+ `list_rules` for subscriptions): requires_session, partitioning, lock duration, max delivery count, active / dead-letter / scheduled / transfer-DLQ counts, rule names + filters | Listen-only SAS → `UserException` "needs Manage (SAS) or Data Receiver (SP)" |
 
-- The platform sync-action service resolves the **portal default image tag**, not a config's
-  `runtime.tag` (writer lesson) — branch builds cannot exercise the buttons before a release.
+- Image tag [live, Phase 8 — corrects the earlier writer lesson]: the UI sends the configuration's
+  `runtime.tag` as the request's `tag`, so the buttons run a pinned branch build; a call without a
+  `tag` (the Sync Actions API used directly, e.g. `kbagent component sync-action`) runs the Developer
+  Portal default tag — for an unreleased component the `0.0.1` bootstrap, which answers every action
+  with HTTP 500.
+- **Deadline (Phase 8):** the platform stops a sync action after 30 seconds (image pull excluded) and
+  then answers a generic HTTP 500 "Internal Server Error" instead of the action's message [docs]. The
+  SDK's own retries (three, exponential backoff, 60-second operation and auth timeouts) can outlast
+  that on a busy, throttled or unreachable namespace [live: a concurrent drain of the same
+  Standard-tier namespace slowed one `testConnection` from ~1.5 s to 8–9 s; against a broker that
+  accepts TCP but never answers, `previewMessages` ran 181 s]. Every action therefore runs in a
+  daemon worker thread and gives up after `SYNC_ACTION_DEADLINE_SECONDS` = 20 with a `UserException`
+  ("Azure Service Bus did not respond within 20 seconds … busy or throttled … or unreachable. Try
+  again in a minute."), leaving the container start-up and the reply their share of the 30 seconds.
 - Row-level sync actions receive the root `parameters` merged with the row's [inferred — verified in
   Phase 6/7; the actions only need the fields they read, via partial models (§7)].
 - **Each action validates only what it reads (Phase 8):** the list actions and the root
@@ -1218,7 +1230,8 @@ chunking / bisection / retry; K computation and scan skip rules; body decoding m
 naming / collisions / hashed registry / cap / input-registry column rule / `body_unmapped`; column mapping and formats; manifest
 fields incl. legacy vs authoritative and the `write_always` switch; unreadable retry budget and
 progress accounting; session lock renewal; peek re-peek dedupe; `SCHEDULED` watermark exclusion;
-C4 skip of scheduled messages pending activation and the single export after activation).
+C4 skip of scheduled messages pending activation and the single export after activation; every
+sync action giving up within its deadline against an `unresponsive` fake namespace, §5.4).
 
 ## 9. Deployment & validation (cf-dev, Phase 7)
 
@@ -1454,3 +1467,4 @@ differ):**
 | P4-7 | (After the Phase-7 probe: activation gives a scheduled message a new sequence number.) C4, both fetch modes, skips `SCHEDULED` messages pending activation, counts them as `skipped_scheduled` and exports them once active, under their new sequence number; the `state` column keeps the broker-reported value | §4-A7, §6.5, §6.7, §6.9, §6.12, §10 |
 | P4-8 | (Phase 7: `KBC_BRANCHID` is set on default-branch jobs too on current stacks — a default-branch C3 job was refused; the platform exposes no branch type / name / default flag and, without `forward_token`, the default branch id cannot be resolved.) The automatic dev-branch guard and the hidden `destructive_in_branch` override are removed; every mode runs in every branch. Documented instead: a dev branch reads the same production entity — use Peek or a separate test entity in branches; admins can enable `dev-branch-configuration-unsafe`. The keboola-context `environment-variables.md` claim "absent on the default branch" is wrong on current stacks | §2.5, §4-J11, §5.2, §5.5, §6.1, §6.11, §8, §9, §12 |
 | P4-9 | (Phase-8 audit follow-up.) A malformed service-principal `tenant_id` makes azure-identity's `ClientSecretCredential` raise `ValueError` before any network call; it is mapped to a `UserException` in the connector's credential builder (a third known `ValueError` source) instead of exiting 2 | §6.11 |
+| P4-10 | (Phase 8, maintainer report: a row-level **Test Connection** answered "Internal Server Error" while Preview Messages worked.) Not reproducible afterwards with the same payload (local, production image, platform UI); the namespace was throttled during a concurrent 1M-message drain at the time. The component can only exit 0 / 1 inside a sync action, so an HTTP 500 means the action outlived the platform's 30-second limit. Every sync action now gives up after 20 seconds with a user error (§5.4); the UI's use of `runtime.tag` for sync actions is recorded as verified | §5.4 |

@@ -276,9 +276,13 @@ The list-entity dropdowns (queues / topics / subscriptions) need a service princ
 Manage-rights connection string; with a Listen-only connection string, type the entity name
 instead.
 
-Sync actions run against the Developer Portal's **default** image tag, not a configuration's
-pinned `runtime.tag` — a change on an unreleased branch cannot be exercised through these buttons
-until it is released.
+The UI runs the actions with the configuration's pinned `runtime.tag` when one is set, otherwise
+with the Developer Portal's default image tag.
+
+Each action gives up after 20 seconds with a message saying that Azure Service Bus did not respond
+in time: the platform stops UI actions after 30 seconds and would otherwise show only a generic
+"Internal Server Error". A busy or throttled namespace — for example while a large extraction runs
+on it — can take that long; try again a minute later.
 
 Limitations
 ===========

@@ -11,9 +11,11 @@ never settle or lock a message.
 
 import logging
 import sys
+import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
-from functools import cached_property
+from functools import cached_property, wraps
 from typing import Any, Literal, NamedTuple
 
 from azure.servicebus import NEXT_AVAILABLE_SESSION, ServiceBusReceiveMode
@@ -60,8 +62,52 @@ LEGACY_QUEUE_WARNING = (
 )
 PREVIEW_MESSAGE_COUNT = 10
 
+# The platform stops a sync action after 30 seconds (image pull excluded) and then answers a generic
+# HTTP 500 "Internal Server Error" instead of the action's message [docs: help.keboola.com/extend/
+# common-interface/actions]. The SDK's own retries (three, exponential backoff, 60-second operation
+# and auth timeouts) can outlast that on a busy or throttled namespace [live: a concurrent drain of
+# the same Standard-tier namespace slowed one testConnection from ~1.5 s to 8-9 s], so every action
+# gives up first, leaving the container start-up and the reply their share of the 30 seconds.
+SYNC_ACTION_DEADLINE_SECONDS = 20.0
+SYNC_ACTION_TIMEOUT_MESSAGE = (
+    "Azure Service Bus did not respond within {seconds:g} seconds, so the action was stopped before the "
+    "platform's 30-second limit for UI actions. The namespace may be busy or throttled (for example while "
+    "a large extraction runs on it) or unreachable. Try again in a minute."
+)
+
 # The modes that arm write_always (spec §6.9): the legacy job queue drops that safety net for them.
 _WRITE_ALWAYS_MODES = frozenset({SettlementMode.COMPLETE, SettlementMode.RECEIVE_AND_DELETE})
+
+
+def _within_deadline[**P, R](action: Callable[P, R]) -> Callable[P, R]:
+    """Run a sync action in a daemon worker thread and give up after ``SYNC_ACTION_DEADLINE_SECONDS``
+    with a ``UserException`` -- exit 1, the action's own message in the UI -- instead of letting the
+    platform's 30-second limit turn a slow namespace into an opaque HTTP 500. The result or the error
+    of an action that finishes in time is handed back unchanged. The worker is a daemon (and so is
+    every thread the SDK starts from it), so a call still blocked in the SDK never delays the exit."""
+
+    @wraps(action)
+    def bounded(*args: P.args, **kwargs: P.kwargs) -> R:
+        outcome: list[tuple[bool, Any]] = []
+
+        def work() -> None:
+            try:
+                outcome.append((True, action(*args, **kwargs)))
+            except BaseException as error:  # noqa: BLE001 -- handed to the calling thread and re-raised there
+                outcome.append((False, error))
+
+        name = getattr(action, "__name__", "action")
+        worker = threading.Thread(target=work, name=f"sync-action-{name}", daemon=True)
+        worker.start()
+        worker.join(SYNC_ACTION_DEADLINE_SECONDS)
+        if not outcome:
+            raise UserException(SYNC_ACTION_TIMEOUT_MESSAGE.format(seconds=SYNC_ACTION_DEADLINE_SECONDS))
+        finished, value = outcome[0]
+        if not finished:
+            raise value
+        return value
+
+    return bounded
 
 
 class _PeekedEntity(NamedTuple):
@@ -316,6 +362,7 @@ class Component(ComponentBase):
     # --- sync actions (spec §5.4) ---------------------------------------------------------------------
 
     @sync_action("testConnection")
+    @_within_deadline
     def test_connection(self) -> ValidationResult:
         """Row: peek one message of the configured entity (auth + Listen + entity). Root (no source):
         a management listing (service principal / Manage connection string)."""
@@ -330,19 +377,23 @@ class Component(ComponentBase):
         return ValidationResult(f"Connected to Azure Service Bus and read '{peeked.entity.path}'.", MessageType.SUCCESS)
 
     @sync_action("listQueues")
+    @_within_deadline
     def list_queues(self) -> list[SelectElement]:
         return self._select_elements("queues")
 
     @sync_action("listTopics")
+    @_within_deadline
     def list_topics(self) -> list[SelectElement]:
         return self._select_elements("topics")
 
     @sync_action("listSubscriptions")
+    @_within_deadline
     def list_subscriptions(self) -> list[SelectElement]:
         topic_name = self._sync_configuration().topic_name
         return self._select_elements("subscriptions", topic_name)  # no topic -> "Select a topic first."
 
     @sync_action("previewMessages")
+    @_within_deadline
     def preview_messages(self) -> ValidationResult:
         """A markdown table of up to ten peeked messages; nothing is locked or settled."""
         messages = self._peek_row_entity(PREVIEW_MESSAGE_COUNT).messages
@@ -351,6 +402,7 @@ class Component(ComponentBase):
         return ValidationResult(render_preview(messages), MessageType.TABLE)
 
     @sync_action("entityInfo")
+    @_within_deadline
     def entity_info(self) -> ValidationResult:
         entity = EntityRef.from_source(self._entity_configuration().source)
         return ValidationResult(describe_entity(self._connector, entity), MessageType.INFO)

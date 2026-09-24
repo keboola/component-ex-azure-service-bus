@@ -3,6 +3,8 @@ import inspect
 import json
 import logging
 import runpy
+import threading
+import time
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -479,6 +481,39 @@ def test_preview_messages_empty_entity(broker, tmp_path, monkeypatch, capsys, se
 def test_preview_messages_maps_sdk_errors(broker, tmp_path, monkeypatch, capsys):
     err = sync_failure(capsys, component(tmp_path, monkeypatch, PARAMS, action="previewMessages"))
     assert "'q'" in err and "c2VjcmV0" not in err  # a missing queue via SAS reads as unauthorized
+
+
+@pytest.mark.parametrize(
+    ("action", "params"),
+    [
+        ("testConnection", {"#connection_string": SAS}),
+        ("listQueues", {"#connection_string": SAS}),
+        ("listTopics", {"#connection_string": SAS}),
+        ("listSubscriptions", {"#connection_string": SAS, "source": {"topic_name": "t"}}),
+        ("previewMessages", PARAMS),
+    ],
+)
+def test_sync_action_gives_up_before_the_platform_limit(broker, tmp_path, monkeypatch, capsys, action, params):
+    """Regression (Phase 8, UI "Internal Server Error"): the platform stops a sync action after 30 s
+    and answers a generic HTTP 500. A namespace that does not answer -- the SDK retrying a throttled
+    one -- must end as the action's own user error within the deadline instead."""
+    import component as component_module
+
+    monkeypatch.setattr(component_module, "SYNC_ACTION_DEADLINE_SECONDS", 0.2)
+    broker.add_queue("q")
+    broker.add_subscription("t", "s")
+    release = threading.Event()
+    broker.unresponsive = release
+    started = time.monotonic()
+    try:
+        err = sync_failure(capsys, component(tmp_path, monkeypatch, params, action=action))
+    finally:
+        elapsed = time.monotonic() - started
+        release.set()
+        for worker in [t for t in threading.enumerate() if t.name.startswith("sync-action-")]:
+            worker.join(5)
+    assert err.startswith("Azure Service Bus did not respond within 0.2 seconds")
+    assert elapsed < 5  # well before the fake's 10-second cap: the action gave up, the call did not return
 
 
 def test_entity_info(broker, tmp_path, monkeypatch, capsys):
