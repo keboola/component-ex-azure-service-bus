@@ -511,6 +511,11 @@ guard (§2.5); a leftover key is ignored.
   daemon worker thread and gives up after `SYNC_ACTION_DEADLINE_SECONDS` = 20 with a `UserException`
   ("Azure Service Bus did not respond within 20 seconds … busy or throttled … or unreachable. Try
   again in a minute."), leaving the container start-up and the reply their share of the 30 seconds.
+  The deadline cannot cover the platform's own start-up: the first action after a configuration is
+  pinned to a new image tag waits for that image on the sync-action worker [live, Phase 8: the first
+  root `testConnection` on a fresh `-31` tag answered HTTP 500 after 46 s, a retry answered the
+  action's own message in seconds; the first call on another unused tag took 10.6 s] — the README
+  says to retry once.
   The session peek of `previewMessages` opens its `NEXT_AVAILABLE_SESSION` receiver on a
   `retry_total=0` client: the SDK retries a timed-out session accept three times with backoff, so
   an entity without an available session took ~34 s instead of the 5-second accept wait [live] —
@@ -748,7 +753,9 @@ another application's deferrals.
   [live: a 1M-message C1 run (batch 5000, prefetch 1000) stopped `idle` after 77,077 messages with
   927,756 still active and no error; the Standard-tier namespace reported ServerBusy (throttling), and
   pyamqp re-flows link credit only when the local credit reaches 0, so a stalled refill is a second
-  candidate]. On an empty receive of a plain entity the loop peeks one page (250, the broker's cap)
+  candidate. Reproduced locally with the fix in place: a 60k-message drain with the same batch /
+  prefetch hit 4 empty receives while ≥ 250 messages were still receivable, no server-busy report
+  was logged (so a stalled link, not throttling, there), and the retries drained all 60,003]. On an empty receive of a plain entity the loop peeks one page (250, the broker's cap)
   past the highest *processed* sequence number (the stop drain's abandoned messages sit below it and
   redeliver; from the start in cursor mode on a fresh receiver on partitioned entities) and counts the
   messages a receive would still hand out: not `DEFERRED` (C2's own and foreign deferrals stay in the

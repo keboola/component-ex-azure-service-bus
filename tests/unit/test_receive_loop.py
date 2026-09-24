@@ -675,7 +675,7 @@ def test_empty_receive_retry_cap_stops_with_the_remaining_count(broker, caplog):
     started = broker.clock.now()
     with caplog.at_level(logging.INFO, logger="receiver"):
         assert loop.run() is StopReason.RECEIVE_STALLED
-    assert sink.rows == [] and stats.empty_receive_retries == 6 and len(broker.receivers) == 6
+    assert sink.rows == [] and stats.empty_receive_retries == 5 and len(broker.receivers) == 6
     assert broker.clock.now() - started >= timedelta(seconds=2 + 4 + 8 + 16 + 30)  # every backoff was taken
     warning = stats.warnings["messages_remaining"]
     assert "4 receivable message(s) are still in 'q'" in warning and "receive_stalled" in warning
@@ -690,8 +690,11 @@ def test_max_duration_bounds_the_empty_receive_retries(broker):
     for call in range(1, 10):
         broker.inject_empty_receive(on_call=call)
     loop, _, stats, _ = build(broker, advanced={"max_duration_seconds": 60})
+    loop._config.advanced.max_duration_seconds = 20  # below the model minimum: backoffs 2 + 4 + 8, then 6 of 16
+    started = broker.clock.now()
     assert loop.run() is StopReason.MAX_DURATION
-    assert stats.empty_receive_retries < 6 and "max_duration" in stats.warnings["messages_remaining"]
+    assert stats.empty_receive_retries == 4 and "max_duration" in stats.warnings["messages_remaining"]
+    assert broker.clock.now() - started == timedelta(seconds=20)  # the last backoff was cut at the deadline
 
 
 def test_partitioned_drain_check_peeks_from_the_start_on_a_fresh_receiver(broker):

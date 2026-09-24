@@ -292,7 +292,9 @@ with the Developer Portal's default image tag.
 Each action gives up after 20 seconds with a message saying that Azure Service Bus did not respond
 in time: the platform stops UI actions after 30 seconds and would otherwise show only a generic
 "Internal Server Error". A busy or throttled namespace — for example while a large extraction runs
-on it — can take that long; try again a minute later.
+on it — can take that long; try again a minute later. The first action after the configuration's
+component version (image tag) changes can also take long enough to end with "Internal Server
+Error" while the platform prepares the new version; clicking again works.
 
 Limitations
 ===========

@@ -460,9 +460,9 @@ class ReceiveLoop:
         namespace recover, at most ``MAX_EMPTY_RECEIVE_RETRIES`` times in a row; ``max_duration`` still
         bounds the run (the next step's stop check)."""
         self._empty_retries += 1
-        self._stats.empty_receive_retries += 1
         if self._empty_retries > MAX_EMPTY_RECEIVE_RETRIES:
             return StopReason.RECEIVE_STALLED
+        self._stats.empty_receive_retries += 1
         backoff = EMPTY_RECEIVE_BACKOFF_SECONDS[min(self._empty_retries, len(EMPTY_RECEIVE_BACKOFF_SECONDS)) - 1]
         logger.info(
             "A receive returned no messages although %s receivable message(s) are still in '%s' (a throttled "
