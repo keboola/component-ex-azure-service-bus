@@ -83,7 +83,6 @@ Limits
 ------
 
 - **Max messages** — stop after this many messages (`0` = no limit).
-- **Max duration** — stop after this many seconds (60–43,200; default 3,600).
 - **Stop at job start** — stop once a batch holds only messages enqueued after the job started,
   instead of also draining messages that arrive mid-run (approximate on partitioned and
   session-enabled entities).
@@ -118,10 +117,16 @@ Destination
 Advanced
 --------
 
-Gated behind an **Advanced options** checkbox: batch size (1–5,000, default 100), prefetch count
-(1–1,000, default 1; must be 1 for `receive_and_delete`), and an optional post-recovery catch-up
-wait in seconds. Lower the batch size for entities with large message bodies, to keep memory use
-and lock duration in check.
+Gated behind an **Advanced options** checkbox (while it is off, every value below is its default):
+
+- **Max duration** — stop reading after this many seconds (60–43,200; default 3,000). It is
+  checked between batches, so what was read is imported and the rest stays for the next run. The
+  platform does not tell the component the job timeout, so keep it well below the configuration's
+  job timeout (1 hour by default) to leave time for the import — a job killed by the timeout may
+  import nothing of what it read.
+- **Batch size** (1–5,000, default 100), **prefetch count** (1–1,000, default 1; must be 1 for
+  `receive_and_delete`), and an optional post-recovery catch-up wait in seconds. Lower the batch
+  size for entities with large message bodies, to keep memory use and lock duration in check.
 
 Settlement modes and guarantees
 ================================

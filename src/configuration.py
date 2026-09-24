@@ -139,7 +139,6 @@ class LimitsConfig(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
 
     max_messages: int = Field(0, ge=0)
-    max_duration_seconds: int = Field(3600, ge=60, le=43200)
     stop_at_job_start: bool = True
 
 
@@ -163,8 +162,13 @@ class DestinationConfig(BaseModel):
 
 
 class AdvancedConfig(BaseModel):
+    """The ``advanced`` section: ignored (model defaults) unless ``advanced_options`` is on.
+    ``max_duration_seconds`` defaults to 3000 -- below the platform's default one-hour job timeout,
+    leaving time for the import (the component is not told the job timeout)."""
+
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
 
+    max_duration_seconds: int = Field(3000, ge=60, le=43200)
     batch_size: int = Field(100, ge=1, le=5000)
     prefetch_count: int = Field(1, ge=1, le=1000)
     recovery_wait_seconds: int = Field(0, ge=0, le=330)

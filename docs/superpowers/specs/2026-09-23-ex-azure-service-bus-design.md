@@ -69,8 +69,8 @@ and the body as text, base64 or flattened JSON columns.
   listed C1 as at-least-once for container crashes — that only held for crashes *before* the first
   settle.)
 - **A terminated, cancelled or timed-out job uploads nothing** [inferred: output mapping does not
-  run for a terminated container]. `limits.max_duration_seconds` keeps runs well inside the job
-  timeout; the residual loss window is listed per mode in §2.3.
+  run for a terminated container]. `advanced.max_duration_seconds` (default 3000, Phase 8) keeps
+  runs well inside the job timeout, which the platform does not pass to the component; the residual loss window is listed per mode in §2.3.
 
 ### 2.2 Constructs
 
@@ -277,7 +277,7 @@ sign-off (approval given 2026-09-23, §15 — this spec is the sign-off artifact
 | Capability | Verdict | Rationale / where |
 |---|---|---|
 | D1. Max messages per run | **In scope** | `limits.max_messages` (0 = no limit). |
-| D2. Max run duration | **In scope** | `limits.max_duration_seconds` (default 3600). |
+| D2. Max run duration | **In scope** | `advanced.max_duration_seconds` (default 3000; Phase 8 moved it from `limits` and lowered it from 3600, below the default one-hour job timeout). |
 | D3. Idle timeout | **In scope** | `source.idle_timeout_seconds` (default 10; destructive modes). |
 | D4. Watermark: backlog as of job start | **In scope** | `limits.stop_at_job_start` (default on); approximate + WARNING on partitioned entities (§6.5). |
 | D5. Peek end-of-log | **In scope** | C4 stops on an empty page. |
@@ -449,7 +449,6 @@ described here, not written as JSON.
 
 **`limits`** — run bounds (all modes):
 - `max_messages` — integer ≥ 0, default `0` (= no limit).
-- `max_duration_seconds` — integer 60–43,200, default 3600.
 - `stop_at_job_start` — boolean, default `true` (D4 watermark).
 
 **`body`**:
@@ -463,6 +462,10 @@ described here, not written as JSON.
   `source_entity_sequence_number`.
 
 **`advanced_options`** — boolean, default `false`; gates the **`advanced`** section:
+- `max_duration_seconds` — integer 60–43,200, default 3000 (Phase 8: moved from `limits`, was 3600).
+  The platform does not pass the job timeout to the component, so the default stays below the
+  default one-hour job timeout and leaves time for the import; the tooltip says to keep it well
+  below the configuration's job timeout, since a job killed by the timeout may import nothing.
 - `batch_size` — integer 1–5,000, default 100.
 - `prefetch_count` — integer 1–1,000, default 1.
 - `recovery_wait_seconds` — integer 0–330, default 0.
@@ -535,7 +538,6 @@ guard (§2.5); a leftover key is ignored.
 | `source.fetch_mode` | row | no | user-facing enum, gated `settlement_mode = peek` | `incremental_fetch` | only in peek mode |
 | `source.idle_timeout_seconds` | row | no | user-facing integer, gated on destructive modes | 10 | only in destructive modes |
 | `limits.max_messages` | row | no | user-facing integer | 0 (no limit) | yes — visible, description says "0 = no limit" |
-| `limits.max_duration_seconds` | row | no | user-facing integer | 3600 | yes — visible |
 | `limits.stop_at_job_start` | row | no | user-facing checkbox | `true` | yes — visible |
 | `body.body_format` | row | no | user-facing enum | `text` | yes — visible |
 | `body.unreadable_body` | row | no | user-facing enum | `dead_letter` | yes — visible |
@@ -543,7 +545,7 @@ guard (§2.5); a leftover key is ignored.
 | `destination.load_type` | row | no | user-facing enum | `incremental_load` | yes — visible |
 | `destination.primary_key` | row | no | user-facing enum | `sequence_number` | yes — visible |
 | `advanced_options` | row | no | user-facing checkbox | `false` | yes — visible |
-| `advanced.batch_size` / `prefetch_count` / `recovery_wait_seconds` | row | no | user-facing, gated `advanced_options = true` | 100 / 1 / 0 | only once `advanced_options` is on |
+| `advanced.max_duration_seconds` / `batch_size` / `prefetch_count` / `recovery_wait_seconds` | row | no | user-facing, gated `advanced_options = true` | 3000 / 100 / 1 / 0 | only once `advanced_options` is on |
 | transport, receiver `keep_alive=0`, SDK retry, recovery cap, orphan-scan K and page cap, commit byte cap, state budget, unreadable abort share | — | — | **internal constants — not in any schema** | §6 | never |
 
 Gated fields rely on the generic UI dropping values of fields whose `options.dependencies` are
@@ -1467,3 +1469,4 @@ differ):**
 | P4-9 | (Phase-8 audit follow-up.) A malformed service-principal `tenant_id` makes azure-identity's `ClientSecretCredential` raise `ValueError` before any network call; it is mapped to a `UserException` in the connector's credential builder (a third known `ValueError` source) instead of exiting 2 | §6.11 |
 | P4-10 | (Phase 8, maintainer report: a row-level **Test Connection** answered "Internal Server Error" while Preview Messages worked.) Not reproducible afterwards with the same payload (local, production image, platform UI); the namespace was throttled during a concurrent 1M-message drain at the time. The component can only exit 0 / 1 inside a sync action, so an HTTP 500 means the action outlived the platform's 30-second limit. Every sync action now gives up after 20 seconds with a user error (§5.4); the UI's use of `runtime.tag` for sync actions is recorded as verified | §5.4 |
 | P4-11 | (Phase 8, maintainer decision.) The row form's **Test Connection** and **Show Entity Details** buttons are removed, and so is the `entityInfo` action; `testConnection` is the root management probe only (a row source is ignored) and a Listen-only SAS is pointed at the row's **Preview Messages**, which proves entity access | §4-I, §5.2, §5.4, §5.6, §8 |
+| P4-12 | (Phase 8, maintainer decision.) **Max Duration** moves to the Advanced section (`advanced.max_duration_seconds`) with default 3000 s (was `limits.max_duration_seconds`, 3600): below the default one-hour job timeout, which the component is not told, leaving time for the import. Like every advanced value it is its default while `advanced_options` is off; a leftover `limits.max_duration_seconds` is ignored | §2.1, §4-D, §5.2, §5.5 |

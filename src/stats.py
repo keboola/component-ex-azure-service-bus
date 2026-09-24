@@ -161,13 +161,13 @@ def log_effective_settings(config: Configuration, entity: EntityRef) -> None:
     tokens.extend(
         [
             f"max_messages={_mark(limits.max_messages, default_limits.max_messages)}",
-            f"max_duration_seconds={_mark(limits.max_duration_seconds, default_limits.max_duration_seconds)}",
             f"stop_at_job_start={_mark(limits.stop_at_job_start, default_limits.stop_at_job_start)}",
             f"body_format={_mark(body.body_format, default_body.body_format)}",
             f"unreadable_body={_mark(body.unreadable_body, default_body.unreadable_body)}",
             f"load_type={_mark(destination.load_type, default_destination.load_type)}",
             f"primary_key={_mark(destination.primary_key, default_destination.primary_key)}",
             "table_name=" + _mark_table_name(destination.table_name, default_destination.table_name),
+            f"max_duration_seconds={_mark(advanced.max_duration_seconds, default_advanced.max_duration_seconds)}",
             f"batch_size={_mark(advanced.batch_size, default_advanced.batch_size)}",
             f"prefetch_count={_mark(advanced.prefetch_count, default_advanced.prefetch_count)}",
             f"recovery_wait_seconds={_mark(advanced.recovery_wait_seconds, default_advanced.recovery_wait_seconds)}",

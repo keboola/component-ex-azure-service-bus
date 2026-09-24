@@ -16,7 +16,6 @@ Each row reads one queue, one topic subscription, or one of their dead-letter / 
 ### Limits
 
 - **Max messages** — stop after this many messages (`0` = no limit).
-- **Max duration** — stop after this many seconds.
 - **Stop at job start** — stop once a batch holds only messages enqueued after the job started, instead of also draining messages that arrive mid-run (approximate on partitioned and session-enabled entities).
 
 ### Body
@@ -32,6 +31,6 @@ Each row reads one queue, one topic subscription, or one of their dead-letter / 
 
 ### Advanced
 
-Batch size, prefetch count, and an optional post-recovery catch-up wait. The defaults suit most entities; lower the batch size when messages carry large bodies.
+**Max duration** (default 3,000 seconds — keep it well below the configuration's job timeout, which the component is not told, so the import still runs), batch size, prefetch count, and an optional post-recovery catch-up wait. The defaults suit most entities; lower the batch size when messages carry large bodies.
 
 Development branches read the same production Service Bus entity as the default branch: a destructive settlement mode (everything except `peek`) run in a branch consumes and removes production messages. Use Peek Only in branches, or point the branch configuration at a separate test entity. Project admins can enable the `dev-branch-configuration-unsafe` feature to have the platform guard branch runs.

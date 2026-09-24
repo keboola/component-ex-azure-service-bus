@@ -29,12 +29,13 @@ def test_defaults():
     assert c.source.settlement_mode.is_destructive
     assert c.source.sub_queue is SubQueue.NONE
     assert c.source.idle_timeout_seconds == 10
-    assert (c.limits.max_messages, c.limits.max_duration_seconds, c.limits.stop_at_job_start) == (0, 3600, True)
+    assert (c.limits.max_messages, c.limits.stop_at_job_start) == (0, True)
     assert c.body.body_format is BodyFormat.TEXT
     assert c.body.unreadable_body is UnreadablePolicy.DEAD_LETTER
     assert c.destination.load_type is LoadType.INCREMENTAL_LOAD and c.destination.incremental
     assert c.destination.primary_key is PrimaryKey.SEQUENCE_NUMBER
     assert (c.advanced.batch_size, c.advanced.prefetch_count, c.advanced.recovery_wait_seconds) == (100, 1, 0)
+    assert c.advanced.max_duration_seconds == 3000  # below the default one-hour job timeout
 
 
 def test_queue_requires_queue_name():
@@ -85,6 +86,16 @@ def test_peek_incremental_refused_on_sessions_and_sub_queues(extra):
 def test_advanced_ignored_unless_enabled():
     assert cfg(advanced={"batch_size": 7}).advanced.batch_size == 100
     assert cfg(advanced_options=True, advanced={"batch_size": 7}).advanced.batch_size == 7
+
+
+def test_max_duration_is_an_advanced_option():
+    # Phase 8: hidden advanced values reset to the defaults, Max Duration included; the old
+    # `limits.max_duration_seconds` key is ignored.
+    assert cfg(advanced={"max_duration_seconds": 120}).advanced.max_duration_seconds == 3000
+    assert cfg(advanced_options=True, advanced={"max_duration_seconds": 120}).advanced.max_duration_seconds == 120
+    assert cfg(limits={"max_duration_seconds": 120}).advanced.max_duration_seconds == 3000
+    with pytest.raises(UserException, match="max_duration_seconds"):
+        cfg(advanced_options=True, advanced={"max_duration_seconds": 59})
 
 
 @pytest.mark.parametrize("name", ["_bad", "bad-", "has space", "dots.no"])

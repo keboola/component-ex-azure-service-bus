@@ -241,19 +241,6 @@
           "default": 0,
           "propertyOrder": 1
         },
-        "max_duration_seconds": {
-          "type": "integer",
-          "title": "Max Duration (Seconds)",
-          "description": "Stop reading after this many seconds",
-          "minimum": 60,
-          "maximum": 43200,
-          "options": {
-            "tooltip": "Checked between batches — the rows already written are imported normally and the remaining messages stay for the next run. Keep it well below the job timeout.",
-            "grid_columns": 6
-          },
-          "default": 3600,
-          "propertyOrder": 2
-        },
         "stop_at_job_start": {
           "type": "boolean",
           "title": "Stop at Job Start",
@@ -264,7 +251,7 @@
             "grid_columns": 12
           },
           "default": true,
-          "propertyOrder": 3
+          "propertyOrder": 2
         }
       }
     },
@@ -383,7 +370,7 @@
     "advanced_options": {
       "type": "boolean",
       "title": "Show Advanced Options",
-      "description": "Batch size, prefetch and connection-recovery tuning",
+      "description": "Run duration, batch size, prefetch and connection-recovery tuning",
       "format": "checkbox",
       "default": false,
       "propertyOrder": 50
@@ -399,6 +386,19 @@
       },
       "propertyOrder": 60,
       "properties": {
+        "max_duration_seconds": {
+          "type": "integer",
+          "title": "Max Duration (Seconds)",
+          "description": "Stop reading after this many seconds",
+          "minimum": 60,
+          "maximum": 43200,
+          "options": {
+            "tooltip": "The run stops reading after this many seconds. It is checked between batches, so the rows already read are imported normally and the remaining messages stay in Service Bus for the next run.\n\nThe platform does not tell the component the job timeout, so keep this well below the configuration's job timeout (1 hour by default) to leave time for the import: a job killed by the timeout may import nothing of what it read.",
+            "grid_columns": 12
+          },
+          "default": 3000,
+          "propertyOrder": 1
+        },
         "batch_size": {
           "type": "integer",
           "title": "Batch Size",
@@ -410,7 +410,7 @@
             "grid_columns": 4
           },
           "default": 100,
-          "propertyOrder": 1
+          "propertyOrder": 2
         },
         "prefetch_count": {
           "type": "integer",
@@ -423,7 +423,7 @@
             "grid_columns": 4
           },
           "default": 1,
-          "propertyOrder": 2
+          "propertyOrder": 3
         },
         "recovery_wait_seconds": {
           "type": "integer",
@@ -436,7 +436,7 @@
             "grid_columns": 4
           },
           "default": 0,
-          "propertyOrder": 3
+          "propertyOrder": 4
         }
       }
     }

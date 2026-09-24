@@ -256,7 +256,7 @@ class ReceiveLoop:
         self._wait: float = config.source.idle_timeout_seconds  # 1 s while catching up
 
     def run(self) -> StopReason:
-        self._deadline = self._monotonic() + self._config.limits.max_duration_seconds
+        self._deadline = self._monotonic() + self._config.advanced.max_duration_seconds
         try:
             reason = self._consume(catch_up_until=None)
             if self._catch_up_due(reason):

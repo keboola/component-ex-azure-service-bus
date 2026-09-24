@@ -22,7 +22,16 @@ SAS = "Endpoint=sb://ns.servicebus.windows.net/;SharedAccessKeyName=k;SharedAcce
 
 
 def pager(
-    broker, *, fetch_mode="incremental_fetch", queue="q", cursor=None, info=None, limits=None, t0=None, session=False
+    broker,
+    *,
+    fetch_mode="incremental_fetch",
+    queue="q",
+    cursor=None,
+    info=None,
+    limits=None,
+    advanced=None,
+    t0=None,
+    session=False,
 ):
     source = {
         "entity_type": "queue",
@@ -34,6 +43,8 @@ def pager(
     params: dict[str, Any] = {"#connection_string": SAS, "source": source}
     if limits:
         params["limits"] = limits
+    if advanced:
+        params |= {"advanced_options": True, "advanced": advanced}
     config = Configuration(**params)
     entity = EntityRef.from_source(config.source)
     stats = RunStats(mode="peek")
@@ -365,7 +376,7 @@ def test_max_duration_stops_between_pages(broker, monkeypatch):
     monkeypatch.setattr(peek_mod, "PEEK_PAGE_SIZE", 1)
     q = broker.add_queue("q")
     seqs = [q.send(b"m") for _ in range(3)]
-    p, sink, stats = pager(broker, limits={"max_duration_seconds": 60})
+    p, sink, stats = pager(broker, advanced={"max_duration_seconds": 60})
     original = p.processor.process
 
     def slow(*args, **kwargs):
@@ -382,7 +393,7 @@ def test_a_pending_retry_caps_the_cursor(broker):
     bad = q.send(b"x")
     q.send(b"good")
     broker.inject_body_error(bad, times=1)
-    p, sink, stats = pager(broker, limits={"max_duration_seconds": 60})
+    p, sink, stats = pager(broker, advanced={"max_duration_seconds": 60})
     original = p.processor.process
 
     def slow(*args, **kwargs):

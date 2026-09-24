@@ -22,7 +22,6 @@
     },
     "limits": {
       "max_messages": 0,
-      "max_duration_seconds": 3600,
       "stop_at_job_start": true
     },
     "body": {

@@ -124,7 +124,7 @@ def test_max_duration(broker):
     q = broker.add_queue("q")
     for _ in range(3):
         q.send(b"a")
-    loop, sink, _, _ = build(broker, limits={"max_duration_seconds": 60}, advanced={"batch_size": 1})
+    loop, sink, _, _ = build(broker, advanced={"max_duration_seconds": 60, "batch_size": 1})
     original = loop.processor.process
 
     def slow(*args, **kwargs):

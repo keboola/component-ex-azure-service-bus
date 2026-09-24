@@ -116,7 +116,7 @@ class PeekPager:
         if incremental and self._info.partitioned is True:
             raise UserException(_PARTITIONED_INCREMENTAL)
         start = self._start() if incremental else 1
-        self._deadline = self._monotonic() + self.config.limits.max_duration_seconds
+        self._deadline = self._monotonic() + self.config.advanced.max_duration_seconds
         expired, scheduled = self._stats.expired_skipped, self._stats.skipped_scheduled
         unreadable = self.processor.unreadable
         retries_enabled = unreadable.retries_enabled
