@@ -18,7 +18,7 @@
           "Connection string (SAS)",
           "Service principal (Entra ID)"
         ],
-        "tooltip": "**Connection string (SAS)** — a shared access policy of the namespace, queue or topic with **Listen** rights. Listing entity names in the rows and **Show Entity Details** also need **Manage** rights; with a Listen-only policy, type the names yourself.\n\n**Service principal (Entra ID)** — an Entra ID app registration with the **Azure Service Bus Data Receiver** role. Required when the namespace has local (SAS) authentication disabled."
+        "tooltip": "**Connection string (SAS)** — a shared access policy of the namespace, queue or topic with **Listen** rights. Listing entity names in the rows and **Test Connection** on this page also need **Manage** rights; with a Listen-only policy, type the names yourself and use **Preview Messages** in a row to check access.\n\n**Service principal (Entra ID)** — an Entra ID app registration with the **Azure Service Bus Data Receiver** role. Required when the namespace has local (SAS) authentication disabled."
       },
       "default": "connection_string",
       "propertyOrder": 1
@@ -29,7 +29,7 @@
       "description": "Shared access signature connection string",
       "format": "password",
       "options": {
-        "tooltip": "Found in the Azure Portal under **Shared access policies** of the namespace (or of the queue / topic). Use a policy with **Listen** rights and copy its **Primary Connection String**. A **Manage** policy additionally lets the rows list queues, topics and subscriptions and show entity details. **Test Connection** on this page also needs **Manage** rights — with a Listen-only policy, use **Test Connection** in a row instead.",
+        "tooltip": "Found in the Azure Portal under **Shared access policies** of the namespace (or of the queue / topic). Use a policy with **Listen** rights and copy its **Primary Connection String**. A **Manage** policy additionally lets the rows list queues, topics and subscriptions. **Test Connection** on this page also needs **Manage** rights — with a Listen-only policy, use **Preview Messages** in a row instead.",
         "inputAttributes": {
           "placeholder": "Endpoint=sb://<namespace>.servicebus.windows.net/;SharedAccessKeyName=<name>;SharedAccessKey=<key>"
         },

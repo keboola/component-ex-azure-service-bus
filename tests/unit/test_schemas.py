@@ -9,7 +9,7 @@ from component import Component
 ROOT = Path(__file__).resolve().parents[2] / "component_config"
 ROOT_SCHEMA = json.loads((ROOT / "configSchema.json").read_text())
 ROW_SCHEMA = json.loads((ROOT / "configRowSchema.json").read_text())
-SYNC_ACTIONS = {"testConnection", "listQueues", "listTopics", "listSubscriptions", "previewMessages", "entityInfo"}
+SYNC_ACTIONS = {"testConnection", "listQueues", "listTopics", "listSubscriptions", "previewMessages"}
 
 
 def walk(schema: dict, path: str = ""):
@@ -141,3 +141,17 @@ def test_portal_urls_point_at_main():
     assert (ROOT / "sourceCodeUrl.md").read_text().strip() == repo
     assert (ROOT / "documentationUrl.md").read_text().strip() == f"{repo}/blob/main/README.md"
     assert (ROOT / "licenseUrl.md").read_text().strip() == f"{repo}/blob/main/LICENSE.md"
+
+
+def test_test_connection_is_a_root_button_only():
+    # Phase 8 (maintainer decision): the row form offers Preview Messages, which proves entity access;
+    # Test Connection (the management probe) lives on the configuration only.
+    def buttons(schema: dict) -> dict[str, str]:
+        return {
+            name: prop.get("options", {}).get("async", {}).get("action") or prop["format"]
+            for name, prop, _ in walk(schema)
+            if prop.get("type") == "button"
+        }
+
+    assert buttons(ROOT_SCHEMA) == {"test_connection": "test-connection"}
+    assert buttons(ROW_SCHEMA) == {"source.preview_messages": "previewMessages"}

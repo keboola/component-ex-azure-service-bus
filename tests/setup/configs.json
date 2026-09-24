@@ -1,7 +1,7 @@
 [
   {
-    "name": "01_testConnection_queue",
-    "description": "Row testConnection peeks one message of a queue; nothing is locked or settled.",
+    "name": "01_testConnection_manage_sas_ignores_source",
+    "description": "Root testConnection with a Manage connection string lists the namespace; a row source is ignored and no entity is opened.",
     "config": {
       "action": "testConnection",
       "parameters": {
@@ -32,10 +32,10 @@
     }
   },
   {
-    "name": "03_testConnection_auth_or_missing",
-    "description": "ServiceBusAuthenticationError maps to the J1 wording incl. the IP firewall.",
+    "name": "03_previewMessages_auth_or_missing",
+    "description": "ServiceBusAuthenticationError on the receiver maps to the J1 wording incl. the IP firewall.",
     "config": {
-      "action": "testConnection",
+      "action": "previewMessages",
       "parameters": {
         "auth_type": "connection_string",
         "#connection_string": "Endpoint=sb://ns.servicebus.windows.net/;SharedAccessKeyName=listen;SharedAccessKey=ZmFrZWtleWZha2VrZXlmYWtla2V5ZmFrZWtleTEyMzQ1Njc4OTA=",
@@ -48,10 +48,10 @@
     }
   },
   {
-    "name": "04_testConnection_session_empty",
-    "description": "A session entity with no available session succeeds with 'No session'.",
+    "name": "04_previewMessages_session_empty",
+    "description": "A session entity with no available session answers 'no messages to preview'.",
     "config": {
-      "action": "testConnection",
+      "action": "previewMessages",
       "parameters": {
         "auth_type": "connection_string",
         "#connection_string": "Endpoint=sb://ns.servicebus.windows.net/;SharedAccessKeyName=listen;SharedAccessKey=ZmFrZWtleWZha2VrZXlmYWtla2V5ZmFrZWtleTEyMzQ1Njc4OTA=",
@@ -214,42 +214,6 @@
           "entity_type": "subscription",
           "topic_name": "t",
           "subscription_name": "missing"
-        }
-      },
-      "storage": {}
-    }
-  },
-  {
-    "name": "15_entityInfo_sp",
-    "description": "entityInfo lists the management metadata of a subscription incl. its rules.",
-    "config": {
-      "action": "entityInfo",
-      "parameters": {
-        "auth_type": "service_principal",
-        "tenant_id": "00000000-0000-0000-0000-000000000000",
-        "client_id": "00000000-0000-0000-0000-000000000000",
-        "#client_secret": "dummy-secret",
-        "fully_qualified_namespace": "ns.servicebus.windows.net",
-        "source": {
-          "entity_type": "subscription",
-          "topic_name": "t",
-          "subscription_name": "s"
-        }
-      },
-      "storage": {}
-    }
-  },
-  {
-    "name": "16_entityInfo_listen_sas",
-    "description": "entityInfo with a Listen-only SAS asks for Manage rights or a service principal.",
-    "config": {
-      "action": "entityInfo",
-      "parameters": {
-        "auth_type": "connection_string",
-        "#connection_string": "Endpoint=sb://ns.servicebus.windows.net/;SharedAccessKeyName=listen;SharedAccessKey=ZmFrZWtleWZha2VrZXlmYWtla2V5ZmFrZWtleTEyMzQ1Njc4OTA=",
-        "source": {
-          "entity_type": "queue",
-          "queue_name": "q"
         }
       },
       "storage": {}

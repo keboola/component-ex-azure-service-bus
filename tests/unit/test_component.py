@@ -330,76 +330,15 @@ def sync_failure(capsys, comp) -> str:
     return capsys.readouterr().err
 
 
-def test_test_connection_row_peeks_one_and_settles_nothing(broker, tmp_path, monkeypatch, capsys):
-    q = broker.add_queue("q")
-    q.send(b"x")
-    component(tmp_path, monkeypatch, PARAMS, action="testConnection").execute_action()
-    assert sync_result(capsys) == {
-        "message": "Connected to Azure Service Bus and read 'q'.",
-        "type": "success",
-        "status": "success",
-    }
-    (receiver,) = broker.receivers
-    assert receiver.kwargs == {
-        "receive_mode": ServiceBusReceiveMode.PEEK_LOCK,
-        "prefetch_count": 1,
-        "keep_alive": 0,
-        "client_identifier": "kbc-local-root",
-    }
-    assert [op for op, _ in receiver.operations] == ["peek_messages"] and receiver.closed
-    assert receiver.operations[0][1]["max_message_count"] == 1
-    assert q.sequence_numbers() == [1] and q.delivery_count(1) == 0 and q.state_of(1) == "ACTIVE"
-
-
-def test_test_connection_session_entity_without_sessions(broker, tmp_path, monkeypatch, capsys):
-    broker.add_queue("q", sessions=True)
-    component(tmp_path, monkeypatch, with_source(session_enabled=True), action="testConnection").execute_action()
-    result = sync_result(capsys)
-    assert result["message"] == "Connected to Azure Service Bus. No session with messages is available right now."
-    assert result["type"] == "success"
-    kwargs = broker.receivers[0].kwargs
-    assert kwargs["session_id"] is NEXT_AVAILABLE_SESSION and kwargs["max_wait_time"] == 5
-
-
-def test_test_connection_session_entity_releases_the_session(broker, tmp_path, monkeypatch, capsys):
-    q = broker.add_queue("q", sessions=True)
-    q.send(b"x", session_id="a")
-    component(tmp_path, monkeypatch, with_source(session_enabled=True), action="testConnection").execute_action()
-    assert sync_result(capsys)["message"] == "Connected to Azure Service Bus and read 'q'."
-    assert broker.receivers[0].closed and q.state_of(1) == "ACTIVE" and q.delivery_count(1) == 0
-
-
-def test_test_connection_maps_sdk_errors_without_secrets(broker, tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize("source", [{}, {"entity_type": "queue"}, PARAMS["source"]], ids=["empty", "partial", "full"])
+def test_test_connection_reads_only_the_auth_block(broker, tmp_path, monkeypatch, capsys, source):
+    """Test Connection is a root button only (spec §5.4): a row's source, complete or not, changes
+    nothing -- the management probe runs and no entity is opened (Preview Messages does that)."""
     broker.add_queue("q")
-    broker.auth_failure = True
-    err = sync_failure(capsys, component(tmp_path, monkeypatch, PARAMS, action="testConnection"))
-    assert err.startswith("Authentication to Azure Service Bus failed for 'q'") and "c2VjcmV0" not in err
-
-
-def test_test_connection_sp_credentials_rejected(broker, tmp_path, monkeypatch, capsys):
-    broker.add_queue("q")
-    broker.credential_failure = "AADSTS700016: Application with identifier 'c' was not found in the directory."
-    params = {
-        "auth_type": "service_principal",
-        "tenant_id": "t",
-        "client_id": "c",
-        "#client_secret": "sp-s3cr3t",
-        "fully_qualified_namespace": "ns.servicebus.windows.net",
-        "source": PARAMS["source"],
-    }
-    err = sync_failure(capsys, component(tmp_path, monkeypatch, params, action="testConnection"))
-    assert err == (
-        "The service principal credentials were rejected (check tenant ID, client ID and client secret). (details: "
-        "Handler failed: Authentication failed: AADSTS700016: Application with identifier 'c' was not found in the "
-        "directory..)"
-    )
-
-
-def test_test_connection_missing_entity(broker, tmp_path, monkeypatch, capsys):
-    broker.add_topic("t")
-    params = {**PARAMS, "source": {"entity_type": "subscription", "topic_name": "t", "subscription_name": "s"}}
-    err = sync_failure(capsys, component(tmp_path, monkeypatch, params, action="testConnection"))
-    assert err.startswith("The entity 't/Subscriptions/s' was not found in the namespace.")
+    params = {"#connection_string": SAS, "source": source}
+    component(tmp_path, monkeypatch, params, action="testConnection").execute_action()
+    assert sync_result(capsys)["message"] == "Connected to the Service Bus namespace."
+    assert broker.admin_calls == [("list_queues", "")] and broker.receivers == []
 
 
 def test_test_connection_root_probes_management(broker, tmp_path, monkeypatch, capsys):
@@ -408,24 +347,10 @@ def test_test_connection_root_probes_management(broker, tmp_path, monkeypatch, c
     assert broker.admin_calls == [("list_queues", "")] and broker.receivers == []
 
 
-def test_test_connection_with_an_empty_source_is_the_root_probe(broker, tmp_path, monkeypatch, capsys):
-    component(
-        tmp_path, monkeypatch, {"#connection_string": SAS, "source": {}}, action="testConnection"
-    ).execute_action()
-    assert sync_result(capsys)["message"] == "Connected to the Service Bus namespace."
-    assert broker.admin_calls == [("list_queues", "")] and broker.receivers == []
-
-
-def test_test_connection_with_a_partial_source_reports_the_missing_field(broker, tmp_path, monkeypatch, capsys):
-    params = {"#connection_string": SAS, "source": {"entity_type": "queue"}}
-    err = sync_failure(capsys, component(tmp_path, monkeypatch, params, action="testConnection"))
-    assert "queue_name" in err and broker.admin_calls == []
-
-
 def test_test_connection_root_listen_sas(broker, tmp_path, monkeypatch, capsys):
     broker.management_denied = True
     err = sync_failure(capsys, component(tmp_path, monkeypatch, {"#connection_string": SAS}, action="testConnection"))
-    assert "only Listen rights" in err
+    assert err.startswith("The connection string has no Manage rights") and "Preview Messages in a row" in err
 
 
 def test_list_topics_and_subscriptions(broker, tmp_path, monkeypatch, capsys):
@@ -463,7 +388,13 @@ def test_preview_messages_peeks_ten_as_a_table(broker, tmp_path, monkeypatch, ca
     assert lines[2].startswith("| 1 |") and lines[2].endswith("| ACTIVE | body 0 |")
     (receiver,) = broker.receivers
     assert receiver.operations == [("peek_messages", {"max_message_count": 10, "sequence_number": 0})]
-    assert receiver.kwargs["prefetch_count"] == 1 and receiver.kwargs["keep_alive"] == 0
+    assert receiver.kwargs == {
+        "receive_mode": ServiceBusReceiveMode.PEEK_LOCK,
+        "prefetch_count": 1,
+        "keep_alive": 0,
+        "client_identifier": "kbc-local-root",
+    }
+    assert receiver.closed
     assert all(q.delivery_count(seq) == 0 for seq in q.sequence_numbers())
 
 
@@ -476,6 +407,35 @@ def test_preview_messages_empty_entity(broker, tmp_path, monkeypatch, capsys, se
         "type": "info",
         "status": "success",
     }
+
+
+def test_preview_messages_session_entity_releases_the_session(broker, tmp_path, monkeypatch, capsys):
+    q = broker.add_queue("q", sessions=True)
+    q.send(b"x", session_id="a")
+    component(tmp_path, monkeypatch, with_source(session_enabled=True), action="previewMessages").execute_action()
+    assert sync_result(capsys)["type"] == "table"
+    kwargs = broker.receivers[0].kwargs
+    assert kwargs["session_id"] is NEXT_AVAILABLE_SESSION and kwargs["max_wait_time"] == 5
+    assert broker.receivers[0].closed and q.state_of(1) == "ACTIVE" and q.delivery_count(1) == 0
+
+
+def test_preview_messages_sp_credentials_rejected(broker, tmp_path, monkeypatch, capsys):
+    broker.add_queue("q")
+    broker.credential_failure = "AADSTS700016: Application with identifier 'c' was not found in the directory."
+    params = {
+        "auth_type": "service_principal",
+        "tenant_id": "t",
+        "client_id": "c",
+        "#client_secret": "sp-s3cr3t",
+        "fully_qualified_namespace": "ns.servicebus.windows.net",
+        "source": PARAMS["source"],
+    }
+    err = sync_failure(capsys, component(tmp_path, monkeypatch, params, action="previewMessages"))
+    assert err == (
+        "The service principal credentials were rejected (check tenant ID, client ID and client secret). (details: "
+        "Handler failed: Authentication failed: AADSTS700016: Application with identifier 'c' was not found in the "
+        "directory..)"
+    )
 
 
 def test_preview_messages_maps_sdk_errors(broker, tmp_path, monkeypatch, capsys):
@@ -516,21 +476,6 @@ def test_sync_action_gives_up_before_the_platform_limit(broker, tmp_path, monkey
     assert elapsed < 5  # well before the fake's 10-second cap: the action gave up, the call did not return
 
 
-def test_entity_info(broker, tmp_path, monkeypatch, capsys):
-    broker.add_queue("q").send(b"x")
-    component(tmp_path, monkeypatch, PARAMS, action="entityInfo").execute_action()
-    result = sync_result(capsys)
-    assert result["type"] == "info"
-    assert "- Requires session: False" in result["message"] and "- Active messages: 1" in result["message"]
-
-
-def test_entity_info_listen_sas(broker, tmp_path, monkeypatch, capsys):
-    broker.add_queue("q")
-    broker.management_denied = True
-    err = sync_failure(capsys, component(tmp_path, monkeypatch, PARAMS, action="entityInfo"))
-    assert err.startswith("Entity details need a connection string with Manage rights")
-
-
 # --- sync actions validate only auth + source (spec §5.4); auth is parsed lazily ---------------------------
 
 UNRELATED_INVALID = {
@@ -540,7 +485,7 @@ UNRELATED_INVALID = {
 
 
 @pytest.mark.parametrize("unrelated", UNRELATED_INVALID.values(), ids=UNRELATED_INVALID.keys())
-@pytest.mark.parametrize("action", ["testConnection", "previewMessages", "entityInfo"])
+@pytest.mark.parametrize("action", ["testConnection", "previewMessages"])
 def test_entity_sync_actions_ignore_unrelated_invalid_fields(broker, tmp_path, monkeypatch, capsys, action, unrelated):
     broker.add_queue("q").send(b"x")
     component(tmp_path, monkeypatch, {**PARAMS, **unrelated}, action=action).execute_action()
@@ -554,10 +499,9 @@ def test_run_still_validates_the_whole_row(broker, tmp_path, monkeypatch, unrela
         component(tmp_path, monkeypatch, {**PARAMS, **unrelated}).execute_action()
 
 
-@pytest.mark.parametrize("action", ["previewMessages", "entityInfo"])
-def test_entity_sync_actions_still_validate_the_source(broker, tmp_path, monkeypatch, capsys, action):
+def test_preview_messages_still_validates_the_source(broker, tmp_path, monkeypatch, capsys):
     params = {"#connection_string": SAS, "source": {"entity_type": "queue"}}
-    err = sync_failure(capsys, component(tmp_path, monkeypatch, params, action=action))
+    err = sync_failure(capsys, component(tmp_path, monkeypatch, params, action="previewMessages"))
     assert err == (
         "Validation Error: configuration: Value error, `source.queue_name` is required when `entity_type` is `queue`."
     )

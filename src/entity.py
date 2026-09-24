@@ -5,9 +5,9 @@ with or without a sub-queue); it knows its SDK path, its derived output table na
 its receiver. ``EntityInfo`` carries the management-derived (or heuristic-fallback) metadata the
 receive loop needs -- ``requires_session``, partitioning, lock duration and max delivery count.
 Management access is optional for a run: every read here that touches the management plane degrades
-to defaults rather than failing the row, except the two explicit sync-action / pre-check helpers
-(``list_entity_names``, ``probe_management``, ``describe_entity``) that ask the user for the metadata
-directly and must report a denied or missing entity as an actionable error.
+to defaults rather than failing the row, except the sync-action helpers (``list_entity_names``,
+``probe_management``) that read the management plane on the user's request and must report a
+denied or missing entity as an actionable error.
 """
 
 import logging
@@ -166,9 +166,9 @@ class EntityInfo:
 
 
 class _EntityMetadata(NamedTuple):
-    """The management fields both ``load_entity_info`` and ``describe_entity`` need. Built by the
-    entity-type-specific loader below so each stays responsible for its own runtime-properties shape
-    (a subscription's has no ``scheduled_message_count``, §4-L)."""
+    """The management fields ``load_entity_info`` needs. Built by the entity-type-specific loader
+    below so each stays responsible for its own runtime-properties shape (a subscription's has no
+    ``scheduled_message_count``, §4-L)."""
 
     requires_session: bool | None
     partitioned: bool | None
@@ -302,8 +302,9 @@ def list_entity_names(
 
 
 def probe_management(connector: ServiceBusConnector) -> None:
-    """The root ``testConnection`` (no source): lists the first queue to prove SP / Manage-SAS auth.
-    A denial names the missing right; rejected SP credentials say so (``to_user_exception``)."""
+    """``testConnection``: lists the first queue to prove SP / Manage-SAS auth. A denial names the
+    missing right (a Listen-only SAS is pointed at a row's Preview Messages); rejected SP
+    credentials say so (``to_user_exception``)."""
     try:
         with connector.admin_client() as admin:
             next(iter(admin.list_queues()), None)
@@ -312,54 +313,12 @@ def probe_management(connector: ServiceBusConnector) -> None:
             raise to_user_exception(e, None, connector.secrets) from e
         if connector.auth_type == AuthType.CONNECTION_STRING:
             message = (
-                "A connection string with only Listen rights can be tested only from a row that has a source selected."
+                "The connection string has no Manage rights, so it cannot read the namespace's management data "
+                "and cannot be tested here. Listen rights are enough to extract: use Preview Messages in a row "
+                "to check that it can read the entity."
             )
         else:
             message = (
                 "The service principal cannot read the namespace: grant it the 'Azure Service Bus Data Receiver' role."
             )
         raise with_details(message, e, connector.secrets) from e
-
-
-def _rule_filter_text(rule_filter: Any) -> str:
-    """``name: sql_expression`` for a SQL (or ``$Default``/``TrueRuleFilter``) rule; ``str(filter)``
-    for anything else, e.g. a ``CorrelationRuleFilter``."""
-    sql_expression = getattr(rule_filter, "sql_expression", None)
-    return sql_expression if sql_expression is not None else str(rule_filter)
-
-
-def describe_entity(connector: ServiceBusConnector, entity: EntityRef) -> str:
-    """The ``entityInfo`` sync action: a markdown bullet list of the entity's management metadata."""
-    try:
-        with connector.admin_client() as admin:
-            metadata = _load_metadata(admin, entity)
-            rules = (
-                list(admin.list_rules(entity.topic_name or "", entity.subscription_name or ""))
-                if entity.entity_type is EntityType.SUBSCRIPTION
-                else None
-            )
-    except AzureError as e:
-        if is_management_denied(e):
-            raise with_details(
-                "Entity details need a connection string with Manage rights or a service principal with the "
-                "'Azure Service Bus Data Receiver' role.",
-                e,
-                connector.secrets,
-            ) from e
-        raise to_user_exception(e, entity.path, connector.secrets) from e
-
-    counts = metadata.counts
-    lines = [
-        f"- Requires session: {metadata.requires_session}",
-        f"- Partitioned: {metadata.partitioned}",
-        f"- Lock duration: {metadata.lock_duration_seconds} seconds",
-        f"- Max delivery count: {metadata.max_delivery_count}",
-        f"- Active messages: {counts['active']}",
-        f"- Dead-lettered messages: {counts['dead_letter']}",
-        f"- Scheduled messages: {counts['scheduled']}",
-        f"- Transfer-dead-lettered messages: {counts['transfer_dead_letter']}",
-    ]
-    if rules is not None:
-        lines.append("- Rules:")
-        lines.extend(f"  - {rule.name}: {_rule_filter_text(rule.filter)}" for rule in rules)
-    return "\n".join(lines)

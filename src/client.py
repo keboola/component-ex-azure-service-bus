@@ -328,7 +328,7 @@ class ServiceBusConnector:
         return self._data_client({"retry_total": 0})
 
     def admin_client(self) -> ServiceBusAdministrationClient:
-        """The management-plane client used by sync actions and ``entityInfo``."""
+        """The management-plane client of the sync actions and the run's metadata pre-check."""
         return _ADMIN_BUILDERS[self._auth.auth_type](self._auth)
 
     def _data_client(self, extra: dict[str, Any]) -> ServiceBusClient:

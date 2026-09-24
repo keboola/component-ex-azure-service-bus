@@ -209,14 +209,6 @@
           "default": 10,
           "propertyOrder": 9
         },
-        "test_connection": {
-          "type": "button",
-          "format": "test-connection",
-          "options": {
-            "grid_columns": 4
-          },
-          "propertyOrder": 10
-        },
         "preview_messages": {
           "type": "button",
           "format": "sync-action",
@@ -228,18 +220,6 @@
             "grid_columns": 4
           },
           "propertyOrder": 11
-        },
-        "entity_info": {
-          "type": "button",
-          "format": "sync-action",
-          "options": {
-            "async": {
-              "label": "Show Entity Details",
-              "action": "entityInfo"
-            },
-            "grid_columns": 4
-          },
-          "propertyOrder": 12
         }
       }
     },

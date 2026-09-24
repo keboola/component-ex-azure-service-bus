@@ -171,25 +171,19 @@ class AdvancedConfig(BaseModel):
 
 
 class SourceSelection(BaseModel):
-    """A row's ``source`` block as the sync actions that tolerate an incomplete row read it: the
-    form may still be half filled in, so only ``topic_name`` is typed and every other key is kept
-    as given (it still tells a configured source from an empty one)."""
+    """A row's ``source`` block as ``listSubscriptions`` reads it: the form may still be half filled
+    in, so only ``topic_name`` is typed and every other key is ignored."""
 
-    model_config = ConfigDict(populate_by_name=True, extra="allow")
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
 
     topic_name: str | None = None
 
 
 class SyncActionConfiguration(AuthConfiguration):
-    """Partial model for ``testConnection`` (row vs root, spec §5.4) and ``listSubscriptions`` (the
-    selected topic): the auth block plus a possibly partial ``source``, never a validated row."""
+    """Partial model for ``listSubscriptions`` (spec §5.4): the auth block plus the selected topic of
+    a possibly partial ``source``, never a validated row."""
 
     source: SourceSelection | None = None
-
-    @property
-    def source_configured(self) -> bool:
-        """A non-empty ``source`` block: a row-level call. The root-level ``testConnection`` has none."""
-        return self.source is not None and bool(self.source.model_fields_set)
 
     @property
     def topic_name(self) -> str | None:
@@ -198,10 +192,9 @@ class SyncActionConfiguration(AuthConfiguration):
 
 class EntityConfiguration(AuthConfiguration):
     """Auth plus the row's validated, normalised ``source``: what every action that opens the entity
-    needs. The row-level sync actions (``testConnection`` with a source, ``previewMessages``,
-    ``entityInfo``, spec §5.4) validate only this, so a half-edited unrelated field -- an invalid
-    table name, a batch size out of range -- never blocks them; the other sections are ignored.
-    ``Configuration`` extends it, so a run and the sync actions read the source identically."""
+    needs. ``previewMessages`` (spec §5.4) validates only this, so a half-edited unrelated field -- an
+    invalid table name, a batch size out of range -- never blocks it; the other sections are ignored.
+    ``Configuration`` extends it, so a run and the sync action read the source identically."""
 
     source: SourceConfig
 

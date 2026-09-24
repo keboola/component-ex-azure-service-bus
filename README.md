@@ -35,9 +35,10 @@ Authentication
 Set once for the whole configuration. Choose one method:
 
 - **Connection string (SAS)** — a shared access signature connection string for the namespace or
-  entity, with **Listen** rights. The entity dropdowns and the **Show Entity Details** action
+  entity, with **Listen** rights. The entity dropdowns and the configuration's **Test Connection**
   additionally need **Manage** rights; a Listen-only connection string still works for reading, but
-  the entity name has to be typed instead of picked from a list.
+  the entity name has to be typed instead of picked from a list, and **Preview Messages** in a row
+  is the way to check access.
 - **Service principal (Entra ID)** — a Microsoft Entra ID application identity: tenant ID, client
   ID, client secret, and the fully qualified namespace host name (e.g.
   `my-namespace.servicebus.windows.net`). Grant it the **Azure Service Bus Data Receiver** RBAC
@@ -265,12 +266,12 @@ to recover).
 Sync actions
 ============
 
-- **Test Connection** — opens the configured entity (row) or lists queues (root, without a
-  configured source) to verify credentials and rights.
-- **Preview Messages** — peeks up to 10 messages and shows sequence number, enqueued time, message
-  ID, subject, state, and the start of the decoded body. Nothing is locked or settled.
-- **Show Entity Details** — entity properties (sessions, partitioning, lock duration, max delivery
-  count, message counts, subscription rules).
+- **Test Connection** (configuration) — lists the namespace's queues to verify the credentials: a
+  service principal, or a connection string with **Manage** rights. A Listen-only connection string
+  cannot be tested here; use Preview Messages in a row.
+- **Preview Messages** (row) — peeks up to 10 messages and shows sequence number, enqueued time,
+  message ID, subject, state, and the start of the decoded body. It proves that the credentials can
+  read the row's entity. Nothing is settled (a session-enabled entity's session is held briefly).
 
 The list-entity dropdowns (queues / topics / subscriptions) need a service principal or a
 Manage-rights connection string; with a Listen-only connection string, type the entity name

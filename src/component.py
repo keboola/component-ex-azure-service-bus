@@ -6,7 +6,7 @@ that own the logic: ``commit.py`` deletes the previous defer-commit run's pendin
 deferrals, ``receiver.py`` drives the destructive receive loop and ``peek.py`` the peek pager, ``settlement.py``
 writes each batch before settling it, ``output.py`` streams the CSV and its manifest, ``state.py``
 holds the row state. The sync actions (spec §5.4) read the management plane or peek the entity; they
-never settle or lock a message.
+never settle a message, and each gives up before the platform's 30-second limit.
 """
 
 import logging
@@ -16,7 +16,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from functools import cached_property, wraps
-from typing import Any, Literal, NamedTuple
+from typing import Any, Literal
 
 from azure.servicebus import NEXT_AVAILABLE_SESSION, ServiceBusReceiveMode
 from azure.servicebus.exceptions import OperationTimeoutError, ServiceBusError
@@ -40,7 +40,6 @@ from configuration import (
 from entity import (
     EntityInfo,
     EntityRef,
-    describe_entity,
     list_entity_names,
     load_entity_info,
     log_entity_counts,
@@ -108,14 +107,6 @@ def _within_deadline[**P, R](action: Callable[P, R]) -> Callable[P, R]:
         return value
 
     return bounded
-
-
-class _PeekedEntity(NamedTuple):
-    """What a sync action peeked: the row's entity and its first messages (``None``: a session entity
-    had no session with an available message)."""
-
-    entity: EntityRef
-    messages: list[Any] | None
 
 
 @dataclass
@@ -364,17 +355,10 @@ class Component(ComponentBase):
     @sync_action("testConnection")
     @_within_deadline
     def test_connection(self) -> ValidationResult:
-        """Row: peek one message of the configured entity (auth + Listen + entity). Root (no source):
-        a management listing (service principal / Manage connection string)."""
-        if not self._sync_configuration().source_configured:
-            probe_management(self._connector)
-            return ValidationResult("Connected to the Service Bus namespace.", MessageType.SUCCESS)
-        peeked = self._peek_row_entity(1)
-        if peeked.messages is None:
-            return ValidationResult(
-                "Connected to Azure Service Bus. No session with messages is available right now.", MessageType.SUCCESS
-            )
-        return ValidationResult(f"Connected to Azure Service Bus and read '{peeked.entity.path}'.", MessageType.SUCCESS)
+        """The root **Test Connection**: a management listing proves service-principal / Manage-SAS
+        auth. Only the auth block is read -- a row's **Preview Messages** proves entity access."""
+        probe_management(self._connector)
+        return ValidationResult("Connected to the Service Bus namespace.", MessageType.SUCCESS)
 
     @sync_action("listQueues")
     @_within_deadline
@@ -396,24 +380,19 @@ class Component(ComponentBase):
     @_within_deadline
     def preview_messages(self) -> ValidationResult:
         """A markdown table of up to ten peeked messages; nothing is locked or settled."""
-        messages = self._peek_row_entity(PREVIEW_MESSAGE_COUNT).messages
+        messages = self._peek_row_entity(PREVIEW_MESSAGE_COUNT)
         if not messages:
             return ValidationResult("The entity has no messages to preview.", MessageType.INFO)
         return ValidationResult(render_preview(messages), MessageType.TABLE)
 
-    @sync_action("entityInfo")
-    @_within_deadline
-    def entity_info(self) -> ValidationResult:
-        entity = EntityRef.from_source(self._entity_configuration().source)
-        return ValidationResult(describe_entity(self._connector, entity), MessageType.INFO)
-
     def _sync_configuration(self) -> SyncActionConfiguration:
-        """The partial model of the sync actions that must work before the row is complete."""
+        """The partial model of ``listSubscriptions``: auth plus the selected topic of a row that may
+        still be half filled in."""
         return SyncActionConfiguration(**self.configuration.parameters)
 
     def _entity_configuration(self) -> EntityConfiguration:
-        """The partial model of the sync actions that open the row's entity: auth + source only
-        (spec §5.4), so an unrelated half-edited field never blocks them."""
+        """The partial model of ``previewMessages``, which opens the row's entity: auth + source only
+        (spec §5.4), so an unrelated half-edited field never blocks it."""
         return EntityConfiguration(**self.configuration.parameters)
 
     def _select_elements(
@@ -421,10 +400,10 @@ class Component(ComponentBase):
     ) -> list[SelectElement]:
         return [SelectElement(value=name, label=name) for name in list_entity_names(self._connector, kind, topic_name)]
 
-    def _peek_row_entity(self, max_message_count: int) -> _PeekedEntity:
+    def _peek_row_entity(self, max_message_count: int) -> list[Any] | None:
         """Peek the row's entity from its first message on a PEEK_LOCK receiver with the thread-free
-        profile (spec §6.2); a session entity takes the next available session for a moment. The
-        messages are ``None`` when a session entity has no session with an available message."""
+        profile (spec §6.2); a session entity takes the next available session for a moment. ``None``
+        when a session entity has no session with an available message."""
         config = self._entity_configuration()
         entity = EntityRef.from_source(config.source)
         sessions = config.source.session_enabled
@@ -438,10 +417,10 @@ class Component(ComponentBase):
             kwargs |= {"session_id": NEXT_AVAILABLE_SESSION, "max_wait_time": SESSION_ACCEPT_WAIT_SECONDS}
         try:
             with self._connector.receive_client() as client, entity.open_receiver(client, **kwargs) as receiver:
-                return _PeekedEntity(entity, receiver.peek_messages(max_message_count))
+                return receiver.peek_messages(max_message_count)
         except OperationTimeoutError as e:
             if sessions:
-                return _PeekedEntity(entity, None)
+                return None
             raise to_user_exception(e, entity.path, self._connector.secrets) from e
         except ServiceBusError as e:
             raise to_user_exception(e, entity.path, self._connector.secrets) from e

@@ -10,4 +10,4 @@ Configuration is row-based: the connection to the namespace is set once at the c
 
 Development branches read the same production entity: in a branch, use Peek Only or a separate test entity, since the other modes consume and remove production messages.
 
-Use the **Test Connection**, **Preview Messages**, and **Show Entity Details** actions to verify credentials, inspect sample messages, and check entity properties before running. The source entity must already exist in the namespace — the extractor does not create it.
+Use **Test Connection** (on the configuration, with a service principal or a Manage connection string) to verify credentials and **Preview Messages** (in a row) to check access to the entity and inspect sample messages before running. The source entity must already exist in the namespace — the extractor does not create it.

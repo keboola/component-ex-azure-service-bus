@@ -1,4 +1,4 @@
-"""Functional sync-action cases 01-16 (spec §8, §5.4): one success and one failure path per action.
+"""Functional sync-action cases 01-14 (spec §8, §5.4): one success and one failure path per action.
 
 Every case runs the real component (``runpy`` as ``__main__``) against the FakeBroker; the configs
 are in ``tests/setup/configs.json``. A sync action prints its JSON result on stdout (exit 0) or its
@@ -13,13 +13,14 @@ def _values(payload: object) -> list[str]:
     return [item["value"] for item in payload]
 
 
-def test_01_testConnection_queue(fake_broker, tmp_path, monkeypatch, capsys):
+def test_01_testConnection_manage_sas_ignores_source(fake_broker, tmp_path, monkeypatch, capsys):
     q = fake_broker.add_queue("orders")
     seqs = [q.send(b"a"), q.send(b"b")]
-    result = run_case("01_testConnection_queue", tmp_path, monkeypatch, capsys)
+    result = run_case("01_testConnection_manage_sas_ignores_source", tmp_path, monkeypatch, capsys)
     assert result.exit_code == 0
     payload = sync_result(result)
-    assert payload["status"] == "success" and "orders" in payload["message"]
+    assert payload["status"] == "success" and payload["message"] == "Connected to the Service Bus namespace."
+    assert fake_broker.admin_calls == [("list_queues", "")] and fake_broker.receivers == []
     assert all(q.state_of(s) == "ACTIVE" and q.delivery_count(s) == 0 for s in seqs)
 
 
@@ -31,19 +32,19 @@ def test_02_testConnection_bad_conn_string(fake_broker, tmp_path, monkeypatch, c
     assert DUMMY_SAS_KEY not in result.stderr
 
 
-def test_03_testConnection_auth_or_missing(fake_broker, tmp_path, monkeypatch, capsys):
+def test_03_previewMessages_auth_or_missing(fake_broker, tmp_path, monkeypatch, capsys):
     fake_broker.auth_failure = True
-    result = run_case("03_testConnection_auth_or_missing", tmp_path, monkeypatch, capsys)
+    result = run_case("03_previewMessages_auth_or_missing", tmp_path, monkeypatch, capsys)
     assert result.exit_code == 1
     assert "IP firewall" in result.stderr and "orders" in result.stderr
     assert DUMMY_SAS_KEY not in result.stderr
 
 
-def test_04_testConnection_session_empty(fake_broker, tmp_path, monkeypatch, capsys):
+def test_04_previewMessages_session_empty(fake_broker, tmp_path, monkeypatch, capsys):
     fake_broker.add_queue("sess", sessions=True)
-    result = run_case("04_testConnection_session_empty", tmp_path, monkeypatch, capsys)
+    result = run_case("04_previewMessages_session_empty", tmp_path, monkeypatch, capsys)
     assert result.exit_code == 0
-    assert "No session" in sync_result(result)["message"]
+    assert sync_result(result)["message"] == "The entity has no messages to preview."
 
 
 def test_05_testConnection_root_sp(fake_broker, tmp_path, monkeypatch, capsys):
@@ -58,7 +59,7 @@ def test_06_testConnection_root_listen_sas(fake_broker, tmp_path, monkeypatch, c
     fake_broker.management_denied = True
     result = run_case("06_testConnection_root_listen_sas", tmp_path, monkeypatch, capsys)
     assert result.exit_code == 1
-    assert "only from a row" in result.stderr
+    assert "no Manage rights" in result.stderr and "Preview Messages in a row" in result.stderr
 
 
 def test_07_listQueues_sp(fake_broker, tmp_path, monkeypatch, capsys):
@@ -146,19 +147,3 @@ def test_14_previewMessages_missing_entity(fake_broker, tmp_path, monkeypatch, c
     result = run_case("14_previewMessages_missing_entity", tmp_path, monkeypatch, capsys)
     assert result.exit_code == 1
     assert "was not found" in result.stderr and "t/Subscriptions/missing" in result.stderr
-
-
-def test_15_entityInfo_sp(fake_broker, tmp_path, monkeypatch, capsys):
-    fake_broker.add_subscription("t", "s").add_rule("r1", "amount > 10")
-    result = run_case("15_entityInfo_sp", tmp_path, monkeypatch, capsys)
-    assert result.exit_code == 0
-    message = sync_result(result)["message"]
-    assert "Requires session" in message and "r1" in message and "amount > 10" in message
-
-
-def test_16_entityInfo_listen_sas(fake_broker, tmp_path, monkeypatch, capsys):
-    fake_broker.add_queue("q")
-    fake_broker.management_denied = True
-    result = run_case("16_entityInfo_listen_sas", tmp_path, monkeypatch, capsys)
-    assert result.exit_code == 1
-    assert "Manage" in result.stderr

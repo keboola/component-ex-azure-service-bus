@@ -88,7 +88,8 @@ and the body as text, base64 or flattened JSON columns.
 - **Secrets → `#`-prefixed keys:** `#connection_string`, `#client_secret` (encrypted at rest as
   `KBC::ProjectSecure`; the container receives plaintext).
 - **Sync actions:** `testConnection`, `listQueues`, `listTopics`, `listSubscriptions`,
-  `previewMessages`, `entityInfo` (§5.4). Registered in the Developer Portal in Phase 6.
+  `previewMessages` (§5.4). Registered in the Developer Portal in Phase 6 (`entityInfo` was removed
+  in Phase 8).
 - **Output bucket:** the portal app gets `defaultBucket: true` (stage `in`) in Phase 6; manifests
   carry no `destination`, so tables land in `in.c-keboola-ex-azure-service-bus-<configId>` and the
   table name is the output file name.
@@ -168,14 +169,14 @@ next run), **or** the branch's next run may delete them first.
 
 | # | Method | `auth_type` | Fields | Rights needed | Status |
 |---|---|---|---|---|---|
-| B1 | SAS connection string | `connection_string` (default) | `#connection_string` | **Listen** on the entity or namespace; the entity dropdowns and `entityInfo` additionally need **Manage** | in scope, live-verified |
+| B1 | SAS connection string | `connection_string` (default) | `#connection_string` | **Listen** on the entity or namespace; the entity dropdowns and the root `testConnection` additionally need **Manage** | in scope, live-verified |
 | B2 | Entra ID service principal (client secret) | `service_principal` | `tenant_id`, `client_id`, `#client_secret`, `fully_qualified_namespace` | RBAC **Azure Service Bus Data Receiver** — covers receive, peek, complete, abandon, defer, dead-letter, DLQ receive **and** listing entities / reading properties, counts and rules | in scope, live-verified |
 
 - **SDK surface.** `ServiceBusClient.from_connection_string(conn_str, …)` or
   `ServiceBusClient(fully_qualified_namespace, credential=ClientSecretCredential(tenant, client,
   secret), …)` for the data plane (AMQP); `ServiceBusAdministrationClient` (same two constructors)
-  for the management plane (HTTPS 443) used only by the dropdowns, `entityInfo` and the optional
-  metadata pre-checks (L1/L2). SAS Listen gets `401` on every management call [live]; a SAS policy
+  for the management plane (HTTPS 443) used only by the dropdowns, the root `testConnection` and the
+  optional metadata pre-checks (L1/L2). SAS Listen gets `401` on every management call [live]; a SAS policy
   with Manage can list entities [docs, not probed].
 - **Transport is fixed: pyamqp over AMQP/TLS 5671.** No transport field; `uamqp_transport` is never
   set (deprecated since 7.14.2; `uamqp` 1.6.11 has no prebuilt cp314 wheel [docs: PyPI]).
@@ -358,10 +359,10 @@ failing (§6.9), and unused columns simply stay empty.
 
 | Capability | Verdict | Rationale / where |
 |---|---|---|
-| I1. `testConnection` (peek 1) | **In scope** | row + root buttons. |
+| I1. `testConnection` | **In scope** | root button only: management probe (Phase 8 — the row button, which peeked one message, was removed; a row's Preview Messages proves entity access). |
 | I2. Entity dropdowns (queues / topics / subscriptions) | **In scope** | `listQueues` / `listTopics` / `listSubscriptions`: work with SP (Data Receiver) and with a Manage SAS; a Listen-only SAS gets an empty list and types the name (creatable select). |
 | I3. Preview messages (peek N) | **In scope** | `previewMessages` (10 messages, non-destructive). |
-| I4. Entity info | **In scope** | `entityInfo` (sessions, partitioning, lock duration, max delivery count, counts, subscription rules). |
+| I4. Entity info | **Removed (Phase 8, maintainer decision)** | the `entityInfo` action and its **Show Entity Details** button: low value — a run already fails clearly on a session mismatch and logs the counts when management reads are allowed. |
 | I5. Session list dropdown | **Excluded** — needs 7.15+ `list_*_sessions`, and it only serves A5b (excluded). | Signed off 2026-09-23. |
 
 ### J. Error handling / robustness (§6.11)
@@ -399,7 +400,7 @@ failing (§6.9), and unused columns simply stay empty.
 |---|---|---|
 | L1. Entity runtime counts in the log | **In scope** | INFO line at run start when the credentials allow management reads; silently skipped otherwise. |
 | L2. Entity metadata pre-checks | **In scope** | `requires_session` vs `session_enabled`, `enable_partitioning`, `lock_duration`, `max_delivery_count` (§6.7); heuristics when unavailable. |
-| L3. Subscription rules / filters as data | **Excluded** — configuration metadata, not message data; shown in `entityInfo` instead. | Signed off 2026-09-23. |
+| L3. Subscription rules / filters as data | **Excluded** — configuration metadata, not message data (no longer shown anywhere since `entityInfo` was removed, I4). | Signed off 2026-09-23. |
 | L4. Service batch delete | **Excluded** — deletes by message count + enqueue-time cutoff (not by sequence number), unsupported on partitioned entities, locked messages ineligible, and absent from the Python SDK (7.14.3 / 7.15.0b2) [docs + source] — it could not target a C2 pending set. | Signed off 2026-09-23. |
 
 **Totals:** 106 inventory rows — **89 in scope, 17 excluded** (A5b, A6, B3, B4, B5, C5, D9, lock
@@ -442,8 +443,9 @@ described here, not written as JSON.
   when `settlement_mode = peek`.
 - `idle_timeout_seconds` — integer 1–300, default 10; shown only for the destructive modes (one
   receive call waits this long; an empty result means the entity is drained).
-- Buttons: **Test Connection** (`testConnection`), **Preview Messages** (`previewMessages`), **Show
-  Entity Details** (`entityInfo`).
+- Button: **Preview Messages** (`previewMessages`) — the row's access check. (Phase 8: the row's
+  **Test Connection** and **Show Entity Details** buttons were removed; Test Connection is a root
+  button only.)
 
 **`limits`** — run bounds (all modes):
 - `max_messages` — integer ≥ 0, default `0` (= no limit).
@@ -488,11 +490,9 @@ guard (§2.5); a leftover key is ignored.
 
 | Action | Context | Behaviour | Failure |
 |---|---|---|---|
-| `testConnection` | row (source present) | open the configured receiver (session entities: `NEXT_AVAILABLE_SESSION`, `max_wait_time=SESSION_ACCEPT_WAIT_SECONDS` = 5) and `peek_messages(1)`; proves auth + Listen + entity. Non-session entities: locks nothing [live]. Session entities: briefly takes a session lock [live]; `OperationTimeoutError` → success "connected, no session with messages available". | mapped `UserException` (J1) |
-| `testConnection` | root (no source) | management `list_queues` (first item) — proves SP / Manage-SAS auth; a Listen-only SAS (401) gets a failure explaining that Listen rights can only be tested from a row with a source | `UserException` |
+| `testConnection` | root button (a row `source`, if sent, is ignored) | management `list_queues` (first item) — proves SP / Manage-SAS auth; a Listen-only SAS (401) gets a failure explaining that it cannot be tested there and that a row's Preview Messages checks Listen access | `UserException` |
 | `listQueues`, `listTopics`, `listSubscriptions` | row | management listing → `[{value, label}]` sorted by name; **SAS 401 → empty list** (the creatable select lets the user type the name); SP errors → `UserException` | missing topic → `UserException` |
 | `previewMessages` | row | peek up to 10 messages; returns a markdown table (sequence number, enqueued time, message id, subject, state, first 120 characters of the text-decoded body); nothing locked or settled (session caveat as above) | mapped `UserException` |
-| `entityInfo` | row | management `get_*` + runtime properties (+ `list_rules` for subscriptions): requires_session, partitioning, lock duration, max delivery count, active / dead-letter / scheduled / transfer-DLQ counts, rule names + filters | Listen-only SAS → `UserException` "needs Manage (SAS) or Data Receiver (SP)" |
 
 - Image tag [live, Phase 8 — corrects the earlier writer lesson]: the UI sends the configuration's
   `runtime.tag` as the request's `tag`, so the buttons run a pinned branch build; a call without a
@@ -510,11 +510,11 @@ guard (§2.5); a leftover key is ignored.
   again in a minute."), leaving the container start-up and the reply their share of the 30 seconds.
 - Row-level sync actions receive the root `parameters` merged with the row's [inferred — verified in
   Phase 6/7; the actions only need the fields they read, via partial models (§7)].
-- **Each action validates only what it reads (Phase 8):** the list actions and the root
-  `testConnection` validate the auth block (plus, for `listSubscriptions`, the selected topic); the
-  row-level `testConnection`, `previewMessages` and `entityInfo` validate auth + `source`
-  (`EntityConfiguration`, with the run's source normalisation) and ignore every other section, so a
-  half-edited unrelated field (an invalid table name, a batch size out of range) never blocks them.
+- **Each action validates only what it reads (Phase 8):** the list actions and `testConnection`
+  validate the auth block (plus, for `listSubscriptions`, the selected topic); `previewMessages`
+  validates auth + `source` (`EntityConfiguration`, with the run's source normalisation) and ignores
+  every other section, so a half-edited unrelated field (an invalid table name, a batch size out of
+  range) never blocks it.
   Only `run` validates the whole row. The auth block is parsed inside the action (not in
   `Component.__init__`), so its validation error reaches the UI through the sync-action error path
   (stderr, exit 1).
@@ -560,7 +560,7 @@ unmet (writer precedent, passed its Phase-7 fresh-config gate); the model defaul
 | `session_enabled`, `stop_at_job_start`, `advanced_options` | checkbox | |
 | integers | number input with `minimum` / `maximum` | |
 | `table_name` | text | placeholder = derived name pattern |
-| buttons | `format: test-connection` (root + row), sync-action buttons for preview / entity details | Title Case labels |
+| buttons | `format: test-connection` (root only), sync-action button **Preview Messages** (row) | Title Case labels |
 | sections | `source` (`grid-strict`, 2 per row), `limits`, `body`, `destination`, `advanced` — named `type: object` sections | |
 
 Recurring review catches, pre-decided: two separate pickers for Load Type and Fetch Mode (Fetch Mode
@@ -830,7 +830,7 @@ another application's deferrals.
   cursor-mode peek (no explicit sequence number, verified to visit all partitions [live]); session
   entities loop `NEXT_AVAILABLE_SESSION` receivers opened with the fixed internal
   `SESSION_ACCEPT_WAIT_SECONDS = 5` (not `idle_timeout_seconds`, which is hidden and ignored in peek
-  mode — a hidden field never drives behaviour; `testConnection` / `previewMessages` use the same
+  mode — a hidden field never drives behaviour; `previewMessages` uses the same
   constant) (each session's receiver peeks from its start; sessions
   locked by other consumers are skipped and deferred-only sessions are invisible — WARNING once per
   run; the peek briefly holds the session lock [live]). The watermark on partitioned / session
@@ -1100,9 +1100,9 @@ state):
 
 | Module | Responsibility |
 |---|---|
-| `src/configuration.py` | Pydantic v2 models: `AuthConfiguration` (flat root auth fields, writer's `_validate_auth`), `SourceConfig`, `LimitsConfig`, `BodyConfig`, `DestinationConfig`, `AdvancedConfig`, `Configuration` (merged root + row); `StrEnum`s for every enum; `extra="ignore"`; `ValidationError` → `UserException` with field paths; §5.3 validators. Partial models: `AuthConfiguration` (list actions, root `testConnection`), `SyncActionConfiguration` (auth + a possibly partial `source`: `testConnection`'s root-vs-row branch, `listSubscriptions`' topic), `EntityConfiguration` (auth + the validated, normalised `source`: row `testConnection`, `previewMessages`, `entityInfo`), `Configuration` (extends `EntityConfiguration`; `run` only). |
+| `src/configuration.py` | Pydantic v2 models: `AuthConfiguration` (flat root auth fields, writer's `_validate_auth`), `SourceConfig`, `LimitsConfig`, `BodyConfig`, `DestinationConfig`, `AdvancedConfig`, `Configuration` (merged root + row); `StrEnum`s for every enum; `extra="ignore"`; `ValidationError` → `UserException` with field paths; §5.3 validators. Partial models: `AuthConfiguration` (list actions, `testConnection`), `SyncActionConfiguration` (auth + a possibly partial `source`: `listSubscriptions`' topic), `EntityConfiguration` (auth + the validated, normalised `source`: `previewMessages`), `Configuration` (extends `EntityConfiguration`; `run` only). |
 | `src/client.py` | `ServiceBusConnector` — credential factory (SAS / SP), `receive_client()`, `commit_client()` (`retry_total=0`), `admin_client()`, `user_agent`; `redact_secrets`, `to_user_exception` (§6.11). Pyamqp only. |
-| `src/entity.py` | `EntityRef` (entity type, names, sub-queue → receiver kwargs, entity path, derived table name, state key); `EntityInfo` (L2 metadata or heuristics: sessions, partitioning, lock duration, max delivery count); `partition_of(seq)`; management helpers for the dropdowns and `entityInfo`. |
+| `src/entity.py` | `EntityRef` (entity type, names, sub-queue → receiver kwargs, entity path, derived table name, state key); `EntityInfo` (L2 metadata or heuristics: sessions, partitioning, lock duration, max delivery count); `partition_of(seq)`; management helpers for the dropdowns and the root `testConnection`. |
 | `src/receiver.py` | `ReceiveLoop` — batches, sessions loop, stop conditions, lock renewal, stop drain, recycling with cap + no-progress guard, catch-up wait; the helpers it shares with the peek pager: `RecoveryTracker`, `StopReason`, receiver profile (§6.2), open / close / session-renew helpers, the watermark test. |
 | `src/peek.py` | `PeekPager` — C4 incremental / full paging, partition / session variants, expired and pending-scheduled skips (§6.7). |
 | `src/settlement.py` | `Settler` per mode (`complete`, `defer` → pending set, `none`); `UnreadableHandler` (abandon / dead-letter / leave / fail, suspect tracking, sub-queue degradation, abort share); `BatchProcessor` — the per-batch pipeline shared by the receive loop, the orphan recovery and the peek pager: map rows → write + flush → settle. |
@@ -1144,7 +1144,7 @@ broker. The management client is HTTP (VCR-recordable in principle) but is mocke
 no tenant ids in cassettes. Real AMQP behaviour is proven live in Phase 7.
 
 **Files:** `tests/fakes/broker.py` (the double) + `tests/conftest.py`; `tests/unit/test_*.py`;
-`tests/functional/` = `conftest.py` (datadir harness), `test_sync_actions.py` (cases 01–16),
+`tests/functional/` = `conftest.py` (datadir harness), `test_sync_actions.py` (cases 01–14),
 `test_runs.py` (20–45), `test_bodies_and_robustness.py` (46–69), `test_sanitisation.py`, `expected/`.
 
 **Fixtures:** `tests/setup/configs.json` (wrapped format, dummy credentials only; real values only in
@@ -1156,10 +1156,10 @@ only dummies may appear, and surfaced errors must be redacted.
 
 | Case | Kind | Covers |
 |---|---|---|
-| `01_testConnection_queue` | sync ok | I1, SAS, peek 1, nothing locked |
+| `01_testConnection_manage_sas_ignores_source` | sync ok | I1, root probe with a Manage SAS; a row source is ignored, no receiver opened, nothing locked |
 | `02_testConnection_bad_conn_string` | sync fail | malformed SAS → redacted `UserException` |
-| `03_testConnection_auth_or_missing` | sync fail | `ServiceBusAuthenticationError` → J1 wording incl. IP firewall |
-| `04_testConnection_session_empty` | sync ok | session entity, `OperationTimeoutError` → "no session available" |
+| `03_previewMessages_auth_or_missing` | sync fail | `ServiceBusAuthenticationError` on the receiver → J1 wording incl. IP firewall |
+| `04_previewMessages_session_empty` | sync ok | session entity, `OperationTimeoutError` → "no messages to preview" |
 | `05_testConnection_root_sp` | sync ok | root context, SP, management listing |
 | `06_testConnection_root_listen_sas` | sync fail | root context, 401 → guidance message |
 | `07_listQueues_sp` | sync ok | I2 |
@@ -1170,8 +1170,6 @@ only dummies may appear, and surfaced errors must be redacted.
 | `12_listSubscriptions_missing_topic` | sync fail | not found → `UserException` |
 | `13_previewMessages` | sync ok | I3, markdown table, nothing settled |
 | `14_previewMessages_missing_entity` | sync fail | J1 |
-| `15_entityInfo_sp` | sync ok | I4 incl. rules |
-| `16_entityInfo_listen_sas` | sync fail | needs Manage / Data Receiver |
 | `20_run_c1_queue` | run | C1, fixed schema golden output, manifest (schema, PK, incremental, `write_always` true after the first complete, `has_header`), completes |
 | `21_run_c1_subscription_sp` | run | A2, B2; variant `credentials_rejected`: the run fails (exit 1) with the credentials message, nothing received |
 | `22_run_c2_first_run_defers` | run | C2 defer, pending set ranges in state |
@@ -1468,3 +1466,4 @@ differ):**
 | P4-8 | (Phase 7: `KBC_BRANCHID` is set on default-branch jobs too on current stacks — a default-branch C3 job was refused; the platform exposes no branch type / name / default flag and, without `forward_token`, the default branch id cannot be resolved.) The automatic dev-branch guard and the hidden `destructive_in_branch` override are removed; every mode runs in every branch. Documented instead: a dev branch reads the same production entity — use Peek or a separate test entity in branches; admins can enable `dev-branch-configuration-unsafe`. The keboola-context `environment-variables.md` claim "absent on the default branch" is wrong on current stacks | §2.5, §4-J11, §5.2, §5.5, §6.1, §6.11, §8, §9, §12 |
 | P4-9 | (Phase-8 audit follow-up.) A malformed service-principal `tenant_id` makes azure-identity's `ClientSecretCredential` raise `ValueError` before any network call; it is mapped to a `UserException` in the connector's credential builder (a third known `ValueError` source) instead of exiting 2 | §6.11 |
 | P4-10 | (Phase 8, maintainer report: a row-level **Test Connection** answered "Internal Server Error" while Preview Messages worked.) Not reproducible afterwards with the same payload (local, production image, platform UI); the namespace was throttled during a concurrent 1M-message drain at the time. The component can only exit 0 / 1 inside a sync action, so an HTTP 500 means the action outlived the platform's 30-second limit. Every sync action now gives up after 20 seconds with a user error (§5.4); the UI's use of `runtime.tag` for sync actions is recorded as verified | §5.4 |
+| P4-11 | (Phase 8, maintainer decision.) The row form's **Test Connection** and **Show Entity Details** buttons are removed, and so is the `entityInfo` action; `testConnection` is the root management probe only (a row source is ignored) and a Listen-only SAS is pointed at the row's **Preview Messages**, which proves entity access | §4-I, §5.2, §5.4, §5.6, §8 |

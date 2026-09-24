@@ -10,7 +10,6 @@ from configuration import AuthConfiguration, SourceConfig
 from entity import (
     EntityInfo,
     EntityRef,
-    describe_entity,
     list_entity_names,
     load_entity_info,
     partition_of,
@@ -122,13 +121,6 @@ def test_list_names_sp_denied_is_user_exception(broker):
         list_entity_names(connector("service_principal"), "topics")
 
 
-def test_describe_entity_denied(broker):
-    broker.add_queue("q")
-    broker.management_denied = True
-    with pytest.raises(UserException, match="Manage"):
-        describe_entity(connector(), EntityRef.from_source(SourceConfig(entity_type="queue", queue_name="q")))
-
-
 # --- service-principal token failures vs. authorization denials (spec §6.11, J7) ----------------------
 
 SP_SECRET = "sp-s3cr3t"
@@ -170,11 +162,6 @@ def test_probe_management_sp_credentials_rejected(broker):
     assert user_error(lambda: probe_management(sp_connector())) == CREDENTIALS_REJECTED
 
 
-def test_describe_entity_sp_credentials_rejected(broker):
-    reject_credentials(broker)
-    assert user_error(lambda: describe_entity(sp_connector(), QUEUE)) == CREDENTIALS_REJECTED
-
-
 @pytest.mark.parametrize("kind", ["queues", "topics"])
 def test_list_names_sp_credentials_rejected(broker, kind):
     reject_credentials(broker)
@@ -201,19 +188,9 @@ def test_probe_management_sp_forbidden_names_the_role_with_details(broker):
 def test_probe_management_listen_sas_with_details(broker):
     broker.management_denied = True
     assert user_error(lambda: probe_management(connector())) == (
-        "A connection string with only Listen rights can be tested only from a row that has a source selected. "
-        + DENIED_DETAILS
-    )
-
-
-@pytest.mark.parametrize("auth_type", ["connection_string", "service_principal"])
-def test_describe_entity_denied_names_manage_and_role_with_details(broker, auth_type):
-    broker.add_queue("q")
-    broker.management_denied = True
-    conn = connector() if auth_type == "connection_string" else sp_connector()
-    assert user_error(lambda: describe_entity(conn, QUEUE)) == (
-        "Entity details need a connection string with Manage rights or a service principal with the "
-        "'Azure Service Bus Data Receiver' role. " + DENIED_DETAILS
+        "The connection string has no Manage rights, so it cannot read the namespace's management data and "
+        "cannot be tested here. Listen rights are enough to extract: use Preview Messages in a row to check "
+        "that it can read the entity. " + DENIED_DETAILS
     )
 
 
@@ -263,15 +240,6 @@ def test_probe_management_real_sdk_credentials_rejected(msal_app, detail):
         "The service principal credentials were rejected (check tenant ID, client ID and client secret). "
         f"(details: Authentication failed: {detail})"
     )
-
-
-def test_describe_entity_subscription_lists_rules(broker):
-    # regression: the same missing-attribute bug used to raise AttributeError (exit 2) for every
-    # subscription, uncaught, before the markdown could be built.
-    broker.add_subscription("t", "s").add_rule("big", "amount > 100")
-    ref = EntityRef.from_source(SourceConfig(entity_type="subscription", topic_name="t", subscription_name="s"))
-    markdown = describe_entity(connector(), ref)
-    assert "big: amount > 100" in markdown
 
 
 def test_open_receiver_entity_path_mismatch(broker):
