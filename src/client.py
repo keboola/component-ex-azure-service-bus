@@ -322,6 +322,13 @@ class ServiceBusConnector:
         """The data-plane client used for every receive / peek / settle (SDK default retries)."""
         return self._data_client({})
 
+    def session_probe_client(self) -> ServiceBusClient:
+        """A data-plane client with ``retry_total=0`` for a sync action's ``NEXT_AVAILABLE_SESSION``
+        peek: the SDK retries a timed-out session accept (``OperationTimeoutError``) three times with
+        backoff, which turns the 5-second accept wait on an entity without an available session into
+        ~34 s [live] -- past the platform's 30-second sync-action limit."""
+        return self._data_client({"retry_total": 0})
+
     def commit_client(self) -> ServiceBusClient:
         """A dedicated data-plane client for ``receive_deferred_messages`` with ``retry_total=0``
         (§6.2 -- never passed as a ``get_*_receiver`` kwarg, which raises ``TypeError`` on 7.14.3)."""

@@ -407,6 +407,10 @@ def test_preview_messages_empty_entity(broker, tmp_path, monkeypatch, capsys, se
         "type": "info",
         "status": "success",
     }
+    # Regression (Phase 8, live): the SDK's default retries turned a session accept that finds no
+    # session into ~34 s -- past the platform's 30-second limit -- so the session peek never retries.
+    (client,) = broker.clients
+    assert client.kwargs.get("retry_total") == (0 if sessions else None)
 
 
 def test_preview_messages_session_entity_releases_the_session(broker, tmp_path, monkeypatch, capsys):

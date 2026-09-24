@@ -415,8 +415,10 @@ class Component(ComponentBase):
         }
         if sessions:
             kwargs |= {"session_id": NEXT_AVAILABLE_SESSION, "max_wait_time": SESSION_ACCEPT_WAIT_SECONDS}
+        # A session accept that finds no session must fail after one wait, not after four (spec §5.4).
+        client_factory = self._connector.session_probe_client if sessions else self._connector.receive_client
         try:
-            with self._connector.receive_client() as client, entity.open_receiver(client, **kwargs) as receiver:
+            with client_factory() as client, entity.open_receiver(client, **kwargs) as receiver:
                 return receiver.peek_messages(max_message_count)
         except OperationTimeoutError as e:
             if sessions:
