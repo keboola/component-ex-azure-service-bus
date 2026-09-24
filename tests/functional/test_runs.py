@@ -80,6 +80,18 @@ def test_21_run_c1_subscription_sp(fake_broker, tmp_path, monkeypatch, capsys):
     assert s.sequence_numbers() == []
 
 
+def test_21_run_c1_subscription_sp_credentials_rejected(fake_broker, tmp_path, monkeypatch, capsys):
+    """Variant of case 21: Entra ID rejects the secret; the run fails with the credentials message."""
+    s = fake_broker.add_subscription("t", "s")
+    s.send(b"a")
+    fake_broker.credential_failure = "AADSTS7000215: Invalid client secret provided."
+    result = run_case("21_run_c1_subscription_sp", tmp_path, monkeypatch, capsys)
+    assert result.exit_code == 1
+    assert "The service principal credentials were rejected" in result.stderr and "AADSTS7000215" in result.stderr
+    assert result.tables["t_s.csv"] == [] and result.state is None
+    assert s.sequence_numbers() == [1] and s.delivery_count(1) == 0
+
+
 def test_22_run_c2_first_run_defers(fake_broker, tmp_path, monkeypatch, capsys):
     q = fake_broker.add_queue("q")
     seqs = [q.send(f"m{i}".encode()) for i in range(3)]

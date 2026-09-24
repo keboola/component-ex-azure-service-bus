@@ -1,7 +1,9 @@
 from unittest import mock
 
+import msal
 import pytest
 from azure.core.exceptions import AzureError, ClientAuthenticationError, HttpResponseError, ResourceNotFoundError
+from azure.identity import ClientSecretCredential, CredentialUnavailableError
 from azure.servicebus.exceptions import (
     MessagingEntityDisabledError,
     MessagingEntityNotFoundError,
@@ -13,7 +15,14 @@ from azure.servicebus.exceptions import (
 from keboola.component.exceptions import UserException
 
 import client as client_mod
-from client import USER_AGENT, ServiceBusConnector, is_management_denied, redact_secrets, to_user_exception
+from client import (
+    USER_AGENT,
+    ServiceBusConnector,
+    is_credential_failure,
+    is_management_denied,
+    redact_secrets,
+    to_user_exception,
+)
 from configuration import AuthConfiguration, AuthType
 
 SAS = "Endpoint=sb://ns.servicebus.windows.net/;SharedAccessKeyName=k;SharedAccessKey=c2VjcmV0"
@@ -143,7 +152,136 @@ def test_management_denied():
     denied = HttpResponseError("nope")
     denied.status_code = 401
     assert is_management_denied(denied)
+    forbidden = HttpResponseError("nope")
+    forbidden.status_code = 403
+    assert is_management_denied(forbidden)
     assert not is_management_denied(ValueError("x"))
+
+
+# --- service-principal token failures vs. authorization denials (spec §6.11, J7) ----------------------
+
+AADSTS_EXPIRED = "AADSTS7000222: The provided client secret keys for app 'c' are expired."
+UNKNOWN_TENANT = (
+    "Unable to get authority configuration for https://login.microsoftonline.com/t. Authority would typically be "
+    "in a format of https://login.microsoftonline.com/your_tenant. Also please double check your tenant name or "
+    "GUID is correct."
+)
+CREDENTIALS_REJECTED = (
+    "The service principal credentials were rejected (check tenant ID, client ID and client secret). (details: "
+)
+SCOPE = "https://servicebus.azure.net/.default"
+
+
+class _RejectingMsalApp:
+    """Stand-in for ``msal.ConfidentialClientApplication``: no cached token, and the token request
+    fails with the error response Entra ID sends for an expired secret."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        pass
+
+    def acquire_token_silent_with_error(self, *args, **kwargs) -> None:
+        return None
+
+    def acquire_token_for_client(self, *args, **kwargs) -> dict[str, str]:
+        return {"error": "invalid_client", "error_description": AADSTS_EXPIRED}
+
+
+def identity_error(app_class) -> ClientAuthenticationError:
+    """The error the real ``ClientSecretCredential.get_token`` raises when MSAL (faked, offline)
+    fails the way ``app_class`` does."""
+    credential = ClientSecretCredential("t", "c", "s3cr3t")
+    with (
+        mock.patch.object(msal, "ConfidentialClientApplication", app_class),
+        pytest.raises(ClientAuthenticationError) as caught,
+    ):
+        credential.get_token(SCOPE)
+    return caught.value
+
+
+def data_plane(error: ClientAuthenticationError) -> ServiceBusError:
+    """How pyamqp surfaces a credential error on the data plane (``create_servicebus_exception``)."""
+    return ServiceBusError(message=f"Handler failed: {error}.", error=error)
+
+
+def test_real_identity_errors_are_credential_failures():
+    rejected = identity_error(_RejectingMsalApp)
+    assert str(rejected) == f"Authentication failed: {AADSTS_EXPIRED}"
+    # an unknown tenant fails in MSAL's authority discovery: azure-identity wraps it, no AADSTS code
+    unknown_tenant = identity_error(mock.Mock(side_effect=ValueError(UNKNOWN_TENANT)))
+    assert str(unknown_tenant) == f"Authentication failed: {UNKNOWN_TENANT}"
+    for error in (rejected, unknown_tenant):
+        assert is_credential_failure(error) and is_credential_failure(data_plane(error))
+        assert not is_management_denied(error)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ClientAuthenticationError(message=f"Authentication failed: {AADSTS_EXPIRED}"),
+        CredentialUnavailableError(message="ClientSecretCredential is unavailable."),
+        data_plane(ClientAuthenticationError(message=f"Authentication failed: {AADSTS_EXPIRED}")),
+    ],
+    ids=["management_aadsts", "credential_unavailable", "data_plane_aadsts"],
+)
+def test_credential_failures_are_recognised(error):
+    assert is_credential_failure(error)
+    assert not is_management_denied(error)
+
+
+def _status(error: HttpResponseError, status_code: int) -> HttpResponseError:
+    error.status_code = status_code
+    return error
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ClientAuthenticationError(message="Unauthorized access. 'Manage,EntityRead' claims required."),
+        _status(HttpResponseError(message="Unauthorized"), 401),
+        _status(HttpResponseError(message="Forbidden"), 403),
+        ServiceBusAuthenticationError(message="CBS token authentication failed for 'q': unauthorized."),
+        ServiceBusError(message="Handler failed: link detached."),
+        ResourceNotFoundError(message="Queue 'q' does not exist."),
+    ],
+    ids=["management_401_fake", "http_401", "http_403", "cbs_unauthorized", "plain_service_bus", "not_found"],
+)
+def test_endpoint_errors_are_not_credential_failures(error):
+    assert not is_credential_failure(error)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ClientAuthenticationError(message=f"Authentication failed: {AADSTS_EXPIRED} sent s3cr3t"),
+        CredentialUnavailableError(message="ClientSecretCredential is unavailable: s3cr3t"),
+        data_plane(ClientAuthenticationError(message=f"Authentication failed: {AADSTS_EXPIRED} sent s3cr3t")),
+    ],
+    ids=["management_aadsts", "credential_unavailable", "data_plane_aadsts"],
+)
+def test_credential_failure_maps_to_the_credentials_message(error):
+    text = str(to_user_exception(error, "orders", ("s3cr3t",)))
+    assert text == f"{CREDENTIALS_REJECTED}{str(error).replace('s3cr3t', '***')})"
+
+
+def test_real_identity_error_maps_to_the_credentials_message():
+    text = str(to_user_exception(data_plane(identity_error(mock.Mock(side_effect=ValueError(UNKNOWN_TENANT))))))
+    assert text == f"{CREDENTIALS_REJECTED}Handler failed: Authentication failed: {UNKNOWN_TENANT}.)"
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ClientAuthenticationError(message="Unauthorized access. 'Manage,EntityRead' claims required."),
+        _status(HttpResponseError(message="Forbidden"), 403),
+    ],
+    ids=["client_authentication", "http_403"],
+)
+def test_management_denial_keeps_the_role_message_with_details(error):
+    text = str(to_user_exception(error, "orders"))
+    assert text == (
+        "The credentials cannot read the Service Bus management data of 'orders': a service principal needs the "
+        f"'Azure Service Bus Data Receiver' role; a connection string needs Manage rights. (details: {error})"
+    )
 
 
 def test_redacting_filter_masks_log_records():

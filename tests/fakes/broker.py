@@ -19,6 +19,12 @@ Modelling notes beyond the Task-4 table:
   with its unsettled messages.
 - Receivers open on ``__enter__`` or on their first operation, as the SDK does; that is where
   entity and session errors surface (``auth_failure`` also fails every operation of an open one).
+- ``credential_failure`` (an Entra ID error text, e.g. ``"AADSTS7000215: ..."``) fails the service
+  principal's token request as ``ClientSecretCredential`` does: a ``ClientAuthenticationError``
+  "Authentication failed: <text>", raised on every management call (before the endpoint's own
+  authorization) and, wrapped by pyamqp in a plain ``ServiceBusError`` "Handler failed: <error>."
+  whose ``inner_exception`` is that error, when an SP receiver opens [SDK source, 7.14.3 / identity
+  1.25]. SAS clients are unaffected.
 - A lock is lapsed when ``locked_until <= now``, the SDK's client-side rule.
 - Settles are pre-settled as on 7.14.3: the SDK's client-side checks raise; anything the broker
   would reject (a stale lock token, dead-lettering a sub-queue message) is silently ignored.
@@ -104,6 +110,7 @@ _MIXED_PARTITIONS = (
 )
 _RAD_LIMIT = "ReceiveAndDelete only can process 250 deferred messages"
 _UNAUTHORIZED = "CBS token authentication failed for '{}': unauthorized."
+_SERVICE_BUS_SCOPE = "https://servicebus.azure.net/.default"
 
 # Public ServiceBusReceivedMessage attributes (besides sequence_number / body / locks) and their defaults.
 _ATTRIBUTES: dict[str, Any] = {
@@ -1107,6 +1114,7 @@ class FakeReceiver:
         """Attach the link: resolve the entity, authenticate and accept the session (once)."""
         if self._entity is not None:
             return self._entity
+        self._authenticate()
         entity = self._broker._resolve(self)
         if entity.requires_session and self._session is None:
             raise ServiceBusError(_REQUIRES_SESSIONS)
@@ -1116,6 +1124,17 @@ class FakeReceiver:
             entity._accept_session(self, self._session)
         self._entity = entity
         return entity
+
+    def _authenticate(self) -> None:
+        """An SP client's CBS handshake asks the credential for a token first; pyamqp wraps any error
+        it raises in a plain ``ServiceBusError`` (``create_servicebus_exception``, "Handler failed")."""
+        credential = self.client.credential
+        if credential is None or self._broker.credential_failure is None:
+            return
+        try:
+            credential.get_token(_SERVICE_BUS_SCOPE)
+        except ClientAuthenticationError as error:
+            raise ServiceBusError(message=f"Handler failed: {error}.", error=error) from None
 
     def _session_filter(self) -> str | None:
         return None if self._session is None else str(self._session.session_id)
@@ -1296,6 +1315,8 @@ class FakeAdminClient:
 
     def _call(self, operation: str, path: str) -> None:
         self._broker.admin_calls.append((operation, path))
+        if self.credential is not None and self._broker.credential_failure is not None:
+            self.credential.get_token(_SERVICE_BUS_SCOPE)  # the bearer-token policy runs before the request
         if self._broker.management_denied:
             raise ClientAuthenticationError(message="Unauthorized access. 'Manage,EntityRead' claims required.")
         if self._broker.management_error is not None:
@@ -1386,7 +1407,8 @@ def _subscription_properties(name: str, entity: FakeEntity) -> FakeSubscriptionP
 
 
 class FakeCredential:
-    """Stand-in for ``ClientSecretCredential`` (real argument checks, offline); never fetches a token."""
+    """Stand-in for ``ClientSecretCredential`` (real argument checks, offline); never fetches a token --
+    it only fails one, as the real credential does, while ``broker.credential_failure`` is set."""
 
     broker: ClassVar[FakeBroker | None] = None
 
@@ -1399,7 +1421,11 @@ class FakeCredential:
         _installed(FakeCredential).credentials.append(self)
 
     def get_token(self, *scopes: str, **kwargs: Any) -> Any:
-        raise AssertionError("FakeCredential never fetches a token: the tests are offline")
+        failure = _installed(FakeCredential).credential_failure
+        if failure is None:
+            raise AssertionError("FakeCredential never fetches a token: the tests are offline")
+        # ClientCredentialBase._request_token's text for an Entra ID error response
+        raise ClientAuthenticationError(message=f"Authentication failed: {failure}")
 
     def close(self) -> None:
         pass
@@ -1418,6 +1444,7 @@ class FakeBroker:
         self.clock = clock or FakeClock()
         self.auth_failure = False  # data-plane receivers raise ServiceBusAuthenticationError (open or not)
         self.management_denied = False  # admin calls raise ClientAuthenticationError
+        self.credential_failure: str | None = None  # Entra ID error text: SP token requests fail (see module doc)
         self.management_error: Exception | None = None  # admin calls raise this
         self.calls: list[tuple[str, str]] = []  # (data-plane operation, entity path)
         self.admin_calls: list[tuple[str, str]] = []

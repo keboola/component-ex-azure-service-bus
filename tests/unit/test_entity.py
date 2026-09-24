@@ -1,9 +1,21 @@
+from unittest import mock
+
+import msal
 import pytest
+from azure.core.exceptions import HttpResponseError
 from keboola.component.exceptions import UserException
 
 from client import ServiceBusConnector
 from configuration import AuthConfiguration, SourceConfig
-from entity import EntityInfo, EntityRef, describe_entity, list_entity_names, load_entity_info, partition_of
+from entity import (
+    EntityInfo,
+    EntityRef,
+    describe_entity,
+    list_entity_names,
+    load_entity_info,
+    partition_of,
+    probe_management,
+)
 
 SAS = "Endpoint=sb://ns.servicebus.windows.net/;SharedAccessKeyName=k;SharedAccessKey=c2VjcmV0"
 
@@ -115,6 +127,142 @@ def test_describe_entity_denied(broker):
     broker.management_denied = True
     with pytest.raises(UserException, match="Manage"):
         describe_entity(connector(), EntityRef.from_source(SourceConfig(entity_type="queue", queue_name="q")))
+
+
+# --- service-principal token failures vs. authorization denials (spec §6.11, J7) ----------------------
+
+SP_SECRET = "sp-s3cr3t"
+AADSTS_INVALID = "AADSTS7000215: Invalid client secret provided."
+CREDENTIALS_REJECTED = (
+    "The service principal credentials were rejected (check tenant ID, client ID and client secret). "
+    f"(details: Authentication failed: {AADSTS_INVALID} sent ***)"
+)
+DENIED_DETAILS = "(details: Unauthorized access. 'Manage,EntityRead' claims required.)"
+QUEUE = EntityRef.from_source(SourceConfig(entity_type="queue", queue_name="q"))
+
+
+def sp_connector() -> ServiceBusConnector:
+    auth = AuthConfiguration(
+        **{
+            "auth_type": "service_principal",
+            "tenant_id": "t",
+            "client_id": "c",
+            "#client_secret": SP_SECRET,
+            "fully_qualified_namespace": "ns.servicebus.windows.net",
+        }
+    )
+    return ServiceBusConnector(auth, "kbc-test")
+
+
+def reject_credentials(broker) -> None:
+    broker.add_queue("q")
+    broker.credential_failure = f"{AADSTS_INVALID} sent {SP_SECRET}"  # the secret proves the redaction
+
+
+def user_error(call) -> str:
+    with pytest.raises(UserException) as caught:
+        call()
+    return str(caught.value)
+
+
+def test_probe_management_sp_credentials_rejected(broker):
+    reject_credentials(broker)
+    assert user_error(lambda: probe_management(sp_connector())) == CREDENTIALS_REJECTED
+
+
+def test_describe_entity_sp_credentials_rejected(broker):
+    reject_credentials(broker)
+    assert user_error(lambda: describe_entity(sp_connector(), QUEUE)) == CREDENTIALS_REJECTED
+
+
+@pytest.mark.parametrize("kind", ["queues", "topics"])
+def test_list_names_sp_credentials_rejected(broker, kind):
+    reject_credentials(broker)
+    assert user_error(lambda: list_entity_names(sp_connector(), kind)) == CREDENTIALS_REJECTED
+
+
+def test_probe_management_sp_denied_names_the_role_with_details(broker):
+    broker.management_denied = True
+    assert user_error(lambda: probe_management(sp_connector())) == (
+        "The service principal cannot read the namespace: grant it the 'Azure Service Bus Data Receiver' role. "
+        + DENIED_DETAILS
+    )
+
+
+def test_probe_management_sp_forbidden_names_the_role_with_details(broker):
+    forbidden = HttpResponseError(message="Forbidden")
+    forbidden.status_code = 403
+    broker.management_error = forbidden
+    assert user_error(lambda: probe_management(sp_connector())).endswith(
+        "grant it the 'Azure Service Bus Data Receiver' role. (details: Forbidden)"
+    )
+
+
+def test_probe_management_listen_sas_with_details(broker):
+    broker.management_denied = True
+    assert user_error(lambda: probe_management(connector())) == (
+        "A connection string with only Listen rights can be tested only from a row that has a source selected. "
+        + DENIED_DETAILS
+    )
+
+
+@pytest.mark.parametrize("auth_type", ["connection_string", "service_principal"])
+def test_describe_entity_denied_names_manage_and_role_with_details(broker, auth_type):
+    broker.add_queue("q")
+    broker.management_denied = True
+    conn = connector() if auth_type == "connection_string" else sp_connector()
+    assert user_error(lambda: describe_entity(conn, QUEUE)) == (
+        "Entity details need a connection string with Manage rights or a service principal with the "
+        "'Azure Service Bus Data Receiver' role. " + DENIED_DETAILS
+    )
+
+
+def test_list_names_sp_denied_names_the_role_with_details(broker):
+    broker.management_denied = True
+    text = user_error(lambda: list_entity_names(sp_connector(), "topics"))
+    assert "'Azure Service Bus Data Receiver' role" in text and text.endswith(DENIED_DETAILS)
+
+
+class _RejectingMsalApp:
+    """``msal.ConfidentialClientApplication`` failing the token request as Entra ID does for a bad secret."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        pass
+
+    def acquire_token_silent_with_error(self, *args, **kwargs) -> None:
+        return None
+
+    def acquire_token_for_client(self, *args, **kwargs) -> dict[str, str]:
+        return {"error": "invalid_client", "error_description": AADSTS_INVALID}
+
+
+UNKNOWN_TENANT = "Unable to get authority configuration for https://login.microsoftonline.com/t."
+
+
+@pytest.mark.parametrize(
+    "msal_app, detail",
+    [
+        (_RejectingMsalApp, AADSTS_INVALID),
+        # MSAL's authority discovery fails for an unknown tenant; the text has no AADSTS code
+        (mock.Mock(side_effect=ValueError(UNKNOWN_TENANT)), UNKNOWN_TENANT),
+    ],
+    ids=["invalid_secret", "unknown_tenant"],
+)
+def test_probe_management_real_sdk_credentials_rejected(msal_app, detail):
+    """The real ``ServiceBusAdministrationClient`` + ``ClientSecretCredential`` (no FakeBroker): the
+    management client surfaces the credential's error so the classifier sees it. MSAL is faked and any
+    HTTP send fails the test, so nothing leaves the process."""
+    with (
+        mock.patch.object(msal, "ConfidentialClientApplication", msal_app),
+        mock.patch(
+            "azure.core.pipeline.transport.RequestsTransport.send", side_effect=AssertionError("network access")
+        ),
+    ):
+        text = user_error(lambda: probe_management(sp_connector()))
+    assert text == (
+        "The service principal credentials were rejected (check tenant ID, client ID and client secret). "
+        f"(details: Authentication failed: {detail})"
+    )
 
 
 def test_describe_entity_subscription_lists_rules(broker):

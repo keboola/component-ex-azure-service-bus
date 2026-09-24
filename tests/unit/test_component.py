@@ -374,6 +374,25 @@ def test_test_connection_maps_sdk_errors_without_secrets(broker, tmp_path, monke
     assert err.startswith("Authentication to Azure Service Bus failed for 'q'") and "c2VjcmV0" not in err
 
 
+def test_test_connection_sp_credentials_rejected(broker, tmp_path, monkeypatch, capsys):
+    broker.add_queue("q")
+    broker.credential_failure = "AADSTS700016: Application with identifier 'c' was not found in the directory."
+    params = {
+        "auth_type": "service_principal",
+        "tenant_id": "t",
+        "client_id": "c",
+        "#client_secret": "sp-s3cr3t",
+        "fully_qualified_namespace": "ns.servicebus.windows.net",
+        "source": PARAMS["source"],
+    }
+    err = sync_failure(capsys, component(tmp_path, monkeypatch, params, action="testConnection"))
+    assert err == (
+        "The service principal credentials were rejected (check tenant ID, client ID and client secret). (details: "
+        "Handler failed: Authentication failed: AADSTS700016: Application with identifier 'c' was not found in the "
+        "directory..)"
+    )
+
+
 def test_test_connection_missing_entity(broker, tmp_path, monkeypatch, capsys):
     broker.add_topic("t")
     params = {**PARAMS, "source": {"entity_type": "subscription", "topic_name": "t", "subscription_name": "s"}}

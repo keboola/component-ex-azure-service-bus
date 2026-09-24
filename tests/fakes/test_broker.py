@@ -737,3 +737,41 @@ def test_subscription_runtime_properties_has_no_scheduled_message_count(broker):
     admin = client_mod.ServiceBusAdministrationClient.from_connection_string(SAS)
     assert hasattr(admin.get_queue_runtime_properties("q"), "scheduled_message_count")
     assert not hasattr(admin.get_subscription_runtime_properties("t", "s"), "scheduled_message_count")
+
+
+# --- Phase 8: service-principal token failures ------------------------------------------------------
+
+CREDENTIAL_FAILURE = "AADSTS7000222: The provided client secret keys for app 'c' are expired."
+
+
+def sp_admin():
+    credential = client_mod.ClientSecretCredential("t", "c", "x")
+    return client_mod.ServiceBusAdministrationClient(
+        fully_qualified_namespace="ns.servicebus.windows.net", credential=credential
+    )
+
+
+def test_credential_failure_fails_the_sp_token_on_both_planes(broker):
+    broker.add_queue("q").send(b"a")
+    broker.credential_failure = CREDENTIAL_FAILURE
+    broker.management_denied = True  # the token is requested first: the endpoint never sees the call
+    with pytest.raises(ClientAuthenticationError) as management:
+        list(sp_admin().list_queues())
+    assert str(management.value) == f"Authentication failed: {CREDENTIAL_FAILURE}"  # ClientSecretCredential's text
+    receiver = sp_client().get_queue_receiver("q", prefetch_count=1, keep_alive=0)
+    with pytest.raises(ServiceBusError) as data:
+        receiver.__enter__()
+    # pyamqp wraps the credential's error in a plain ServiceBusError ("Handler failed: ...") [SDK source]
+    assert type(data.value) is ServiceBusError
+    assert str(data.value) == f"Handler failed: Authentication failed: {CREDENTIAL_FAILURE}."
+    assert isinstance(data.value.inner_exception, ClientAuthenticationError)
+    assert broker.calls == []  # no data-plane operation reached the broker
+
+
+def test_credential_failure_spares_sas_clients(broker):
+    broker.add_queue("q").send(b"a")
+    broker.credential_failure = CREDENTIAL_FAILURE
+    admin = client_mod.ServiceBusAdministrationClient.from_connection_string(SAS)
+    assert [queue.name for queue in admin.list_queues()] == ["q"]
+    with sas_client().get_queue_receiver("q", prefetch_count=1, keep_alive=0) as receiver:
+        assert len(receiver.peek_messages(1)) == 1

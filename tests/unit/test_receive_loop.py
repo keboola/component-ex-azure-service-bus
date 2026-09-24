@@ -592,3 +592,13 @@ def test_tracker_fatal_errors_are_mapped_not_counted():
     assert tracker.count == 0
     tracker.failure(SessionLockLostError())  # a lapsed session lock is recycled, not fatal
     assert tracker.count == 1
+
+
+def test_tracker_credential_failures_are_mapped_not_counted():
+    from azure.core.exceptions import ClientAuthenticationError
+
+    token_error = ClientAuthenticationError(message="Authentication failed: AADSTS7000222: expired secret keys.")
+    tracker = RecoveryTracker(entity_path="q")
+    with pytest.raises(UserException, match="^The service principal credentials were rejected"):
+        tracker.failure(ServiceBusError(message=f"Handler failed: {token_error}.", error=token_error))
+    assert tracker.count == 0

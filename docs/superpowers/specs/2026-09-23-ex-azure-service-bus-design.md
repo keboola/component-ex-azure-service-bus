@@ -1029,9 +1029,9 @@ another application's deferrals.
 | missing Listen / Data Receiver | `ServiceBusAuthorizationError` | `UserException` naming the right |
 | missing subscription | `MessagingEntityNotFoundError` | `UserException` |
 | entity `ReceiveDisabled` | `MessagingEntityDisabledError` | `UserException` |
-| management call denied (SP without Data Receiver, SAS without Manage) / unknown topic | `ClientAuthenticationError`, `HttpResponseError` 401 / 403 / `ResourceNotFoundError` (azure.core) | `UserException` naming the Data Receiver role / Manage rights, or "not found" (a Listen-only SAS listing returns `[]` instead, §5.4) |
+| management call denied (SP without Data Receiver, SAS without Manage) / unknown topic — the endpoint's own 401 / 403, never a token failure (next rows) | `ClientAuthenticationError`, `HttpResponseError` 401 / 403 / `ResourceNotFoundError` (azure.core) | `UserException` naming the Data Receiver role / Manage rights, or "not found", always with `(details: …)` (a Listen-only SAS listing returns `[]` instead, §5.4) |
 | unknown namespace host | `ServiceBusConnectionError` at connect | `UserException` "cannot reach namespace" |
-| SP wrong secret | `ServiceBusError` "Authentication failed: AADSTS…" | `UserException` (redacted) |
+| SP credentials rejected — wrong / expired secret, unknown client ID or tenant (the Entra ID token cannot be acquired) | data plane: plain `ServiceBusError` "Handler failed: Authentication failed: AADSTS…" [live: "Authentication failed: AADSTS…"; the "Handler failed" wrapper and its `inner_exception` = the credential's error per SDK source]; management plane: azure-identity's `ClientAuthenticationError` "Authentication failed: AADSTS…" re-raised unchanged (an unknown tenant fails in MSAL's authority discovery with no AADSTS code), or `CredentialUnavailableError` [SDK source, identity 1.25] | `UserException` "The service principal credentials were rejected (check tenant ID, client ID and client secret). (details: …)" on every path — sync actions, the pre-checks and runs (never recycled). `client.is_credential_failure` recognises it (an AADSTS code, `CredentialUnavailableError`, or raised inside azure-identity, following `inner_exception`); `is_management_denied` excludes it, so it is never reported as a missing role |
 | session entity without `session_enabled` (or the reverse) | `ServiceBusError` text / L2 mismatch | `UserException` "enable / disable Sessions" |
 | refused combinations (J10), state version, table name, flatten cap, unreadable share, commit retries exhausted, recoveries exhausted on a `ServiceBusError` | component checks | `UserException` |
 | `MessageLockLostError` on settle; `SessionCannotBeLockedError`; `OperationTimeoutError` (no session) | — | counted / skipped / normal end |
@@ -1141,7 +1141,7 @@ only dummies may appear, and surfaced errors must be redacted.
 | `06_testConnection_root_listen_sas` | sync fail | root context, 401 → guidance message |
 | `07_listQueues_sp` | sync ok | I2 |
 | `08_listQueues_listen_sas_empty` | sync ok | I2 SAS 401 → `[]` |
-| `09_listTopics_sp_auth_failure` | sync fail | SP error → `UserException` |
+| `09_listTopics_sp_auth_failure` | sync fail | SP error → `UserException`; variant `credentials_rejected`: an AADSTS token failure → the credentials message, not the role |
 | `10_listTopics_sp` | sync ok | I2 |
 | `11_listSubscriptions_sp` | sync ok | I2 |
 | `12_listSubscriptions_missing_topic` | sync fail | not found → `UserException` |
@@ -1150,7 +1150,7 @@ only dummies may appear, and surfaced errors must be redacted.
 | `15_entityInfo_sp` | sync ok | I4 incl. rules |
 | `16_entityInfo_listen_sas` | sync fail | needs Manage / Data Receiver |
 | `20_run_c1_queue` | run | C1, fixed schema golden output, manifest (schema, PK, incremental, `write_always` true after the first complete, `has_header`), completes |
-| `21_run_c1_subscription_sp` | run | A2, B2 |
+| `21_run_c1_subscription_sp` | run | A2, B2; variant `credentials_rejected`: the run fails (exit 1) with the credentials message, nothing received |
 | `22_run_c2_first_run_defers` | run | C2 defer, pending set ranges in state |
 | `23_run_c2_second_run_commits` | two-run | H5 commit (RAD, ≤ 250 + byte chunking), new deferrals |
 | `24_run_c2_commit_not_found_bisection` | run | already-gone sequence numbers treated as committed |

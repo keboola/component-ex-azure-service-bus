@@ -5,7 +5,7 @@ are in ``tests/setup/configs.json``. A sync action prints its JSON result on std
 error on stderr (exit 1).
 """
 
-from tests.functional.conftest import DUMMY_SAS_KEY, run_case, sync_result
+from tests.functional.conftest import DUMMY_CLIENT_SECRET, DUMMY_SAS_KEY, run_case, sync_result
 
 
 def _values(payload: object) -> list[str]:
@@ -82,6 +82,16 @@ def test_09_listTopics_sp_auth_failure(fake_broker, tmp_path, monkeypatch, capsy
     result = run_case("09_listTopics_sp_auth_failure", tmp_path, monkeypatch, capsys)
     assert result.exit_code == 1
     assert "Data Receiver" in result.stderr
+
+
+def test_09_listTopics_sp_credentials_rejected(fake_broker, tmp_path, monkeypatch, capsys):
+    """Variant of case 09: Entra ID rejects the secret -- not a missing role (spec §6.11)."""
+    fake_broker.credential_failure = "AADSTS7000222: The provided client secret keys for app 'c' are expired."
+    result = run_case("09_listTopics_sp_auth_failure", tmp_path, monkeypatch, capsys)
+    assert result.exit_code == 1
+    assert result.stderr.startswith("The service principal credentials were rejected")
+    assert "AADSTS7000222" in result.stderr and "Data Receiver" not in result.stderr
+    assert DUMMY_CLIENT_SECRET not in result.stderr
 
 
 def test_10_listTopics_sp(fake_broker, tmp_path, monkeypatch, capsys):

@@ -21,7 +21,7 @@ from azure.servicebus import ServiceBusClient, ServiceBusReceiver, ServiceBusSub
 from azure.servicebus.management import ServiceBusAdministrationClient
 from keboola.component.exceptions import UserException
 
-from client import ServiceBusConnector, is_management_denied, redact_secrets, to_user_exception
+from client import ServiceBusConnector, is_management_denied, redact_secrets, to_user_exception, with_details
 from configuration import AuthType, EntityType, SourceConfig, SubQueue
 
 logger = logging.getLogger(__name__)
@@ -282,7 +282,8 @@ def list_entity_names(
 ) -> list[str]:
     """Sorted names for the ``list*`` sync actions (§5.4). A Listen-only SAS is denied management
     reads by design, so it returns an empty list (the creatable select still lets the user type a
-    name) rather than failing; a service principal without the Data Receiver role is a real error."""
+    name) rather than failing; a service principal without the Data Receiver role, or whose credentials
+    Entra ID rejects, is a real error."""
     if kind == "subscriptions" and not topic_name:
         raise UserException("Select a topic first.")
     try:
@@ -301,21 +302,23 @@ def list_entity_names(
 
 
 def probe_management(connector: ServiceBusConnector) -> None:
-    """The root ``testConnection`` (no source): lists the first queue to prove SP / Manage-SAS auth."""
+    """The root ``testConnection`` (no source): lists the first queue to prove SP / Manage-SAS auth.
+    A denial names the missing right; rejected SP credentials say so (``to_user_exception``)."""
     try:
         with connector.admin_client() as admin:
             next(iter(admin.list_queues()), None)
     except AzureError as e:
-        if is_management_denied(e):
-            if connector.auth_type == AuthType.CONNECTION_STRING:
-                raise UserException(
-                    "A connection string with only Listen rights can be tested only from a row that has a "
-                    "source selected."
-                ) from e
-            raise UserException(
+        if not is_management_denied(e):
+            raise to_user_exception(e, None, connector.secrets) from e
+        if connector.auth_type == AuthType.CONNECTION_STRING:
+            message = (
+                "A connection string with only Listen rights can be tested only from a row that has a source selected."
+            )
+        else:
+            message = (
                 "The service principal cannot read the namespace: grant it the 'Azure Service Bus Data Receiver' role."
-            ) from e
-        raise to_user_exception(e, None, connector.secrets) from e
+            )
+        raise with_details(message, e, connector.secrets) from e
 
 
 def _rule_filter_text(rule_filter: Any) -> str:
@@ -337,9 +340,11 @@ def describe_entity(connector: ServiceBusConnector, entity: EntityRef) -> str:
             )
     except AzureError as e:
         if is_management_denied(e):
-            raise UserException(
+            raise with_details(
                 "Entity details need a connection string with Manage rights or a service principal with the "
-                "'Azure Service Bus Data Receiver' role."
+                "'Azure Service Bus Data Receiver' role.",
+                e,
+                connector.secrets,
             ) from e
         raise to_user_exception(e, entity.path, connector.secrets) from e
 

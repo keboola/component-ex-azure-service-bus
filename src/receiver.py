@@ -35,7 +35,7 @@ from azure.servicebus.exceptions import (
 )
 from keboola.component.exceptions import UserException
 
-from client import ServiceBusConnector, is_session_mismatch, redact_secrets, to_user_exception
+from client import ServiceBusConnector, is_credential_failure, is_session_mismatch, redact_secrets, to_user_exception
 from configuration import Configuration, SettlementMode
 from entity import EntityInfo, EntityRef
 from settlement import LOCK_RENEW_MARGIN, BatchProcessor, BatchResult, safe_settle
@@ -51,7 +51,8 @@ SESSION_ACCEPT_WAIT_SECONDS = 5
 DRAIN_WAIT_SECONDS = 1
 CATCH_UP_POLL_SECONDS = 1
 
-# Errors a fresh connection cannot fix (spec §6.11); plus the session mismatch (``is_session_mismatch``).
+# Errors a fresh connection cannot fix (spec §6.11); plus the session mismatch (``is_session_mismatch``)
+# and rejected service-principal credentials (``is_credential_failure``, a plain ServiceBusError).
 FATAL_ERRORS = (
     ServiceBusAuthenticationError,
     ServiceBusAuthorizationError,
@@ -79,7 +80,7 @@ class StopReason(StrEnum):
 
 def is_fatal(error: BaseException) -> bool:
     """A configuration, auth or entity error (or the session mismatch): mapped, never recycled."""
-    return isinstance(error, FATAL_ERRORS) or is_session_mismatch(error)
+    return isinstance(error, FATAL_ERRORS) or is_session_mismatch(error) or is_credential_failure(error)
 
 
 class RecoveryTracker:

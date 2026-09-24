@@ -14,11 +14,11 @@ live read of this module's globals at call time, so tests patch the SDK with
 
 import logging
 import re
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from typing import Any
 
 from azure.core.exceptions import AzureError, ClientAuthenticationError, HttpResponseError, ResourceNotFoundError
-from azure.identity import ClientSecretCredential
+from azure.identity import ClientSecretCredential, CredentialUnavailableError
 from azure.servicebus import ServiceBusClient
 from azure.servicebus.exceptions import (
     MessagingEntityDisabledError,
@@ -49,6 +49,12 @@ _SESSION_NOT_USED_TEXTS = (
     "session is not enabled",
     "not require sessions",  # [inferred] reverse-mismatch phrasing, e.g. "does not require sessions"
 )
+
+# Every Entra ID token-endpoint error carries an "AADSTS<n>" code (AADSTS7000215 invalid secret,
+# AADSTS7000222 expired secret, AADSTS700016 unknown application, ...); a Service Bus 401 / 403 never does.
+_ENTRA_ERROR_CODE = "AADSTS"
+_IDENTITY_PACKAGE = "azure.identity"
+CREDENTIALS_REJECTED = "The service principal credentials were rejected (check tenant ID, client ID and client secret)."
 
 
 def redact_secrets(text: str, secrets: Iterable[str] = ()) -> str:
@@ -122,11 +128,64 @@ def is_session_mismatch(error: BaseException) -> bool:
     return _SESSION_REQUIRED_TEXT in text or any(marker in text.lower() for marker in _SESSION_NOT_USED_TEXTS)
 
 
+def _linked_errors(error: BaseException) -> Iterator[BaseException]:
+    """``error`` and the originals the SDKs attach to it -- ``inner_exception`` (the ``error=`` a
+    ``ServiceBusError`` wraps) and ``__cause__`` -- each once."""
+    pending, seen = [error], set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        yield current
+        for linked in (getattr(current, "inner_exception", None), current.__cause__):
+            if isinstance(linked, BaseException):
+                pending.append(linked)
+
+
+def _raised_by_azure_identity(error: BaseException) -> bool:
+    """The innermost traceback frame -- where ``error`` was raised -- belongs to azure-identity."""
+    frame_tb = error.__traceback__
+    if frame_tb is None:
+        return False
+    while frame_tb.tb_next is not None:
+        frame_tb = frame_tb.tb_next
+    return str(frame_tb.tb_frame.f_globals.get("__name__", "")).startswith(_IDENTITY_PACKAGE)
+
+
+def is_credential_failure(error: BaseException) -> bool:
+    """True when the service principal's Entra ID token could not be acquired (§6.11): a wrong or
+    expired secret, an unknown client ID or tenant -- never a missing right.
+
+    ``ClientSecretCredential`` raises a ``ClientAuthenticationError`` ("Authentication failed: ...",
+    ``CredentialUnavailableError`` when it cannot even try). The management client re-raises it
+    unchanged; the data plane (pyamqp) wraps it in a plain ``ServiceBusError`` "Handler failed: ..."
+    whose ``inner_exception`` is the original. It is recognised by its Entra ID error code
+    (``AADSTS<n>``) or, for failures without one (an unknown tenant fails in MSAL's authority
+    discovery), by having been raised inside azure-identity. A Service Bus 401 / 403 is neither.
+    """
+    for linked in _linked_errors(error):
+        if isinstance(linked, CredentialUnavailableError):
+            return True
+        if isinstance(linked, AzureError) and (_ENTRA_ERROR_CODE in str(linked) or _raised_by_azure_identity(linked)):
+            return True
+    return False
+
+
 def is_management_denied(error: Exception) -> bool:
-    """True when a management-plane call was rejected for lacking rights (§6.11)."""
+    """True when the management endpoint itself rejected a call for lacking rights (§6.11): a SAS
+    without Manage or a service principal without the Data Receiver role (HTTP 401 / 403). A failed
+    token acquisition (:func:`is_credential_failure`) is never a denial."""
+    if is_credential_failure(error):
+        return False
     if isinstance(error, ClientAuthenticationError):
         return True
     return isinstance(error, HttpResponseError) and error.status_code in (401, 403)
+
+
+def with_details(message: str, error: BaseException, secrets: Iterable[str] = ()) -> UserException:
+    """``UserException("<message> (details: <redacted SDK message>)")`` -- the §6.11 / J7 shape."""
+    return UserException(f"{message} (details: {redact_secrets(str(error), secrets)})")
 
 
 def to_user_exception(
@@ -139,11 +198,12 @@ def to_user_exception(
     ``azure.core.exceptions.AzureError`` (management plane) only; never called with ``ValueError``
     (Global Constraints) -- that is mapped only at its two known sources.
     """
-    detail = redact_secrets(str(error), secrets)
     target = f" '{entity_path}'" if entity_path else ""
     of_target = f" of '{entity_path}'" if entity_path else ""
 
-    if isinstance(error, ServiceBusAuthenticationError):
+    if is_credential_failure(error):  # before every data-plane type: pyamqp wraps it in a plain ServiceBusError
+        message = CREDENTIALS_REJECTED
+    elif isinstance(error, ServiceBusAuthenticationError):
         message = (
             f"Authentication to Azure Service Bus failed for{target}: the credentials are wrong, the entity "
             "does not exist, or the namespace's IP firewall rejected the Keboola stack (Service Bus reports "
@@ -180,7 +240,7 @@ def to_user_exception(
         message = f"The entity{target} was not found in the namespace."
     else:
         message = f"Azure Service Bus management reported an error{of_target}."
-    return UserException(f"{message} (details: {detail})")
+    return with_details(message, error, secrets)
 
 
 def _invalid_connection_string(auth: AuthConfiguration, error: ValueError) -> UserException:
