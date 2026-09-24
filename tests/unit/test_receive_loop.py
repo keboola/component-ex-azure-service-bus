@@ -3,6 +3,7 @@ from datetime import timedelta
 from typing import Any
 
 import pytest
+from azure.servicebus import ServiceBusReceiveMode
 from azure.servicebus.exceptions import ServiceBusError
 from keboola.component.exceptions import UserException
 
@@ -61,6 +62,20 @@ def build(broker, *, source=None, limits=None, advanced=None, t0=None, state_siz
         sleep=broker.clock.advance,
     )
     return loop, sink, stats, pending
+
+
+def split_receivers(broker) -> tuple[list[Any], list[Any]]:
+    """The run's receive links and the drain check's dedicated peekers (receivers that only peeked). A
+    receive link never peeks: a peek services its connection and would pull credited messages into a
+    buffer the next close discards (``ReceiveLoop._receivable_messages``)."""
+    peekers = [r for r in broker.receivers if r.operations and all(op == "peek_messages" for op, _ in r.operations)]
+    links = [r for r in broker.receivers if r not in peekers]
+    assert all(op != "peek_messages" for r in links for op, _ in r.operations)
+    return links, peekers
+
+
+def peeks_of(receivers: list[Any]) -> list[dict[str, Any]]:
+    return [details for r in receivers for op, details in r.operations if op == "peek_messages"]
 
 
 def test_drains_until_idle_with_thread_free_profile(broker):
@@ -368,9 +383,11 @@ def test_c1_drain_uses_abandon(broker):
         q.send(b"a")
     loop, _, stats, _ = build(broker, limits={"max_messages": 1})
     loop.run()
-    ops = [op for op, _ in broker.receivers[0].operations]
-    drain = ["receive_messages", "complete_message", "receive_messages", "abandon_message", "abandon_message"]
-    assert ops == [*drain, "peek_messages"]  # then the remaining-count peek (Phase 8): the 3 left are counted
+    (link,), peekers = split_receivers(broker)
+    ops = [op for op, _ in link.operations]
+    assert ops == ["receive_messages", "complete_message", "receive_messages", "abandon_message", "abandon_message"]
+    # Then the remaining-count peek (Phase 8), on its own receiver: the 3 left are counted.
+    assert peeks_of(peekers) == [{"max_message_count": 250, "sequence_number": 2}]
     assert "3 receivable message(s) are still in 'q'" in stats.warnings["messages_remaining"]
 
 
@@ -620,9 +637,30 @@ def test_transient_empty_receive_reopens_and_drains_everything(broker):
     assert loop.run() is StopReason.IDLE
     assert len(sink.rows) == 10 and q.sequence_numbers() == [] and stats.completed == 10
     assert stats.empty_receive_retries == 1 and "messages_remaining" not in stats.warnings
-    assert len(broker.receivers) == 2 and broker.receivers[0].closed  # a fresh receiver after the empty one
+    links, peekers = split_receivers(broker)
+    assert len(links) == 2 and links[0].closed  # a fresh receiver after the empty one
+    assert len(peekers) == 2 and all(p.closed for p in peekers)  # the retried check and the final one
     assert len(broker.clients) == 2 and broker.clients[0].closed  # ... on a fresh connection
     assert broker.clock.now() - started >= timedelta(seconds=2)  # the first backoff
+
+
+def test_c3_drain_check_never_peeks_on_the_receive_link(broker):
+    """Regression (review): a peek services its connection while it waits for the reply, so on the receive
+    link's connection it would pull messages sent against the link's credit into the local buffer, and the
+    close after the check would discard them -- in receive_and_delete already deleted on the broker. Both
+    the empty-receive check and the remaining count at the stop peek on their own receiver."""
+    q = broker.add_queue("q")
+    for _ in range(4):
+        q.send(b"a")
+    broker.inject_empty_receive(on_call=2)
+    source = {"entity_type": "queue", "queue_name": "q", "settlement_mode": "receive_and_delete"}
+    loop, sink, stats, _ = build(broker, source=source, limits={"max_messages": 3}, advanced={"batch_size": 2})
+    assert loop.run() is StopReason.MAX_MESSAGES
+    links, peekers = split_receivers(broker)
+    assert len(links) == 2 and all(link.receive_mode is ServiceBusReceiveMode.RECEIVE_AND_DELETE for link in links)
+    assert len(peekers) == 2 and all(p.receive_mode is ServiceBusReceiveMode.PEEK_LOCK and p.closed for p in peekers)
+    assert len(sink.rows) == 4 and q.sequence_numbers() == []  # the stop drain wrote the fourth (C8)
+    assert stats.empty_receive_retries == 1 and "messages_remaining" not in stats.warnings
 
 
 def test_truly_drained_entity_stops_idle_after_one_check(broker):
@@ -632,9 +670,8 @@ def test_truly_drained_entity_stops_idle_after_one_check(broker):
     loop, sink, stats, _ = build(broker)
     assert loop.run() is StopReason.IDLE
     assert len(sink.rows) == 3 and stats.empty_receive_retries == 0 and not stats.warnings
-    (receiver,) = broker.receivers
-    peeks = [details for op, details in receiver.operations if op == "peek_messages"]
-    assert peeks == [{"max_message_count": 250, "sequence_number": 4}]  # past the highest processed number
+    (_link,), peekers = split_receivers(broker)
+    assert peeks_of(peekers) == [{"max_message_count": 250, "sequence_number": 4}]  # past the highest processed
 
 
 def test_only_deferred_scheduled_expired_or_newer_messages_left_stops_idle(broker):
@@ -650,8 +687,8 @@ def test_only_deferred_scheduled_expired_or_newer_messages_left_stops_idle(broke
     loop, sink, stats, _ = build(broker, t0=t0)
     assert loop.run() is StopReason.IDLE
     assert sink.rows == [] and stats.empty_receive_retries == 0 and not stats.warnings
-    peeks = [details for op, details in broker.receivers[0].operations if op == "peek_messages"]
-    assert peeks == [{"max_message_count": 250, "sequence_number": 1}]  # nothing processed yet: from the start
+    _links, peekers = split_receivers(broker)
+    assert peeks_of(peekers) == [{"max_message_count": 250, "sequence_number": 1}]  # nothing processed: from the start
 
 
 def test_newer_messages_count_without_the_job_start_stop(broker):
@@ -675,7 +712,9 @@ def test_empty_receive_retry_cap_stops_with_the_remaining_count(broker, caplog):
     started = broker.clock.now()
     with caplog.at_level(logging.INFO, logger="receiver"):
         assert loop.run() is StopReason.RECEIVE_STALLED
-    assert sink.rows == [] and stats.empty_receive_retries == 5 and len(broker.receivers) == 6
+    links, peekers = split_receivers(broker)
+    assert sink.rows == [] and stats.empty_receive_retries == 5 and len(links) == 6
+    assert len(peekers) == 7  # one check per empty receive, plus the remaining count at the stop
     assert broker.clock.now() - started >= timedelta(seconds=2 + 4 + 8 + 16 + 30)  # every backoff was taken
     warning = stats.warnings["messages_remaining"]
     assert "4 receivable message(s) are still in 'q'" in warning and "receive_stalled" in warning

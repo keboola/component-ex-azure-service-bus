@@ -762,9 +762,15 @@ another application's deferrals.
   by its first reconnect; the output table holds 1,004,833 unique sequence numbers (77,077 + 927,756)
   and the queue 0 active]. On an empty receive of a plain entity the loop peeks one page (250, the broker's cap)
   past the highest *processed* sequence number (the stop drain's abandoned messages sit below it and
-  redeliver; from the start in cursor mode on a fresh receiver on partitioned entities) and counts the
+  redeliver; from the start in cursor mode on partitioned entities) and counts the
   messages a receive would still hand out: not `DEFERRED` (C2's own and foreign deferrals stay in the
   entity), not pending activation, not expired, and — with `stop_at_job_start` — enqueued before T0.
+  The peek always runs on a dedicated receiver, which has its own connection (a 7.14.3 client shares
+  none), never on the open receive link. A peek is a management request that services its whole
+  connection while it waits for the reply [source: pyamqp `ManagementOperation.execute` →
+  `Connection.listen`], so on the receive link's connection it would pull messages sent against the
+  link's outstanding credit into the local buffer, and the close after the check would discard them
+  (C3: already deleted on the broker; C1 / C2: locked until expiry).
   None → stop `idle`. Otherwise the loop closes the receiver **and** its client (a fresh link and
   connection), backs off 2 / 4 / 8 / 16 / 30 s (bounded by `max_duration_seconds`) and continues —
   no stop drain: the receive just returned empty and pyamqp works only inside calls. The retry counter
@@ -772,7 +778,9 @@ another application's deferrals.
   run as `receive_stalled`. A peek cannot see another consumer's message lock [live, Phase 8: a
   locked message peeks `ACTIVE`, `locked_until_utc` None, `delivery_count` 0], so messages locked by a
   competing consumer look receivable: such a run spends the retries (~2 min at the default idle
-  timeout) and ends `receive_stalled` with the WARNING below — nothing is lost. Session entities
+  timeout) and ends `receive_stalled` with the WARNING below — nothing is lost. On a partitioned
+  entity in C2 the run's own deferrals stay in the entity and can fill the one page peeked from the
+  start, so there the check can miss receivable messages and stop `idle` as before [inferred]. Session entities
   keep their `NEXT_AVAILABLE_SESSION` loop (a peek there needs a session).
 - **Messages left behind:** after a `max_messages`, `max_duration` or `receive_stalled` stop, a
   WARNING names what is left — peeked on plain entities ("N receivable message(s) are still in …",

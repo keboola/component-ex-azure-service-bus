@@ -474,31 +474,35 @@ class ReceiveLoop:
             MAX_EMPTY_RECEIVE_RETRIES,
         )
         # No stop drain: the receive just returned empty, so the local buffer is empty, and with no
-        # keep-alive thread nothing arrives before the next call [source: pyamqp works only inside calls].
+        # keep-alive thread nothing arrives before the next call on this connection [source: pyamqp works
+        # only inside calls] -- the drain check peeked on its own connection (``_receivable_messages``).
         self._close()
         self._sleep(min(backoff, max(0.0, self._deadline - self._monotonic())))
         return None
 
     def _receivable_messages(self) -> list[Any]:
         """One peek page of what a receive would still hand out: past the highest processed sequence
-        number (from the start in cursor mode on a fresh receiver on partitioned entities, whose
-        sequence numbers are per partition), keeping messages that are neither deferred (C2's own and
-        foreign deferrals stay in the entity), nor pending activation, nor expired, nor -- with
-        ``stop_at_job_start`` -- enqueued at or after T0. Peeking locks nothing."""
+        number (from the start on partitioned entities, whose sequence numbers are per partition),
+        keeping messages that are neither deferred (C2's own and foreign deferrals stay in the entity),
+        nor pending activation, nor expired, nor -- with ``stop_at_job_start`` -- enqueued at or after T0.
+
+        Peeking locks nothing, and it always runs on a dedicated receiver -- its own connection, since a
+        7.14.3 client shares none -- never on the open receive link: a peek is a management request that
+        services its whole connection while it waits for the reply [source: pyamqp
+        ``ManagementOperation.execute`` -> ``Connection.listen``], so on the receive link's connection it
+        would pull messages sent against the link's outstanding credit into the local buffer, which the
+        close after the check discards (C3: already deleted on the broker, so lost; C1 / C2: locked until
+        the lock expires, one delivery spent)."""
         if self._client is None:
             self._client = self._connector.receive_client()
         now = self._clock()
-        if self._info.is_partitioned or self._receiver is None:
-            kwargs = receiver_profile(self._connector, ServiceBusReceiveMode.PEEK_LOCK, 1, session_wait=None)
-            peeker = enter_receiver(self._entity.open_receiver(self._client, **kwargs))
-            start = 0 if self._info.is_partitioned else (self._highest_processed or 0) + 1
-            try:
-                page = peeker.peek_messages(DRAIN_CHECK_PEEK_COUNT, sequence_number=start)
-            finally:
-                close_quietly(peeker)
-        else:
-            start = (self._highest_processed or 0) + 1
-            page = self._receiver.peek_messages(DRAIN_CHECK_PEEK_COUNT, sequence_number=start)
+        kwargs = receiver_profile(self._connector, ServiceBusReceiveMode.PEEK_LOCK, 1, session_wait=None)
+        start = 0 if self._info.is_partitioned else (self._highest_processed or 0) + 1
+        peeker = enter_receiver(self._entity.open_receiver(self._client, **kwargs))
+        try:
+            page = peeker.peek_messages(DRAIN_CHECK_PEEK_COUNT, sequence_number=start)
+        finally:
+            close_quietly(peeker)
         watermark = self._config.limits.stop_at_job_start
         return [
             message
