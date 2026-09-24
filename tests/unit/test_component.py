@@ -324,7 +324,12 @@ def test_throttled_empty_receive_is_counted_retried_and_summarised(broker, tmp_p
     summary = next(m for m in messages if m.startswith("mode=complete "))
     assert "received=3 written=3" in summary and "empty_receive_retries=1 throttled=1" in summary
     assert "stop=idle" in summary
-    assert any(m.startswith("Service Bus throttled 1 request(s) of this run (ServerBusy)") for m in messages)
+    assert any(
+        m.startswith(
+            "Service Bus throttled 1 request(s) (ServerBusy; the SDK retried them) and returned no messages to 1"
+        )
+        for m in messages
+    )
     assert not any("AMQP error occurred" in m for m in messages)  # the SDK's own line stays out of the log
     assert q.sequence_numbers() == []
 

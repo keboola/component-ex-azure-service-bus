@@ -92,16 +92,27 @@ class RunStats:
         logger.warning("%s", message)
 
     def note_throttled(self, count: int) -> None:
-        """Record the throttled requests the SDK reported this run (``client.throttled_requests``);
-        any at all is a WARNING with the tier hint -- it is what stalls receives (§6.5)."""
+        """Record the throttled requests the SDK reported this run (``client.throttled_requests``) and
+        make a busy namespace visible (§6.5): SDK-reported ServerBusy errors and the receive loop's
+        reconnects after empty receives -- a throttled Standard-tier namespace mostly shows as the
+        latter [live, Phase 8: Azure counted 43 throttled requests during a 928k-message run whose SDK
+        reported none, while 22 receives came back empty] -- are one WARNING with the tier hint."""
         self.throttled = count
+        signs = []
         if count:
+            signs.append(f"throttled {count} request(s) (ServerBusy; the SDK retried them)")
+        if self.empty_receive_retries:
+            signs.append(
+                f"returned no messages to {self.empty_receive_retries} receive(s) although messages were "
+                "available (the run reconnected and continued)"
+            )
+        if signs:
             self.warn(
                 "throttled",
-                f"Service Bus throttled {count} request(s) of this run (ServerBusy): the namespace reached its "
-                "throughput limit (Standard tier: about 1,000 operations per second, shared by every client of the "
-                "namespace). The SDK retried them; if runs slow down, stall or stop before the entity is drained, "
-                "lower Batch Size / Prefetch Count, run fewer consumers at once, or use the Premium tier.",
+                f"Service Bus {' and '.join(signs)} -- typical of a namespace at its throughput limit (Standard "
+                "tier: about 1,000 operations per second, shared by every client of the namespace) or of a stalled "
+                "receive link. Nothing was lost. If runs slow down or stop before the entity is drained, lower Batch "
+                "Size / Prefetch Count, run fewer consumers at once, or use the Premium tier.",
             )
 
     def note_delivery_count(self, n: int) -> None:

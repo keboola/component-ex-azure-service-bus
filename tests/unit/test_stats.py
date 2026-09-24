@@ -1,5 +1,7 @@
 import logging
 
+import pytest
+
 from configuration import Configuration
 from entity import EntityRef
 from stats import RunStats, log_effective_settings
@@ -52,3 +54,27 @@ def test_effective_settings_peek_omits_idle_timeout(caplog):
         log_effective_settings(c, EntityRef.from_source(c.source))
     text = caplog.records[-1].getMessage()
     assert "fetch_mode=" in text and "idle_timeout_seconds" not in text
+
+
+@pytest.mark.parametrize(
+    ("throttled", "empty", "expected"),
+    [
+        (0, 0, None),
+        (3, 0, "Service Bus throttled 3 request(s) (ServerBusy; the SDK retried them) -- typical"),
+        (0, 2, "Service Bus returned no messages to 2 receive(s) although messages were available"),
+        (1, 4, "Service Bus throttled 1 request(s) (ServerBusy; the SDK retried them) and returned no messages to 4"),
+    ],
+)
+def test_busy_namespace_warning(throttled, empty, expected):
+    """Phase 8: SDK-reported throttling and the loop's reconnects after empty receives -- how a
+    throttled namespace mostly shows [live] -- are one WARNING with the tier hint, plus summary tokens."""
+    stats = RunStats(mode="complete", monotonic=lambda: 0.0)
+    stats.empty_receive_retries = empty
+    stats.note_throttled(throttled)
+    if expected is None:
+        assert "throttled" not in stats.warnings
+    else:
+        assert stats.warnings["throttled"].startswith(expected) and "Premium tier" in stats.warnings["throttled"]
+    line = stats.summary_line()
+    assert (f"throttled={throttled}" in line) is bool(throttled)
+    assert (f"empty_receive_retries={empty}" in line) is bool(empty)

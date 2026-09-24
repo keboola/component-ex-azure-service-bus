@@ -755,7 +755,12 @@ another application's deferrals.
   pyamqp re-flows link credit only when the local credit reaches 0, so a stalled refill is a second
   candidate. Reproduced locally with the fix in place: a 60k-message drain with the same batch /
   prefetch hit 4 empty receives while ≥ 250 messages were still receivable, no server-busy report
-  was logged (so a stalled link, not throttling, there), and the retries drained all 60,003]. On an empty receive of a plain entity the loop peeks one page (250, the broker's cap)
+  was logged (so a stalled link, not throttling, there), and the retries drained all 60,003.
+  Validated live on the platform (Phase 8 rerun, same 1M-message row, branch build `-31`): one run
+  drained all 927,756 remaining messages — `received=written=completed=927756
+  empty_receive_retries=22 stop=idle duration_s=1758`, ~528 messages/s, every empty receive resolved
+  by its first reconnect; the output table holds 1,004,833 unique sequence numbers (77,077 + 927,756)
+  and the queue 0 active]. On an empty receive of a plain entity the loop peeks one page (250, the broker's cap)
   past the highest *processed* sequence number (the stop drain's abandoned messages sit below it and
   redeliver; from the start in cursor mode on a fresh receiver on partitioned entities) and counts the
   messages a receive would still hand out: not `DEFERRED` (C2's own and foreign deferrals stay in the
@@ -777,8 +782,12 @@ another application's deferrals.
 - **Throttling (Phase 8):** the SDK reports every retryable AMQP error at INFO before retrying; a
   `ThrottleCounter` handler on `azure.servicebus` counts the `com.microsoft:server-busy` reports
   without printing them (the logger reaches the job log only in debug mode). A non-zero count is a
-  summary token (`throttled=`) and a WARNING with the tier hint (Standard: about 1,000 operations per
-  second per namespace — lower batch / prefetch, fewer concurrent consumers, or Premium). A
+  summary token (`throttled=`); it and the loop's reconnects after empty receives
+  (`empty_receive_retries=`) share one WARNING with the tier hint (Standard: about 1,000 operations
+  per second per namespace — lower batch / prefetch, fewer concurrent consumers, or Premium), because
+  a throttled namespace mostly shows as empty receives [live, Phase 8 rerun: Azure counted 43
+  throttled requests during the run, the SDK reported none as an error, and 22 receives came back
+  empty]. A
   `ServiceBusServerBusyError` that surfaces (retries exhausted, a sync action) maps to a throttling
   `UserException` (§6.11).
 - **Watermark on partitioned entities:** receive order is not enqueue order [live], so the stop is
