@@ -42,3 +42,13 @@ def test_effective_settings_marks_defaults(caplog):
         log_effective_settings(c, EntityRef.from_source(c.source))
     text = caplog.records[-1].getMessage()
     assert "settlement_mode=complete (default)" in text and "entity=q" in text and "SharedAccessKey" not in text
+    assert "idle_timeout_seconds=10 (default)" in text and "fetch_mode" not in text
+
+
+def test_effective_settings_peek_omits_idle_timeout(caplog):
+    source = {"entity_type": "queue", "queue_name": "q", "settlement_mode": "peek", "idle_timeout_seconds": 30}
+    c = Configuration(**{"#connection_string": SAS, "source": source})  # ty: ignore[invalid-argument-type]
+    with caplog.at_level(logging.INFO):
+        log_effective_settings(c, EntityRef.from_source(c.source))
+    text = caplog.records[-1].getMessage()
+    assert "fetch_mode=" in text and "idle_timeout_seconds" not in text

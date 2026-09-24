@@ -102,7 +102,11 @@ Destination
 -----------
 
 - **Table name** — empty derives a name from the entity (queue → `<queue>`; subscription →
-  `<topic>_<subscription>`; `_dead_letter` / `_transfer_dead_letter` appended for sub-queues).
+  `<topic>_<subscription>`; `_dead_letter` / `_transfer_dead_letter` appended for sub-queues;
+  characters other than letters, digits, `-` and `_` become `_`). Different entities can derive the
+  same name (e.g. `orders.eu` and `orders_eu`, or topic `a_b` + subscription `c` and topic `a` +
+  subscription `b_c`); rows of one configuration share its bucket, so give such rows an explicit
+  table name.
 - **Load type** — `incremental_load` (upsert, default) or `full_load` (the table holds only this
   run's messages).
 - **Primary key** — `sequence_number` (default; unique per entity, not globally), `message_id`

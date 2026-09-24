@@ -312,14 +312,15 @@ def test_sub_queue_group_commits_without_a_session(broker):
     assert "session_id" not in broker.receivers[0].kwargs
 
 
-def _fail_deferred_call(monkeypatch, on_call: int, error: Exception) -> None:
-    """The ``on_call``-th ``receive_deferred_messages`` (1-based) raises ``error`` instead."""
+def _fail_deferred_call(monkeypatch, on_call: int, error: Exception, times: int = 1) -> None:
+    """The ``on_call``-th ``receive_deferred_messages`` (1-based) and the ``times - 1`` calls after
+    it raise ``error`` instead."""
     original = FakeReceiver.receive_deferred_messages
     calls: list[int] = []
 
     def flaky(self, sequence_numbers, **kwargs):
         calls.append(1)
-        if len(calls) == on_call:
+        if on_call <= len(calls) < on_call + times:
             raise error
         return original(self, sequence_numbers, **kwargs)
 
@@ -348,6 +349,17 @@ def test_stale_entity_mid_group_drops_the_rest_and_later_groups(broker, monkeypa
     c, stats = committer(configured=Q)
     assert c.commit(pending) == []
     assert stats.committed == 250 and stats.dropped_stale == 50 + 2
+
+
+def test_transient_exhausted_mid_entity_reports_only_the_undeleted_rest(broker, monkeypatch):
+    q = broker.add_queue("q")
+    seqs = deferred(q, 300)
+    pending = pending_for(Q, [*seqs, (52 << 48) | 1, (52 << 48) | 2])  # a second partition group
+    _fail_deferred_call(monkeypatch, 2, ServiceBusServerBusyError(message="busy"), times=4)  # 1 try + 3 retries
+    c, stats = committer()
+    with pytest.raises(UserException, match=r"Could not delete the 52 message\(s\)"):
+        c.commit(pending)
+    assert stats.committed == 250 and q.sequence_numbers() == seqs[250:]
 
 
 def test_other_service_bus_error_is_mapped(broker):

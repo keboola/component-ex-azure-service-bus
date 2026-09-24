@@ -349,7 +349,7 @@
           "title": "Table Name",
           "description": "Leave empty to derive the name from the entity",
           "options": {
-            "tooltip": "Empty = derived from the entity: a queue → `<queue>`, a subscription → `<topic>_<subscription>`, plus `_dead_letter` / `_transfer_dead_letter` for sub-queues; other characters than letters, digits, `-` and `_` become `_`. An explicit name may contain only letters, digits, `-` and `_`, and must not start or end with `-` or `_`. Rows with the Text or Base64 body format may share a table (use the **Source Entity + Sequence Number** key); Flatten JSON rows must not.",
+            "tooltip": "Empty = derived from the entity: a queue → `<queue>`, a subscription → `<topic>_<subscription>`, plus `_dead_letter` / `_transfer_dead_letter` for sub-queues; other characters than letters, digits, `-` and `_` become `_`. Different entities can derive the same name (e.g. `orders.eu` and `orders_eu`) — give such rows an explicit name. An explicit name may contain only letters, digits, `-` and `_`, and must not start or end with `-` or `_`. Rows with the Text or Base64 body format may share a table (use the **Source Entity + Sequence Number** key); Flatten JSON rows must not.",
             "inputAttributes": {
               "placeholder": "<queue> or <topic>_<subscription>"
             },

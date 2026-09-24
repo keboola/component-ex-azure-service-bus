@@ -214,8 +214,10 @@ class PendingCommitter:
                 self._drop_stale(ref, group.tail(progress.next_seq).count + _count(groups[index + 1 :]))
                 break  # the entity's remaining groups are just as unreadable
             except TRANSIENT_ERRORS as error:
+                # Only what is still pending: earlier chunks / groups of this entity are already deleted.
+                left = _count(carried) + group.tail(progress.next_seq).count + _count(groups[index + 1 :])
                 raise UserException(
-                    f"Could not delete the {_count(groups)} message(s) deferred by the previous run on '{ref.path}': "
+                    f"Could not delete the {left} message(s) deferred by the previous run on '{ref.path}': "
                     f"{redact_secrets(str(error), self._connector.secrets)}. Nothing was extracted in this run and "
                     "the state is unchanged; the next run retries."
                 ) from error

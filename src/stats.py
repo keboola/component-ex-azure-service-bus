@@ -156,6 +156,8 @@ def log_effective_settings(config: Configuration, entity: EntityRef) -> None:
     ]
     if source.settlement_mode is SettlementMode.PEEK:
         tokens.append(f"fetch_mode={_mark(source.fetch_mode, default_source.fetch_mode)}")
+    else:  # peek ignores the idle timeout (§5.3)
+        tokens.append(f"idle_timeout_seconds={_mark(source.idle_timeout_seconds, default_source.idle_timeout_seconds)}")
     tokens.extend(
         [
             f"max_messages={_mark(limits.max_messages, default_limits.max_messages)}",
