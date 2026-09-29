@@ -296,6 +296,36 @@ on it — can take that long; try again a minute later. The first action after t
 component version (image tag) changes can also take long enough to end with "Internal Server
 Error" while the platform prepares the new version; clicking again works.
 
+Performance
+===========
+
+A 1,000,000-message round trip measured on 2026-09-24:
+
+| | |
+|---|---|
+| **Namespace** | Azure Service Bus **Standard** tier, West Europe |
+| **Queue** | not partitioned, no sessions, no duplicate detection, lock duration 1 min, max delivery count 10, max size 5 GB, message TTL 1 day |
+| **Messages** | ~260 bytes each on average (queue size ÷ message count): one table row as a JSON object, with `message_id` and `subject` set from columns |
+| **Keboola** | jobs on the GCP `us-east4` stack, so every AMQP round trip crosses to West Europe |
+| **Sent by** | the Azure Service Bus writer (`keboola.wr-azure-service-bus`): 1,000,000-row input table, whole row as JSON, batch size 5,000 |
+| **Read with** | **Delete After Batch Is Written**, batch size 5,000, prefetch 1,000, idle timeout 10 s, incremental load |
+
+| Step | Messages | Duration | Throughput |
+|---|---|---|---|
+| Send (writer job) | 1,000,000 | 724 s | ~1,380 msg/s |
+| Extract (one extractor job) | 927,756 | 1,758 s reading (1,790 s job) | ~528 msg/s |
+
+- The whole backlog was drained in **one run**. At this rate 1M messages take about 32 minutes, so they fit
+  in the default **Max Duration** (3,000 s).
+- The namespace throttled both sides: the writer's SDK retried 30 `ServerBusy` responses, and Azure
+  metrics recorded 43 throttled requests during extraction. The extractor hit 22 empty receives while
+  messages remained, and recovered each one by reconnecting (see **Idle Timeout**).
+- A Standard namespace gets [1,000 throttling credits per second](https://learn.microsoft.com/en-us/azure/service-bus-messaging/service-bus-throttling),
+  shared by every client. Each sent, received or peeked message costs one credit. Reading stays
+  below that limit, most likely because each message is settled individually and every settle is a
+  round trip across regions (inferred). Expect higher throughput from a Premium namespace, a Keboola
+  stack in the namespace's region, or a namespace with no other traffic.
+
 Limitations
 ===========
 
