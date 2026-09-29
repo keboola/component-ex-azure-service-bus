@@ -80,20 +80,21 @@ def test_async_selects_declare_empty_enum():
             assert prop.get("enum") == [], prop
 
 
-def test_async_autoload_is_array_form():
-    # The Keboola UI autoloads only an array (json-editor `helpers.ts` `shouldAutoload`: not
-    # `Array.isArray(autoload)` -> false; `[]` loads on open, a path list once those fields are set);
-    # a boolean `true` never autoloads, whatever older docs say.
-    autoloads = {
-        name: prop["options"]["async"]["autoload"]
+def test_entity_dropdowns_load_on_click_only():
+    # P4-16 (maintainer decision, a deliberate deviation from the kit's "autoload the first dropdown"):
+    # a Listen-only connection string is denied every listing, so an autoloading dropdown showed an
+    # error toast each time a row was opened. No select carries `autoload` in any form (the UI
+    # autoloads an array -- `[]` on open, a path list once those fields are set -- json-editor
+    # `helpers.ts` `shouldAutoload`); the lists load when the user clicks the Load button, uncached.
+    selects = {
+        name: prop["options"]["async"]
         for name, prop, _ in list(walk(ROOT_SCHEMA)) + list(walk(ROW_SCHEMA))
-        if "autoload" in prop.get("options", {}).get("async", {})
+        if prop.get("type") != "button" and "async" in prop.get("options", {})
     }
-    assert autoloads == {
-        "source.queue_name": [],
-        "source.topic_name": [],
-        "source.subscription_name": ["parameters.source.topic_name"],
-    }
+    assert set(selects) == {"source.queue_name", "source.topic_name", "source.subscription_name"}
+    for name, async_options in selects.items():
+        assert "autoload" not in async_options, name
+        assert async_options["cache"] is False, name
 
 
 def test_message_id_primary_key_warns():

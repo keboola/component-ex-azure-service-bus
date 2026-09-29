@@ -62,11 +62,10 @@
             "async": {
               "label": "Load Queues",
               "action": "listQueues",
-              "autoload": [],
               "cache": false
             },
             "creatable": true,
-            "tooltip": "Loading the list needs a service principal or a connection string with **Manage** rights. A Listen-only connection string gets an error message instead of the list: type the queue name.",
+            "tooltip": "Click **Load Queues** to list the namespace's queues; this needs a service principal or a connection string with **Manage** rights. A Listen-only connection string gets an error message instead of the list: type the queue name.",
             "inputAttributes": {
               "placeholder": "my-queue"
             },
@@ -87,11 +86,10 @@
             "async": {
               "label": "Load Topics",
               "action": "listTopics",
-              "autoload": [],
               "cache": false
             },
             "creatable": true,
-            "tooltip": "Loading the list needs a service principal or a connection string with **Manage** rights. A Listen-only connection string gets an error message instead of the list: type the topic name.",
+            "tooltip": "Click **Load Topics** to list the namespace's topics; this needs a service principal or a connection string with **Manage** rights. A Listen-only connection string gets an error message instead of the list: type the topic name.",
             "inputAttributes": {
               "placeholder": "my-topic"
             },
@@ -112,13 +110,10 @@
             "async": {
               "label": "Load Subscriptions",
               "action": "listSubscriptions",
-              "autoload": [
-                "parameters.source.topic_name"
-              ],
               "cache": false
             },
             "creatable": true,
-            "tooltip": "Loading the list needs a service principal or a connection string with **Manage** rights. A Listen-only connection string gets an error message instead of the list: type the subscription name. Select the topic first; after changing the topic, click **Load Subscriptions** again.",
+            "tooltip": "Select the topic first, then click **Load Subscriptions** to list its subscriptions (click it again after changing the topic); this needs a service principal or a connection string with **Manage** rights. A Listen-only connection string gets an error message instead of the list: type the subscription name.",
             "inputAttributes": {
               "placeholder": "my-subscription"
             },

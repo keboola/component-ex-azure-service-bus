@@ -282,9 +282,10 @@ Sync actions
   message ID, subject, state, and the start of the decoded body. It proves that the credentials can
   read the row's entity. Nothing is settled (a session-enabled entity's session is held briefly).
 
-The list-entity dropdowns (queues / topics / subscriptions) need a service principal or a
-Manage-rights connection string. With a Listen-only connection string, loading a list fails with a
-message that says so (the UI shows it as a notification); type the entity name instead.
+The list-entity dropdowns (queues / topics / subscriptions) load when you click **Load Queues** /
+**Load Topics** / **Load Subscriptions**, not when the row opens. Listing needs a service principal
+or a Manage-rights connection string. With a Listen-only connection string, loading a list fails
+with a message that says so (the UI shows it as a notification); type the entity name instead.
 
 The UI runs the actions with the configuration's pinned `runtime.tag` when one is set, otherwise
 with the Developer Portal's default image tag.
