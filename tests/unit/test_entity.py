@@ -123,7 +123,8 @@ CREDENTIALS_REJECTED = (
     "The service principal credentials were rejected (check tenant ID, client ID and client secret). "
     f"(details: Authentication failed: {AADSTS_INVALID} sent ***)"
 )
-DENIED_DETAILS = "(details: Unauthorized access. 'Manage,EntityRead' claims required.)"
+# The fake broker's denial is the real 401 text; the details keep only its meaning (P4-15).
+DENIED_DETAILS = "(details: Unauthorized: Manage,EntityRead claims required for this operation)"
 QUEUE = EntityRef.from_source(SourceConfig(entity_type="queue", queue_name="q"))
 
 

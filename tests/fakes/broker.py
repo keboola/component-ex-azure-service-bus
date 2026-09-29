@@ -127,6 +127,14 @@ _MIXED_PARTITIONS = (
 _RAD_LIMIT = "ReceiveAndDelete only can process 250 deferred messages"
 _UNAUTHORIZED = "CBS token authentication failed for '{}': unauthorized."
 _SERVICE_BUS_SCOPE = "https://servicebus.azure.net/.default"
+# `str()` of the ClientAuthenticationError a management call raises for a SAS without Manage rights
+# [live, 2026-09-29, azure-servicebus 7.14.3: list_queues / get_queue alike]; tracking id and namespace
+# anonymised, the path is the one `list_queues` reports.
+MANAGEMENT_DENIED = (
+    "Operation returned an invalid status 'Unauthorized'\nContent: <Error><Code>401</Code><Detail>Manage,EntityRead "
+    "claims required for this operation. TrackingId:0f8fad5b-d9cb-469f-a165-70867728950e_G29, "
+    "SystemTracker:ns.servicebus.windows.net:$Resources/queues, Timestamp:2026-09-29T11:32:25</Detail></Error>"
+)
 
 # Public ServiceBusReceivedMessage attributes (besides sequence_number / body / locks) and their defaults.
 _ATTRIBUTES: dict[str, Any] = {
@@ -1343,7 +1351,7 @@ class FakeAdminClient:
         if self.credential is not None and self._broker.credential_failure is not None:
             self.credential.get_token(_SERVICE_BUS_SCOPE)  # the bearer-token policy runs before the request
         if self._broker.management_denied:
-            raise ClientAuthenticationError(message="Unauthorized access. 'Manage,EntityRead' claims required.")
+            raise ClientAuthenticationError(message=MANAGEMENT_DENIED)
         if self._broker.management_error is not None:
             raise self._broker.management_error
 

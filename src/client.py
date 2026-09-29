@@ -12,6 +12,7 @@ live read of this module's globals at call time, so tests patch the SDK with
 ``mock.patch.object(client, "ServiceBusClient", ...)``.
 """
 
+import html
 import logging
 import re
 from collections.abc import Callable, Iterable, Iterator
@@ -224,9 +225,43 @@ def is_management_denied(error: Exception) -> bool:
     return isinstance(error, HttpResponseError) and error.status_code in (401, 403)
 
 
+# Azure ends an error description with request-tracking data -- Service Bus "TrackingId:…,
+# SystemTracker:…, Timestamp:…", Entra ID "Trace ID: … Correlation ID: … Timestamp: …" -- that identifies
+# the request for Azure support but tells the user nothing; everything from the first marker to the end of
+# its line goes (together with the separator before it). A "SubCode=<n>" (or "SubCode: <n>") repeats the
+# HTTP status as a number and goes on its own.
+_TRACKING_TAIL_RE = re.compile(
+    r"[\s,.;]*\b(?:Tracking\s?Id|SystemTracker|Trace\s?ID|Correlation\s?ID|Timestamp)\s*[:=].*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+_SUB_CODE_RE = re.compile(r"[\s,.;]*\bSubCode\s*[:=]\s*\d+", re.IGNORECASE)
+# azure-core renders a management-plane HTTP error as "Operation returned an invalid status '<reason>'"
+# plus "\nContent: <the response body>" (cut at 2,048 characters); Service Bus answers with
+# "<Error><Code>401</Code><Detail>…</Detail></Error>", whose Detail is the only meaningful part [live].
+_STATUS_DETAIL_RE = re.compile(
+    r"Operation returned an invalid status '(?P<reason>[^']*)'.*?<Detail>(?P<detail>.*?)(?:</Detail>|$)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def concise_details(text: str) -> str:
+    """The meaningful part of an Azure error message for a ``(details: …)`` suffix (P4-15): a
+    management-plane HTTP error becomes ``<reason>: <Detail>`` (``Unauthorized: Manage,EntityRead
+    claims required for this operation``); tracking ids, timestamps and ``SubCode`` fragments are
+    dropped and whitespace is collapsed. A text that would come out empty is kept as it was."""
+    concise = text
+    status = _STATUS_DETAIL_RE.search(concise)
+    if status:
+        concise = f"{status['reason']}: {html.unescape(status['detail'])}"
+    concise = _SUB_CODE_RE.sub("", _TRACKING_TAIL_RE.sub("", concise))
+    concise = " ".join(concise.split()).lstrip(" ,.;:").rstrip(" ,;:")
+    return concise or " ".join(text.split())
+
+
 def with_details(message: str, error: BaseException, secrets: Iterable[str] = ()) -> UserException:
-    """``UserException("<message> (details: <redacted SDK message>)")`` -- the §6.11 / J7 shape."""
-    return UserException(f"{message} (details: {redact_secrets(str(error), secrets)})")
+    """``UserException("<message> (details: <concise, redacted SDK message>)")`` -- the §6.11 / J7
+    shape. Redaction runs last, on the text the user sees."""
+    return UserException(f"{message} (details: {redact_secrets(concise_details(str(error)), secrets)})")
 
 
 def to_user_exception(

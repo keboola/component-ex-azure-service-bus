@@ -75,9 +75,11 @@ def test_08_listQueues_listen_sas_denied(fake_broker, tmp_path, monkeypatch, cap
     fake_broker.management_denied = True
     result = run_case("08_listQueues_listen_sas_denied", tmp_path, monkeypatch, capsys)
     assert result.exit_code == 1 and result.stdout == ""
-    assert result.stderr.startswith(
+    # the fake raises Azure's real 401 text; the toast keeps its meaning without the tracking noise (P4-15)
+    assert result.stderr.strip() == (
         "Listing queues needs a connection string with Manage rights, or a service principal. "
-        "With this connection string, type the queue name instead. (details: "
+        "With this connection string, type the queue name instead. "
+        "(details: Unauthorized: Manage,EntityRead claims required for this operation)"
     )
     assert DUMMY_SAS_KEY not in result.stderr
 

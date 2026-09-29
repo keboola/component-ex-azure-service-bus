@@ -1127,7 +1127,14 @@ a `ValueError` from any other place is a bug and exits 2.
 
 Redaction (J7): `SharedAccessKey=…`, `sig=…` (SAS tokens) and the literal `#client_secret` /
 `#connection_string` values are masked in every surfaced message and log line; `UserException`
-messages carry `(details: <redacted SDK message>)` like the writer.
+messages carry `(details: <redacted SDK message>)` like the writer. **Concise details (P4-15):** the
+details keep only the meaningful part of Azure's text (`client.concise_details`, redaction runs last on
+the result): a management-plane HTTP error ("Operation returned an invalid status 'Unauthorized'" +
+the `<Error><Code>401</Code><Detail>…</Detail></Error>` body [live]) becomes `<reason>: <Detail>`, and
+Azure's request-tracking tail (`TrackingId:` / `SystemTracker:` / `Timestamp:`, Entra ID's `Trace ID:` /
+`Correlation ID:`) and `SubCode` fragments are dropped — e.g. a Listen-only SAS listing ends with
+`(details: Unauthorized: Manage,EntityRead claims required for this operation)`. A text that would come
+out empty is kept as it was.
 
 ### 6.12 Logging, summary, client identity
 
@@ -1535,3 +1542,4 @@ differ):**
 | P4-12 | (Phase 8, maintainer decision.) **Max Duration** moves to the Advanced section (`advanced.max_duration_seconds`) with default 3000 s (was `limits.max_duration_seconds`, 3600): below the default one-hour job timeout, which the component is not told, leaving time for the import. Like every advanced value it is its default while `advanced_options` is off; a leftover `limits.max_duration_seconds` is ignored | §2.1, §4-D, §5.2, §5.5 |
 | P4-13 | (Phase 8, live: a 1M-message C1 run stopped `idle` after 77,077 messages with 927,756 still active.) An empty receive is verified by a peek before the run stops idle; if receivable messages remain, the loop reopens the connection, backs off and continues (at most 5 times in a row, then `receive_stalled`); a stop that leaves messages behind logs a WARNING with the remaining count; throttling (ServerBusy) is counted quietly into the summary with a tier hint; the idle-timeout tooltip no longer says an empty result means drained | §5.2, §6.5, §6.11, §6.12 |
 | P4-14 | (Phase 8, maintainer decision; verified in the UI: a Listen-only SAS got `[]`, so the dropdowns stayed silently empty.) A management denial of `listQueues` / `listTopics` / `listSubscriptions` with a connection string is a `UserException` — "Listing queues needs a connection string with Manage rights, or a service principal. With this connection string, type the queue name instead. (details: …)", topics and subscriptions alike — which the UI shows as a toast; the creatable select still takes a typed name. A service principal keeps its own messages (denied → the Data Receiver role; rejected credentials → `is_credential_failure`); the 20-second deadline is unchanged; the dropdown tooltips say so | §4-I, §5.4, §5.6, §6.11, §8 |
+| P4-15 | (Final polish, maintainer decision.) The `(details: …)` suffix stays on every mapped error but keeps only Azure's meaning: a management HTTP error reads `<reason>: <Detail>` (a Listen-only SAS: `Unauthorized: Manage,EntityRead claims required for this operation`, from the real 401 text [live]); tracking id, system tracker, timestamps (Entra ID's trace / correlation ids too) and `SubCode` fragments are dropped; redaction is unchanged and runs last | §6.11 |

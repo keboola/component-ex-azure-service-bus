@@ -18,12 +18,14 @@ import client as client_mod
 from client import (
     USER_AGENT,
     ServiceBusConnector,
+    concise_details,
     is_credential_failure,
     is_management_denied,
     redact_secrets,
     to_user_exception,
 )
 from configuration import AuthConfiguration, AuthType
+from tests.fakes.broker import MANAGEMENT_DENIED
 
 SAS = "Endpoint=sb://ns.servicebus.windows.net/;SharedAccessKeyName=k;SharedAccessKey=c2VjcmV0"
 
@@ -292,6 +294,86 @@ def test_management_denial_keeps_the_role_message_with_details(error):
         "The credentials cannot read the Service Bus management data of 'orders': a service principal needs the "
         f"'Azure Service Bus Data Receiver' role; a connection string needs Manage rights. (details: {error})"
     )
+
+
+# --- `(details: …)` keeps Azure's meaning, drops its noise (maintainer decision P4-15) ------------------
+
+# The exact `str()` of the ClientAuthenticationError `list_queues` raised for a Listen-only connection
+# string [live]; the fake broker raises the same text for every denied management call.
+REAL_MANAGEMENT_401 = MANAGEMENT_DENIED
+CONCISE_401 = "Unauthorized: Manage,EntityRead claims required for this operation"
+
+# (Azure text, concise details) per shape; the tracking values are made up.
+NOISY_DETAILS = {
+    "data_plane": (  # the tracking fragments trail the sentence
+        (
+            "Unauthorized access. 'Listen' claim(s) are required to perform this operation. Resource: "
+            "'sb://ns.servicebus.windows.net/q'. TrackingId:5a1c9f0e_G3, SystemTracker:gateway5, "
+            "Timestamp:2026-09-29T11:32:25"
+        ),
+        (
+            "Unauthorized access. 'Listen' claim(s) are required to perform this operation. Resource: "
+            "'sb://ns.servicebus.windows.net/q'"
+        ),
+    ),
+    "subcode_and_us_timestamp": (  # a leading SubCode, a spaced "Tracking Id", a US-format timestamp
+        (
+            "SubCode=40100. Unauthorized : Unauthorized access for 'GetQueues' operation. Tracking Id: 5a1c9f0e_G3, "
+            "SystemTracker:ns.servicebus.windows.net:$Resources/queues, Timestamp:9/29/2026 11:32:25 AM"
+        ),
+        "Unauthorized : Unauthorized access for 'GetQueues' operation",
+    ),
+    "subcode_mid_text": (  # colon form
+        "Put token failed. status-code: 401, SubCode: 40100. status-description: InvalidSignature.",
+        "Put token failed. status-code: 401. status-description: InvalidSignature.",
+    ),
+    "xml_escaped": (
+        (
+            "Operation returned an invalid status 'Unauthorized'\nContent: <Error><Code>401</Code><Detail>"
+            "Unauthorized access for &apos;GetQueues&apos; operation. TrackingId:5a1c9f0e_G3, SystemTracker:x, "
+            "Timestamp:2026-09-29T11:32:25</Detail></Error>"
+        ),
+        "Unauthorized: Unauthorized access for 'GetQueues' operation",
+    ),
+    "truncated_body": (  # azure-core cut the body at 2,048 characters, before `</Detail>`
+        (
+            "Operation returned an invalid status 'Forbidden'\nContent: <Error><Code>403</Code><Detail>Denied. "
+            "TrackingId:5a1c9f0e_G3, SystemTr"
+        ),
+        "Forbidden: Denied",
+    ),
+    "entra_trace": (  # Entra ID's own tracking tail (a rejected service-principal secret)
+        (
+            "Authentication failed: AADSTS7000215: Invalid client secret provided. Trace ID: 5a1c9f0e "
+            "Correlation ID: 7d3e2b1a Timestamp: 2026-09-29 11:32:25Z"
+        ),
+        "Authentication failed: AADSTS7000215: Invalid client secret provided",
+    ),
+    "plain": ("The request was terminated.", "The request was terminated."),
+    "multi_line": ("Handler failed:\n  link detached.", "Handler failed: link detached."),
+    "noise_only": ("TrackingId:5a1c9f0e_G3", "TrackingId:5a1c9f0e_G3"),  # kept rather than emptied
+}
+
+
+def test_concise_details_keeps_the_meaning_of_a_real_management_401():
+    assert concise_details(REAL_MANAGEMENT_401) == CONCISE_401
+
+
+@pytest.mark.parametrize(("text", "expected"), list(NOISY_DETAILS.values()), ids=list(NOISY_DETAILS))
+def test_concise_details_strips_tracking_noise(text, expected):
+    assert concise_details(text) == expected
+
+
+def test_management_401_details_are_concise_and_redacted():
+    leaky = REAL_MANAGEMENT_401.replace("this operation.", f"this operation with {SAS} and s3cr3t.")
+    text = str(to_user_exception(ClientAuthenticationError(message=leaky), "orders", ("s3cr3t",)))
+    assert text.endswith(
+        "(details: Unauthorized: Manage,EntityRead claims required for this operation with "
+        "Endpoint=sb://ns.servicebus.windows.net/;SharedAccessKeyName=k;SharedAccessKey=*** and ***)"
+    )
+    assert "c2VjcmV0" not in text and "s3cr3t" not in text
+    for noise in ("TrackingId", "SystemTracker", "Timestamp", "<Detail>", "Operation returned"):
+        assert noise not in text
 
 
 def test_redacting_filter_masks_log_records():
