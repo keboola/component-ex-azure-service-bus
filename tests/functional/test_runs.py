@@ -29,6 +29,7 @@ def queue_ref(name: str = "q", sub_queue: str = "none") -> dict:
 def pending_state(ranges: list[list[int]], *, max_body_bytes: int = 1) -> dict:
     """An input state holding one pending-commit group on queue ``q`` (a previous C2 run's deferrals)."""
     group = {"session_id": None, "partition": 0, "max_body_bytes": max_body_bytes, "ranges": ranges}
+    # the pre-P4-17 timestamp form: a state written by an earlier build still loads
     entity = {"entity": queue_ref(), "groups": [group], "deferred_at_utc": "2026-09-23 09:00:00.000000"}
     return {"version": 1, "pending_commit": [entity]}
 

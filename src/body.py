@@ -21,7 +21,7 @@ import re
 import unicodedata
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, NamedTuple
 from uuid import UUID
@@ -94,9 +94,19 @@ def charset_of(content_type: str | None) -> str:
     return "utf-8"
 
 
+def format_utc(value: datetime) -> str:
+    """The extractor's one timestamp form (spec §6.9, P4-17): strict ISO 8601 in UTC with
+    microseconds and a ``Z`` -- ``2026-09-24T14:03:15.123456Z``. A naive ``datetime`` is already UTC
+    (as every broker-supplied one is); an aware one is converted. ``isoformat`` (unlike ``strftime``'s
+    ``%Y`` on Linux) always pads the year to four digits."""
+    aware = value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+    return aware.astimezone(UTC).replace(tzinfo=None).isoformat(timespec="microseconds") + "Z"
+
+
 def to_jsonable(value: object) -> object:
     """Recursively make ``value`` safe for JSON encoding: ``bytes`` (and dict keys) become UTF-8
-    strings with replacement, ``datetime`` becomes ISO-8601, ``Decimal`` is kept as-is (``compact_json``
+    strings with replacement, ``datetime`` becomes the TIMESTAMP columns' ISO 8601 UTC form
+    (``format_utc``), ``Decimal`` is kept as-is (``compact_json``
     renders it as a bare, unquoted JSON number so ``1.10`` never loses its trailing zero or gets
     quoted), ``uuid.UUID`` becomes ``str()``, other non-JSON scalars fall back to ``str()``."""
     if isinstance(value, bytes):
@@ -106,7 +116,7 @@ def to_jsonable(value: object) -> object:
     if isinstance(value, list | tuple):
         return [to_jsonable(item) for item in value]
     if isinstance(value, datetime):
-        return value.isoformat()
+        return format_utc(value)
     if isinstance(value, Decimal):
         return value
     if isinstance(value, UUID):

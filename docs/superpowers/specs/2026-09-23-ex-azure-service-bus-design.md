@@ -985,9 +985,14 @@ another application's deferrals.
   input registry's flattened `body_*` columns followed by `body_unmapped` (flatten mode, §6.10). Unlisted types are STRING. Types are native only for
   broker-assigned values whose Python types were observed [live]; producer-controlled content (body,
   flattened keys, property maps) is STRING, per the native-types rule for unverified types.
-- **Value formats:** timestamps `YYYY-MM-DD HH:MM:SS.ffffff` in UTC (verified against a typed
-  import in Phase 7); `None` → empty; booleans `true` / `false`; JSON columns compact
-  (`ensure_ascii=False`), bytes decoded UTF-8 with replacement, datetimes ISO-8601.
+- **Value formats:** every TIMESTAMP column is strict ISO 8601 in UTC,
+  `YYYY-MM-DDTHH:MM:SS.ffffffZ` (e.g. `2026-09-24T14:03:15.123456Z`; P4-17 — until then
+  `YYYY-MM-DD HH:MM:SS.ffffff`, verified against a typed import in Phase 7); `columns.format_timestamp`
+  / `body.format_utc` are the one formatter, so the `previewMessages` table, the state's
+  `deferred_at_utc` and datetimes inside JSON cells use the same form; `None` → empty; booleans
+  `true` / `false`; JSON columns compact (`ensure_ascii=False`), bytes decoded UTF-8 with
+  replacement. State written before P4-17 keeps its `deferred_at_utc` as stored (the value is
+  informational, never parsed), so old state loads unchanged.
 - **`state`** is the broker-reported value (`ACTIVE` / `DEFERRED` / `SCHEDULED`), never rewritten:
   a message activated from a schedule can report `SCHEDULED` on 7.14.3 [live, Phase 7] — in C1–C3
   and, once active, in C4 (§6.7) it is exported with that value.
@@ -1544,3 +1549,4 @@ differ):**
 | P4-14 | (Phase 8, maintainer decision; verified in the UI: a Listen-only SAS got `[]`, so the dropdowns stayed silently empty.) A management denial of `listQueues` / `listTopics` / `listSubscriptions` with a connection string is a `UserException` — "Listing queues needs a connection string with Manage rights, or a service principal. With this connection string, type the queue name instead. (details: …)", topics and subscriptions alike — which the UI shows as a toast; the creatable select still takes a typed name. A service principal keeps its own messages (denied → the Data Receiver role; rejected credentials → `is_credential_failure`); the 20-second deadline is unchanged; the dropdown tooltips say so | §4-I, §5.4, §5.6, §6.11, §8 |
 | P4-15 | (Final polish, maintainer decision.) The `(details: …)` suffix stays on every mapped error but keeps only Azure's meaning: a management HTTP error reads `<reason>: <Detail>` (a Listen-only SAS: `Unauthorized: Manage,EntityRead claims required for this operation`, from the real 401 text [live]); tracking id, system tracker, timestamps (Entra ID's trace / correlation ids too) and `SubCode` fragments are dropped; redaction is unchanged and runs last | §6.11 |
 | P4-16 | (Final polish, maintainer decision — a deliberate deviation from the kit's "autoload the first dropdown" UI default.) The `queue_name` / `topic_name` / `subscription_name` selects no longer autoload (`autoload` removed; `"enum": []` and `cache: false` kept): the list loads only when the user clicks **Load …**. Reason: a Listen-only connection string is denied every listing by design (P4-14), so an autoloading dropdown showed an error toast every time a row was opened, although typing the name is the normal path for that credential; the tooltips say to click Load | §5.6 |
+| P4-17 | (Final polish, maintainer decision.) Timestamps are strict ISO 8601 in UTC, `YYYY-MM-DDTHH:MM:SS.ffffffZ`, in every TIMESTAMP column, the preview table, the pending set's `deferred_at_utc` and datetimes inside JSON cells (one formatter); an older state's `deferred_at_utc` is kept as stored (never parsed). The typed import of the new form is verified live on cf-dev (§9) | §6.9 |

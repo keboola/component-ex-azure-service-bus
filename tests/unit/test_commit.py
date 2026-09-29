@@ -36,7 +36,7 @@ def pending_for(ref, seqs, session_id=None, body_bytes=10):
     b = PendingSetBuilder()
     for s in seqs:
         b.add(ref, s, session_id, body_bytes)
-    return b.build("2026-09-23 10:00:00.000000")
+    return b.build("2026-09-23 10:00:00.000000")  # an earlier run's pre-P4-17 form: carried as stored
 
 
 def committer(sleeps=None, configured=Q, stats=None):

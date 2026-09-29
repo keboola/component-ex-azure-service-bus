@@ -1,5 +1,6 @@
 import base64
 import json
+from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -103,6 +104,19 @@ def test_compact_json_keeps_decimal_unquoted():
     assert body_mod.compact_json([Decimal("1.10"), Decimal("2.5")]) == "[1.10,2.5]"
     assert body_mod.compact_json(Decimal("1.10")) == "1.10"
     assert body_mod.compact_json([{"p": Decimal("1.5")}]) == '[{"p":1.5}]'
+
+
+def test_datetimes_inside_json_use_the_timestamp_column_form():
+    # P4-17: a datetime inside a JSON cell reads like the TIMESTAMP columns (UTC, `…ffffffZ`)
+    plus_two = timezone(timedelta(hours=2))
+    value = {
+        "at": datetime(2026, 9, 24, 16, 3, 15, 123456, tzinfo=plus_two),
+        "naive": [datetime(2026, 9, 24, tzinfo=UTC).replace(tzinfo=None)],
+    }
+    assert (
+        body_mod.compact_json(value) == '{"at":"2026-09-24T14:03:15.123456Z","naive":["2026-09-24T00:00:00.000000Z"]}'
+    )
+    assert body_mod.format_utc(datetime(2026, 9, 24, 14, 3, 15, 123456, tzinfo=UTC)) == "2026-09-24T14:03:15.123456Z"
 
 
 def test_flatten_array_of_decimals_stays_unquoted():

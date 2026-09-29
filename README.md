@@ -200,10 +200,13 @@ Fixed metadata columns, in order:
 `settlement_mode`, `extracted_at_utc` (TIMESTAMP). Every unlisted column is STRING.
 
 Then, depending on `body.body_format`: a single `body` column (`text` / `base64` modes), or the
-flattened `body_*` columns followed by `body_unmapped` (`json_flatten` mode). Timestamps are
-`YYYY-MM-DD HH:MM:SS.ffffff` UTC; `application_properties` / `message_annotations` stay JSON
-because their key set is producer-defined and varies per message; the fixed AMQP header /
-properties fields are flattened into their own scalar columns instead.
+flattened `body_*` columns followed by `body_unmapped` (`json_flatten` mode).
+
+Value formats: every TIMESTAMP column is strict ISO 8601 in UTC, `YYYY-MM-DDTHH:MM:SS.ffffffZ`
+(e.g. `2026-09-24T14:03:15.123456Z`); Preview Messages and datetimes inside JSON cells use the same
+form. Empty values stay empty and booleans are `true` / `false`. `application_properties` /
+`message_annotations` stay JSON because their key set is producer-defined and varies per message;
+the fixed AMQP header / properties fields are flattened into their own scalar columns instead.
 
 `state` is the value Service Bus reports (`ACTIVE`, `DEFERRED` or `SCHEDULED`). With
 azure-servicebus 7.14.3, a message that was activated from a schedule can still report

@@ -14,7 +14,7 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any
 
-from body import charset_of, compact_json
+from body import charset_of, compact_json, format_utc
 from configuration import SettlementMode
 from entity import EntityRef
 
@@ -75,16 +75,16 @@ def utc_now() -> datetime:
 def format_timestamp(value: datetime | int | float | None) -> str:  # noqa: PYI041 -- the two numeric
     # arms are semantically distinct (epoch milliseconds, always integral in practice) and the task
     # interface spells out `int | float` explicitly.
-    """Spec §6.9 value formats: an aware or naive ``datetime`` (naive is already UTC, as every
-    broker-supplied datetime is) renders as ``YYYY-MM-DD HH:MM:SS.ffffff`` UTC; an ``int`` / ``float``
-    is epoch **milliseconds** (the AMQP ``creation-time`` / ``absolute-expiry-time`` shape); ``None``
-    and ``0`` (AMQP's "unset" timestamp) render as empty."""
+    """Spec §6.9 value formats (P4-17): every TIMESTAMP column, the preview and the pending set's
+    ``deferred_at_utc`` use strict ISO 8601 in UTC, ``YYYY-MM-DDTHH:MM:SS.ffffffZ`` (``format_utc``).
+    An aware or naive ``datetime`` (naive is already UTC, as every broker-supplied datetime is) is
+    converted; an ``int`` / ``float`` is epoch **milliseconds** (the AMQP ``creation-time`` /
+    ``absolute-expiry-time`` shape); ``None`` and ``0`` (AMQP's "unset" timestamp) render as empty."""
     if value is None or value == 0:
         return ""
     if isinstance(value, datetime):
-        aware = value if value.tzinfo is not None else value.replace(tzinfo=UTC)
-        return aware.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S.%f")
-    return datetime.fromtimestamp(value / 1000, tz=UTC).strftime("%Y-%m-%d %H:%M:%S.%f")
+        return format_utc(value)
+    return format_utc(datetime.fromtimestamp(value / 1000, tz=UTC))
 
 
 def _str(value: object) -> str:

@@ -57,6 +57,18 @@ def test_unknown_keys_ignored():
     assert ExtractorState.load({"version": 1, "legacy": 1}).version == 1
 
 
+def test_state_written_before_iso_timestamps_loads_and_round_trips():
+    # P4-17 changed the component's timestamp form; `deferred_at_utc` is informational (never parsed),
+    # so an older state's `YYYY-MM-DD HH:MM:SS.ffffff` value loads and is written back unchanged.
+    old = {
+        "version": 1,
+        "pending_commit": [{"entity": Q.to_dict(), "groups": [], "deferred_at_utc": "2026-09-23 10:00:00.000000"}],
+    }
+    state = ExtractorState.load(old)
+    assert state.pending_commit[0].deferred_at_utc == "2026-09-23 10:00:00.000000"
+    assert state.to_dict()["pending_commit"] == old["pending_commit"]
+
+
 def test_malformed_state_rejected():
     with pytest.raises(UserException, match="malformed"):
         ExtractorState.load({"version": 1, "pending_commit": "not-a-list"})
@@ -68,8 +80,8 @@ def test_builder_groups_by_session_and_partition():
     b.add(Q, 2, None, 30)
     b.add(Q, (52 << 48) | 1, None, 5)
     b.add(Q, 3, "s1", 7)
-    built = b.build("2026-09-23 10:00:00.000000")
-    assert len(built) == 1 and built[0].entity_ref() == Q
+    built = b.build("2026-09-23T10:00:00.000000Z")
+    assert len(built) == 1 and built[0].entity_ref() == Q and built[0].deferred_at_utc == "2026-09-23T10:00:00.000000Z"
     groups = {(g.session_id, g.partition): g for g in built[0].groups}
     assert groups[(None, 0)].ranges == [[1, 2]] and groups[(None, 0)].max_body_bytes == 30
     assert list(groups[(None, 52)].iter_sequence_numbers()) == [(52 << 48) | 1]
