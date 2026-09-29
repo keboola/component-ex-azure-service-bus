@@ -69,6 +69,21 @@ def test_20_run_c1_queue(fake_broker, tmp_path, monkeypatch, capsys):
     assert result.state is not None and result.state["pending_commit"] == []
 
 
+def test_20_run_c1_queue_amqp_timestamp_out_of_range(fake_broker, tmp_path, monkeypatch, capsys):
+    # P4-18: a producer-set AMQP timestamp past year 9999 no longer exits 2
+    q = fake_broker.add_queue("q")
+    q.send(b"a", creation_time=253402300800000)
+    q.send(b"b", absolute_expiry_time=2**63 - 1)
+    result = run_case("20_run_c1_queue", tmp_path, monkeypatch, capsys)
+    assert result.exit_code == 0
+    rows = result.tables["q.csv"]
+    assert [row["body"] for row in rows] == ["a", "b"]
+    assert rows[0]["amqp_creation_time_utc"] == "" and rows[1]["amqp_absolute_expiry_time_utc"] == ""
+    assert q.sequence_numbers() == []  # both messages completed as usual
+    assert summary(result)["amqp_timestamps_out_of_range"] == "2"
+    assert result.log.count("AMQP timestamp value(s)") == 1
+
+
 def test_21_run_c1_subscription_sp(fake_broker, tmp_path, monkeypatch, capsys):
     s = fake_broker.add_subscription("t", "s")
     s.send(b"a")

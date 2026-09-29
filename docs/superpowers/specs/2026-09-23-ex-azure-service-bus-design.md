@@ -993,7 +993,8 @@ another application's deferrals.
   stack), so the rows written before P4-17 are 7 hours late — the `Z` is what makes the value UTC.]
   `columns.format_timestamp`
   / `body.format_utc` are the one formatter, so the `previewMessages` table, the state's
-  `deferred_at_utc` and datetimes inside JSON cells use the same form; `None` → empty; booleans
+  `deferred_at_utc` and datetimes inside JSON cells use the same form; `None` → empty (so is an AMQP
+  `creation-time` / `absolute-expiry-time` that cannot be converted, counted, P4-18); booleans
   `true` / `false`; JSON columns compact (`ensure_ascii=False`), bytes decoded UTF-8 with
   replacement. State written before P4-17 keeps its `deferred_at_utc` as stored (the value is
   informational, never parsed), so old state loads unchanged.
@@ -1165,10 +1166,11 @@ out empty is kept as it was.
 - **Run summary** (J8/J9): received, written, completed / deferred / deleted-on-receive, committed
   (H5) + already-gone, orphans recovered / skipped by the guard, unreadable (per reason and
   disposition), settlement failures, recoveries, empty-receive retries and throttled requests (§6.5,
-  Phase 8), C4 skips (`expired_skipped`, `skipped_scheduled`, §6.7), stop reason, **delivery-count
-  high-water mark**, duration; WARNINGs for C3 (at-most-once), best-effort / impossible orphan
-  recovery, scan cap, state budget, approximate watermark, prefetch > 1, messages left behind and
-  throttling (§6.5).
+  Phase 8), C4 skips (`expired_skipped`, `skipped_scheduled`, §6.7), AMQP timestamps left empty
+  (`amqp_timestamps_out_of_range`, P4-18), stop reason, **delivery-count high-water mark**, duration;
+  WARNINGs for C3 (at-most-once), best-effort / impossible orphan recovery, scan cap, state budget,
+  approximate watermark, prefetch > 1, messages left behind, throttling (§6.5) and AMQP timestamps
+  left empty (one per run, with the total).
 - `user_agent="keboola.ex-azure-service-bus"`; `client_identifier =
   "kbc-<KBC_CONFIGID or local>-<KBC_CONFIGROWID or root>"` (≤ 64 chars; `KBC_CONFIGID` may be a hash
   for inline-config jobs — used only as a label).
@@ -1554,3 +1556,4 @@ differ):**
 | P4-15 | (Final polish, maintainer decision.) The `(details: …)` suffix stays on every mapped error but keeps only Azure's meaning: a management HTTP error reads `<reason>: <Detail>` (a Listen-only SAS: `Unauthorized: Manage,EntityRead claims required for this operation`, from the real 401 text [live]); tracking id, system tracker, timestamps (Entra ID's trace / correlation ids too) and `SubCode` fragments are dropped; redaction is unchanged and runs last | §6.11 |
 | P4-16 | (Final polish, maintainer decision — a deliberate deviation from the kit's "autoload the first dropdown" UI default.) The `queue_name` / `topic_name` / `subscription_name` selects no longer autoload (`autoload` removed; `"enum": []` and `cache: false` kept): the list loads only when the user clicks **Load …**. Reason: a Listen-only connection string is denied every listing by design (P4-14), so an autoloading dropdown showed an error toast every time a row was opened, although typing the name is the normal path for that credential; the tooltips say to click Load | §5.6 |
 | P4-17 | (Final polish, maintainer decision.) Timestamps are strict ISO 8601 in UTC, `YYYY-MM-DDTHH:MM:SS.ffffffZ`, in every TIMESTAMP column, the preview table, the pending set's `deferred_at_utc` and datetimes inside JSON cells (one formatter); an older state's `deferred_at_utc` is kept as stored (never parsed). [live, cf-dev job 56931833 on `initial-implementation-37`, Snowflake: all six TIMESTAMP columns typed `TIMESTAMP_LTZ` and hold the exact UTC instants; the old zone-less rows had been read as UTC−7 local time and stay 7 h late until re-extracted] | §6.9 |
+| P4-18 | (Final polish, lead decision.) A producer-set AMQP `creation-time` / `absolute-expiry-time` that cannot be converted — beyond the datetime range (past year 9999 or before year 1; the AMQP maximum is `2**63 − 1` ms), NaN / infinity, or not a number — no longer ends the run with exit 2 (the `OverflowError` was first recycled as a connection failure): its `amqp_*_utc` cell is empty and the message is written and settled normally. The run counts such values on written rows (`amqp_timestamps_out_of_range` in the summary line) and logs one WARNING with the total at the end | §6.9, §6.12 |

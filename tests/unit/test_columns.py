@@ -2,6 +2,7 @@ import json
 import re
 from datetime import UTC, datetime, timedelta, timezone
 
+import pytest
 from azure.servicebus import ServiceBusMessageState
 
 from columns import (
@@ -76,6 +77,68 @@ def test_every_timestamp_column_uses_the_iso_form():
     assert row["expires_at_utc"] == row["amqp_absolute_expiry_time_utc"] == "2026-09-23T11:00:00.000000Z"
     assert row["scheduled_enqueue_time_utc"] == "2026-09-23T09:00:00.000000Z"
     assert row["amqp_creation_time_utc"] == row["extracted_at_utc"] == "2026-09-23T10:00:00.000000Z"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        253402300800000,  # 10000-01-01T00:00:00Z: one millisecond past the datetime range
+        2**63 - 1,  # the largest AMQP timestamp (signed 64-bit milliseconds)
+        -(2**63),
+        -62135596800001,  # one millisecond before 0001-01-01
+        float("nan"),
+        float("inf"),
+        "tomorrow",  # a producer can encode any AMQP type in the field
+    ],
+)
+def test_unconvertible_amqp_timestamp_is_left_empty_and_reported(value):
+    # P4-18: a producer-set value beyond the datetime range must not fail the run
+    reported: list[None] = []
+    m = make_message(b"x", creation_time=value, absolute_expiry_time=1790161200000)
+    row = message_metadata(
+        m,
+        entity=Q,
+        settlement_mode=SettlementMode.COMPLETE,
+        extracted_at=NOW,
+        on_timestamp_out_of_range=lambda: reported.append(None),
+    )
+    assert row["amqp_creation_time_utc"] == ""
+    assert row["amqp_absolute_expiry_time_utc"] == "2026-09-23T11:00:00.000000Z"
+    assert len(reported) == 1
+
+
+def test_every_unconvertible_amqp_timestamp_is_reported():
+    reported: list[None] = []
+    m = make_message(b"x", creation_time=2**63 - 1, absolute_expiry_time=253402300800000)
+    row = message_metadata(
+        m,
+        entity=Q,
+        settlement_mode=SettlementMode.COMPLETE,
+        extracted_at=NOW,
+        on_timestamp_out_of_range=lambda: reported.append(None),
+    )
+    assert row["amqp_creation_time_utc"] == row["amqp_absolute_expiry_time_utc"] == ""
+    assert len(reported) == 2
+
+
+def test_amqp_timestamp_edges_and_unset_are_not_reported():
+    reported: list[None] = []
+    m = make_message(b"x", creation_time=253402300799999, absolute_expiry_time=0)
+    row = message_metadata(
+        m,
+        entity=Q,
+        settlement_mode=SettlementMode.COMPLETE,
+        extracted_at=NOW,
+        on_timestamp_out_of_range=lambda: reported.append(None),
+    )
+    assert row["amqp_creation_time_utc"] == "9999-12-31T23:59:59.999000Z"
+    assert row["amqp_absolute_expiry_time_utc"] == "" and reported == []
+    # without a callback an unconvertible value is still left empty, never raised
+    far = make_message(b"x", creation_time=2**63 - 1)
+    assert (
+        message_metadata(far, entity=Q, settlement_mode=SettlementMode.PEEK, extracted_at=NOW)["amqp_creation_time_utc"]
+        == ""
+    )
 
 
 def test_message_metadata_mapping():

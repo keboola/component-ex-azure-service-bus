@@ -57,6 +57,21 @@ def test_defer_adds_to_pending(broker):
     assert q.state_of(seq) == "DEFERRED" and pending.count == 1 and stats.deferred == 1
 
 
+def test_out_of_range_amqp_timestamp_is_written_empty_and_settled(broker):
+    # P4-18: the row is written with the cell empty, the message completed as usual, the value counted
+    q = broker.add_queue("q")
+    seq = q.send(b"a", creation_time=253402300800000, absolute_expiry_time=2**63 - 1)
+    ok = q.send(b"b", creation_time=1790157600000)
+    proc, sink, stats = processor(broker, SettlementMode.COMPLETE)
+    with receiver(broker) as r:
+        result = proc.process(r, r.receive_messages(max_message_count=10), generation=0)
+    assert result.written == 2 and [row["body"] for row in sink.rows] == ["a", "b"]
+    assert sink.rows[0]["amqp_creation_time_utc"] == sink.rows[0]["amqp_absolute_expiry_time_utc"] == ""
+    assert sink.rows[1]["amqp_creation_time_utc"] == "2026-09-23T10:00:00.000000Z"
+    assert q.state_of(seq) is None and q.state_of(ok) is None and stats.completed == 2
+    assert stats.amqp_timestamps_out_of_range == 2
+
+
 def test_lock_lost_is_counted_not_fatal(broker):
     q = broker.add_queue("q")
     q.send(b"a")
@@ -347,7 +362,7 @@ def test_oversized_body_unmapped_cell_takes_the_unreadable_policy(broker, monkey
 
     monkeypatch.setattr(body_mod, "CELL_LIMIT_BYTES", 30)  # each field fits, their body_unmapped cell does not
     q = broker.add_queue("q")
-    seq = q.send(b'{"a":"xxxxxxxxxx","b":"yyyyyyyyyy"}')
+    seq = q.send(b'{"a":"xxxxxxxxxx","b":"yyyyyyyyyy"}', creation_time=2**63 - 1)
     stats = RunStats(mode="complete")
     sink = RecordingSink()
     proc = BatchProcessor(
@@ -367,6 +382,7 @@ def test_oversized_body_unmapped_cell_takes_the_unreadable_policy(broker, monkey
         result = proc.process(r, r.receive_messages(), generation=0)
     assert sink.rows == [] and result.written == 0 and q.dead_letter.state_of(seq) == "ACTIVE"
     assert stats.unreadable["BodyTooLarge:dead_lettered"] == 1
+    assert stats.amqp_timestamps_out_of_range == 0  # counted only on a row that is written
 
 
 def test_dead_letter_description_is_the_underlying_exception_class(broker):

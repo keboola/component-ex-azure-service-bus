@@ -73,6 +73,7 @@ class RunStats:
     expired_skipped: int = 0
     skipped_scheduled: int = 0
     max_delivery_count: int = 0
+    amqp_timestamps_out_of_range: int = 0
     orphans_guarded: list[int] = field(default_factory=list)
     unreadable: Counter[str] = field(default_factory=Counter)
     stop_reason: str = ""
@@ -119,6 +120,11 @@ class RunStats:
         """Feed the J8 delivery-count high-water mark from every message read this run."""
         self.max_delivery_count = max(self.max_delivery_count, n)
 
+    def note_amqp_timestamp_out_of_range(self) -> None:
+        """Count one AMQP ``creation-time`` / ``absolute-expiry-time`` left empty because it could
+        not be converted (P4-18); ``log_summary`` reports the total as one WARNING."""
+        self.amqp_timestamps_out_of_range += 1
+
     def unreadable_total(self) -> int:
         """Unreadable bodies actually disposed of this run: every ``unreadable`` count whose
         disposition (the part after the last ``:``) is not ``retry`` -- a retry is a recycle
@@ -148,6 +154,7 @@ class RunStats:
             ("expired_skipped", self.expired_skipped),
             ("skipped_scheduled", self.skipped_scheduled),
             ("max_delivery_count", self.max_delivery_count),
+            ("amqp_timestamps_out_of_range", self.amqp_timestamps_out_of_range),
         )
         tokens.extend(f"{name}={value}" for name, value in optional_counts if value)
         tokens.extend(
@@ -159,7 +166,14 @@ class RunStats:
 
     def log_summary(self) -> None:
         """One INFO line with ``summary_line()``, plus a second INFO line with the number of
-        distinct warnings raised this run when at least one was."""
+        distinct warnings raised this run when at least one was. AMQP timestamps left empty are
+        reported here, once, with the run's total (P4-18)."""
+        if self.amqp_timestamps_out_of_range:
+            self.warn(
+                "amqp_timestamps_out_of_range",
+                f"{self.amqp_timestamps_out_of_range} AMQP timestamp value(s) (creation-time / absolute-expiry-time) "
+                "were out of range and left empty; their messages were written and settled normally.",
+            )
         logger.info(self.summary_line())
         if self.warnings:
             logger.info("%d warning(s) were raised during this run.", len(self.warnings))

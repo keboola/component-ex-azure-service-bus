@@ -356,16 +356,25 @@ class BatchProcessor:
         )
 
     def _to_row(self, message: Any, extracted_at: datetime) -> tuple[OutputRow, int]:
-        """The message's output row and raw body size; raises one of ``UNREADABLE_ERRORS``."""
+        """The message's output row and raw body size; raises one of ``UNREADABLE_ERRORS``. The
+        metadata is mapped last, once the body is known to be readable, so an AMQP timestamp left
+        empty is counted only on a row that is written (P4-18)."""
         encoded = encode_body(message, self._body_format)
-        metadata = message_metadata(message, entity=self._entity, settlement_mode=self._mode, extracted_at=extracted_at)
+        if encoded.fields is not None:
+            registry = self._registry
+            assert registry is not None, "json_flatten requires a registry (checked in __init__)"
+            for path in encoded.fields:
+                registry.register(path)  # over the cap: a provisional name and `overflowed`; the row is still written
+            registry.split(encoded.fields)  # an over-limit body_unmapped cell raises BodyTooLargeError before any write
+        metadata = message_metadata(
+            message,
+            entity=self._entity,
+            settlement_mode=self._mode,
+            extracted_at=extracted_at,
+            on_timestamp_out_of_range=self._stats.note_amqp_timestamp_out_of_range,
+        )
         if encoded.fields is None:
             return OutputRow(metadata=metadata, body=encoded.cell), encoded.size_bytes
-        registry = self._registry
-        assert registry is not None, "json_flatten requires a registry (checked in __init__)"
-        for path in encoded.fields:
-            registry.register(path)  # over the cap: a provisional name and `overflowed`; the row is still written
-        registry.split(encoded.fields)  # an over-limit body_unmapped cell raises BodyTooLargeError before any write
         return OutputRow(metadata=metadata, fields=encoded.fields), encoded.size_bytes
 
     def _settle(self, receiver: Any, message: Any, body_bytes: int) -> None:

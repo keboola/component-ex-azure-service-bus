@@ -204,7 +204,8 @@ flattened `body_*` columns followed by `body_unmapped` (`json_flatten` mode).
 
 Value formats: every TIMESTAMP column is strict ISO 8601 in UTC, `YYYY-MM-DDTHH:MM:SS.ffffffZ`
 (e.g. `2026-09-24T14:03:15.123456Z`); Preview Messages and datetimes inside JSON cells use the same
-form. Empty values stay empty and booleans are `true` / `false`. `application_properties` /
+form. A producer-set AMQP creation / expiry time past year 9999 is left empty, with one WARNING per run.
+Empty values stay empty and booleans are `true` / `false`. `application_properties` /
 `message_annotations` stay JSON because their key set is producer-defined and varies per message;
 the fixed AMQP header / properties fields are flattened into their own scalar columns instead.
 

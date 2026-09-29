@@ -10,7 +10,7 @@ into the ``body`` / flattened ``body_*`` columns that follow this fixed set (§6
 body itself, for display only, and must never fail on a bad body.
 """
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -90,6 +90,18 @@ def format_timestamp(value: datetime | int | float | None) -> str:  # noqa: PYI0
     return format_utc(_EPOCH + timedelta(milliseconds=value))
 
 
+def _amqp_timestamp(value: Any, on_out_of_range: Callable[[], None]) -> str:
+    """A producer-set AMQP ``creation-time`` / ``absolute-expiry-time`` (P4-18): ``format_timestamp``,
+    except that a value it cannot convert -- beyond the datetime range (years 1-9999, e.g. the AMQP
+    maximum ``2**63 - 1``), NaN / infinity, or not a number at all -- renders empty and calls
+    ``on_out_of_range`` instead of failing the run; the message is written and settled as usual."""
+    try:
+        return format_timestamp(value)
+    except OverflowError, ValueError, TypeError:
+        on_out_of_range()
+        return ""
+
+
 def _str(value: object) -> str:
     """A plain STRING / INTEGER cell: ``None`` -> empty, everything else -> ``str(value)``."""
     return "" if value is None else str(value)
@@ -122,11 +134,13 @@ def message_metadata(
     entity: EntityRef,
     settlement_mode: SettlementMode,
     extracted_at: datetime,
+    on_timestamp_out_of_range: Callable[[], None] = lambda: None,
 ) -> dict[str, str]:
     """Map one received / peeked message to its output row (spec §4-E, §6.9), in
     ``metadata_column_names()`` order. Never touches ``message.body``. The AMQP header / properties
     objects on ``raw_amqp_message`` are read defensively (``getattr(obj, name, None)``) since either
-    can itself be ``None`` on the real SDK."""
+    can itself be ``None`` on the real SDK. ``on_timestamp_out_of_range`` is called once per AMQP
+    timestamp left empty because it could not be converted (P4-18)."""
     raw = message.raw_amqp_message
     header = getattr(raw, "header", None)
     properties = getattr(raw, "properties", None)
@@ -161,8 +175,12 @@ def message_metadata(
         "amqp_first_acquirer": _bool_str(getattr(header, "first_acquirer", None)),
         "amqp_user_id": _bytes_str(getattr(properties, "user_id", None)),
         "amqp_content_encoding": _bytes_str(getattr(properties, "content_encoding", None)),
-        "amqp_creation_time_utc": format_timestamp(getattr(properties, "creation_time", None)),
-        "amqp_absolute_expiry_time_utc": format_timestamp(getattr(properties, "absolute_expiry_time", None)),
+        "amqp_creation_time_utc": _amqp_timestamp(
+            getattr(properties, "creation_time", None), on_timestamp_out_of_range
+        ),
+        "amqp_absolute_expiry_time_utc": _amqp_timestamp(
+            getattr(properties, "absolute_expiry_time", None), on_timestamp_out_of_range
+        ),
         "amqp_group_sequence": _str(getattr(properties, "group_sequence", None)),
         "amqp_reply_to_group_id": _bytes_str(getattr(properties, "reply_to_group_id", None)),
         "source_entity": entity.path,

@@ -38,6 +38,32 @@ def test_summary_line_shows_skipped_scheduled():
     assert "skipped_scheduled=1" in s.summary_line()
 
 
+def test_amqp_timestamps_out_of_range_are_one_summary_warning(caplog):
+    # P4-18: however many values were left empty, the run logs one WARNING with the total
+    s = RunStats(mode="complete", received=2, written=2, stop_reason="idle")
+    for _ in range(3):
+        s.note_amqp_timestamp_out_of_range()
+    with caplog.at_level(logging.INFO):
+        s.log_summary()
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert warnings == [
+        (
+            "3 AMQP timestamp value(s) (creation-time / absolute-expiry-time) were out of range and left empty; "
+            "their messages were written and settled normally."
+        )
+    ]
+    assert "amqp_timestamps_out_of_range=3" in s.summary_line()
+    assert caplog.records[-1].getMessage() == "1 warning(s) were raised during this run."
+
+
+def test_no_amqp_timestamp_warning_when_every_value_converted(caplog):
+    s = RunStats(mode="complete", received=1, written=1, stop_reason="idle")
+    with caplog.at_level(logging.INFO):
+        s.log_summary()
+    assert not [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert "amqp_timestamps_out_of_range" not in s.summary_line()
+
+
 def test_effective_settings_marks_defaults(caplog):
     c = Configuration(**{"#connection_string": SAS, "source": {"entity_type": "queue", "queue_name": "q"}})  # ty: ignore[invalid-argument-type]
     with caplog.at_level(logging.INFO):
