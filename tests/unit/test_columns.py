@@ -46,6 +46,8 @@ def test_format_timestamp_is_strict_iso_8601_utc():
 def test_format_timestamp_epoch_milliseconds_and_unset():
     assert format_timestamp(1790157600000) == "2026-09-23T10:00:00.000000Z"
     assert format_timestamp(1790157600123) == "2026-09-23T10:00:00.123000Z"
+    # .NET's DateTimeOffset.MaxValue: exact integer arithmetic, no float rounding in the last millisecond
+    assert format_timestamp(253402300799999) == "9999-12-31T23:59:59.999000Z"
     assert format_timestamp(None) == "" and format_timestamp(0) == ""
 
 

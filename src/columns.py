@@ -11,7 +11,7 @@ body itself, for display only, and must never fail on a bad body.
 """
 
 from collections.abc import Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from body import charset_of, compact_json, format_utc
@@ -19,6 +19,7 @@ from configuration import SettlementMode
 from entity import EntityRef
 
 BODY_COLUMN = "body"
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
 # (name, base_type) in spec §6.9 column order; base types beyond STRING are spelled out there
 # (INTEGER / FLOAT / BOOLEAN / TIMESTAMP), every other column defaults to STRING.
@@ -84,7 +85,9 @@ def format_timestamp(value: datetime | int | float | None) -> str:  # noqa: PYI0
         return ""
     if isinstance(value, datetime):
         return format_utc(value)
-    return format_utc(datetime.fromtimestamp(value / 1000, tz=UTC))
+    # timedelta arithmetic is exact; `fromtimestamp(value / 1000)` rounds through a float and loses the
+    # last millisecond of far-future values (.NET's DateTimeOffset.MaxValue read as `…59.998993`)
+    return format_utc(_EPOCH + timedelta(milliseconds=value))
 
 
 def _str(value: object) -> str:
