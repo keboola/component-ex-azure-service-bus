@@ -3,17 +3,19 @@ services:
   dev:
     build: .
     volumes:
-        - ./:/code
-        - ./data:/data
+      - ./:/code
+      - ./data:/data
     environment:
       - KBC_DATADIR=./data
   test:
-    # Use to run flake8 and unittests checks
-    build: .
+    # Deviation from the template's build_n_test.sh (this repo has none): the multi-stage Dockerfile's
+    # test stage runs ruff at image build; this service builds that stage and runs its CMD.
+    build:
+      context: .
+      target: test
     volumes:
       - ./:/code
       - ./data:/data
     environment:
       - KBC_DATADIR=./data
-    command:
-      - python -m pytest tests/ --tb=short -q
+    command: ["uv", "run", "pytest", "tests/", "-v"]

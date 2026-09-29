@@ -1,1 +1,1 @@
-Enter short description of the component here.
+Reads messages from an Azure Service Bus queue or topic subscription into a Keboola Storage table.
