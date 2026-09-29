@@ -103,12 +103,6 @@ def test_load_entity_info_falls_back_when_denied(broker):
     assert info.partitioned is None and info.lock_duration_seconds == 60
 
 
-def test_list_names_sas_denied_returns_empty(broker):
-    broker.add_queue("b")
-    broker.management_denied = True
-    assert list_entity_names(connector(), "queues") == []
-
-
 def test_list_names_sp(broker):
     broker.add_queue("b")
     broker.add_queue("a")
@@ -191,6 +185,19 @@ def test_probe_management_listen_sas_with_details(broker):
         "The connection string has no Manage rights, so it cannot read the namespace's management data and "
         "cannot be tested here. Listen rights are enough to extract: use Preview Messages in a row to check "
         "that it can read the entity. " + DENIED_DETAILS
+    )
+
+
+@pytest.mark.parametrize(
+    ("kind", "noun"), [("queues", "queue"), ("topics", "topic"), ("subscriptions", "subscription")]
+)
+def test_list_names_listen_sas_denied_asks_to_type_the_name(broker, kind, noun):
+    """A Listen-only SAS used to get an empty list, so the dropdown stayed silently empty (P4-14)."""
+    broker.add_subscription("t", "s")
+    broker.management_denied = True
+    assert user_error(lambda: list_entity_names(connector(), kind, "t")) == (
+        f"Listing {kind} needs a connection string with Manage rights, or a service principal. "
+        f"With this connection string, type the {noun} name instead. " + DENIED_DETAILS
     )
 
 

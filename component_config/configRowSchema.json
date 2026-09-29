@@ -66,7 +66,7 @@
               "cache": false
             },
             "creatable": true,
-            "tooltip": "Listing needs a service principal or a connection string with **Manage** rights — with a Listen-only connection string, type the name.",
+            "tooltip": "Loading the list needs a service principal or a connection string with **Manage** rights. A Listen-only connection string gets an error message instead of the list: type the queue name.",
             "inputAttributes": {
               "placeholder": "my-queue"
             },
@@ -91,7 +91,7 @@
               "cache": false
             },
             "creatable": true,
-            "tooltip": "Listing needs a service principal or a connection string with **Manage** rights — with a Listen-only connection string, type the name.",
+            "tooltip": "Loading the list needs a service principal or a connection string with **Manage** rights. A Listen-only connection string gets an error message instead of the list: type the topic name.",
             "inputAttributes": {
               "placeholder": "my-topic"
             },
@@ -118,7 +118,7 @@
               "cache": false
             },
             "creatable": true,
-            "tooltip": "Listing needs a service principal or a connection string with **Manage** rights — with a Listen-only connection string, type the name. Select the topic first; after changing the topic, click **Load Subscriptions** again.",
+            "tooltip": "Loading the list needs a service principal or a connection string with **Manage** rights. A Listen-only connection string gets an error message instead of the list: type the subscription name. Select the topic first; after changing the topic, click **Load Subscriptions** again.",
             "inputAttributes": {
               "placeholder": "my-subscription"
             },

@@ -107,8 +107,8 @@
     }
   },
   {
-    "name": "08_listQueues_listen_sas_empty",
-    "description": "listQueues with a Listen-only SAS returns an empty list.",
+    "name": "08_listQueues_listen_sas_denied",
+    "description": "listQueues with a Listen-only SAS fails (exit 1): listing needs Manage rights or a service principal, so type the queue name.",
     "config": {
       "action": "listQueues",
       "parameters": {

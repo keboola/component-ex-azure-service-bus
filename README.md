@@ -37,8 +37,8 @@ Set once for the whole configuration. Choose one method:
 - **Connection string (SAS)** — a shared access signature connection string for the namespace or
   entity, with **Listen** rights. The entity dropdowns and the configuration's **Test Connection**
   additionally need **Manage** rights; a Listen-only connection string still works for reading, but
-  the entity name has to be typed instead of picked from a list, and **Preview Messages** in a row
-  is the way to check access.
+  loading a dropdown shows an error, the entity name has to be typed instead of picked from a list,
+  and **Preview Messages** in a row is the way to check access.
 - **Service principal (Entra ID)** — a Microsoft Entra ID application identity: tenant ID, client
   ID, client secret, and the fully qualified namespace host name (e.g.
   `my-namespace.servicebus.windows.net`). Grant it the **Azure Service Bus Data Receiver** RBAC
@@ -283,8 +283,8 @@ Sync actions
   read the row's entity. Nothing is settled (a session-enabled entity's session is held briefly).
 
 The list-entity dropdowns (queues / topics / subscriptions) need a service principal or a
-Manage-rights connection string; with a Listen-only connection string, type the entity name
-instead.
+Manage-rights connection string. With a Listen-only connection string, loading a list fails with a
+message that says so (the UI shows it as a notification); type the entity name instead.
 
 The UI runs the actions with the configuration's pinned `runtime.tag` when one is set, otherwise
 with the Developer Portal's default image tag.

@@ -281,9 +281,9 @@ def list_entity_names(
     topic_name: str | None = None,
 ) -> list[str]:
     """Sorted names for the ``list*`` sync actions (§5.4). A Listen-only SAS is denied management
-    reads by design, so it returns an empty list (the creatable select still lets the user type a
-    name) rather than failing; a service principal without the Data Receiver role, or whose credentials
-    Entra ID rejects, is a real error."""
+    reads by design; it gets a user error telling it to type the name (the UI shows it as a toast;
+    an empty list left the dropdown silently empty). A service principal without the Data Receiver
+    role, or whose credentials Entra ID rejects, gets its own message (``to_user_exception``)."""
     if kind == "subscriptions" and not topic_name:
         raise UserException("Select a topic first.")
     try:
@@ -297,7 +297,11 @@ def list_entity_names(
         return sorted(names)
     except AzureError as e:
         if is_management_denied(e) and connector.auth_type == AuthType.CONNECTION_STRING:
-            return []
+            message = (
+                f"Listing {kind} needs a connection string with Manage rights, or a service principal. "
+                f"With this connection string, type the {kind.removesuffix('s')} name instead."
+            )
+            raise with_details(message, e, connector.secrets) from e
         raise to_user_exception(e, topic_name, connector.secrets) from e
 
 

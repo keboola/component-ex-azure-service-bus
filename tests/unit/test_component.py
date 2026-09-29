@@ -397,11 +397,15 @@ def test_list_subscriptions_needs_a_topic(broker, tmp_path, monkeypatch, capsys)
     assert err == "Select a topic first."
 
 
-def test_list_queues_listen_sas_is_empty(broker, tmp_path, monkeypatch, capsys):
+def test_list_queues_listen_sas_is_a_user_error(broker, tmp_path, monkeypatch, capsys):
+    """The UI shows a sync action's user error as a toast; an empty list left the dropdown silently empty."""
     broker.add_queue("a")
     broker.management_denied = True
-    component(tmp_path, monkeypatch, {"#connection_string": SAS}, action="listQueues").execute_action()
-    assert sync_result(capsys) == []
+    err = sync_failure(capsys, component(tmp_path, monkeypatch, {"#connection_string": SAS}, action="listQueues"))
+    assert err.startswith(
+        "Listing queues needs a connection string with Manage rights, or a service principal. "
+        "With this connection string, type the queue name instead. (details: "
+    )
 
 
 def test_preview_messages_peeks_ten_as_a_table(broker, tmp_path, monkeypatch, capsys):

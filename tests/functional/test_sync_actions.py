@@ -70,19 +70,23 @@ def test_07_listQueues_sp(fake_broker, tmp_path, monkeypatch, capsys):
     assert _values(sync_result(result)) == ["a", "b"]
 
 
-def test_08_listQueues_listen_sas_empty(fake_broker, tmp_path, monkeypatch, capsys):
+def test_08_listQueues_listen_sas_denied(fake_broker, tmp_path, monkeypatch, capsys):
     fake_broker.add_queue("a")
     fake_broker.management_denied = True
-    result = run_case("08_listQueues_listen_sas_empty", tmp_path, monkeypatch, capsys)
-    assert result.exit_code == 0
-    assert sync_result(result) == []
+    result = run_case("08_listQueues_listen_sas_denied", tmp_path, monkeypatch, capsys)
+    assert result.exit_code == 1 and result.stdout == ""
+    assert result.stderr.startswith(
+        "Listing queues needs a connection string with Manage rights, or a service principal. "
+        "With this connection string, type the queue name instead. (details: "
+    )
+    assert DUMMY_SAS_KEY not in result.stderr
 
 
 def test_08_listQueues_without_credentials(fake_broker, tmp_path, monkeypatch, capsys):
     """Variant of case 08: the auth block is parsed inside the action (not in ``__init__``), so the
     sync-action wrapper reports the validation error on stderr -- the channel the UI reads."""
     overrides = {"#connection_string": ""}
-    result = run_case("08_listQueues_listen_sas_empty", tmp_path, monkeypatch, capsys, overrides=overrides)
+    result = run_case("08_listQueues_listen_sas_denied", tmp_path, monkeypatch, capsys, overrides=overrides)
     assert result.exit_code == 1
     assert result.stderr == (
         "Validation Error: configuration: Value error, `#connection_string` is required for connection_string auth."
