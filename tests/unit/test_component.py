@@ -66,6 +66,15 @@ def component(tmp_path, monkeypatch, parameters, **kwargs):
     return Component()
 
 
+SP_AUTH: dict[str, Any] = {
+    "auth_type": "service_principal",
+    "tenant_id": "00000000-0000-0000-0000-000000000000",
+    "client_id": "00000000-0000-0000-0000-000000000000",
+    "#client_secret": "dummy-secret",
+    "fully_qualified_namespace": "rootns.servicebus.windows.net",
+}
+ROW_SAS = "Endpoint=sb://rowns.servicebus.windows.net/;SharedAccessKeyName=row;SharedAccessKey=cm93a2V5"
+
 PARAMS: dict[str, Any] = {"#connection_string": SAS, "source": {"entity_type": "queue", "queue_name": "q"}}
 
 
@@ -374,10 +383,113 @@ def test_test_connection_root_probes_management(broker, tmp_path, monkeypatch, c
     assert broker.admin_calls == [("list_queues", "")] and broker.receivers == []
 
 
-def test_test_connection_root_listen_sas(broker, tmp_path, monkeypatch, capsys):
+def test_test_connection_root_listen_sas_is_informational(broker, tmp_path, monkeypatch, capsys):
     broker.management_denied = True
-    err = sync_failure(capsys, component(tmp_path, monkeypatch, {"#connection_string": SAS}, action="testConnection"))
-    assert err.startswith("The connection string has no Manage rights") and "Preview Messages in a row" in err
+    component(tmp_path, monkeypatch, {"#connection_string": SAS}, action="testConnection").execute_action()
+    result = sync_result(capsys)
+    assert result["type"] == "info" and "Extraction can still work" in result["message"]
+    assert "Preview Messages" in result["message"] and broker.receivers == []
+
+
+@pytest.mark.parametrize(
+    ("source", "path"),
+    [
+        ({"entity_type": "queue", "queue_name": "q"}, "q"),
+        ({"entity_type": "subscription", "topic_name": "t", "subscription_name": "s"}, "t/Subscriptions/s"),
+        ({"entity_type": "queue", "queue_name": "q", "sub_queue": "dead_letter"}, "q/$DeadLetterQueue"),
+    ],
+    ids=["queue", "subscription", "dead_letter"],
+)
+def test_test_connection_listen_only_peeks_the_entity(broker, tmp_path, monkeypatch, capsys, source, path):
+    broker.add_queue("q")
+    broker.add_subscription("t", "s")
+    broker.management_denied = True
+    params = {"#connection_string": SAS, "source": source}
+    component(tmp_path, monkeypatch, params, action="testConnection").execute_action()
+    result = sync_result(capsys)
+    assert result["status"] == "success" and result["type"] == "success" and f"'{path}'" in result["message"]
+    assert [r.entity_path for r in broker.receivers] == [path]
+
+
+def test_test_connection_listen_only_session_entity_without_a_session(broker, tmp_path, monkeypatch, capsys):
+    broker.add_queue("q", sessions=True)
+    broker.management_denied = True
+    params = {"#connection_string": SAS, "source": {**PARAMS["source"], "session_enabled": True}}
+    component(tmp_path, monkeypatch, params, action="testConnection").execute_action()
+    assert sync_result(capsys)["type"] == "success"
+
+
+def test_test_connection_listen_only_wrong_sessions_setting_fails(broker, tmp_path, monkeypatch, capsys):
+    broker.add_queue("q", sessions=True)
+    broker.management_denied = True
+    err = sync_failure(capsys, component(tmp_path, monkeypatch, {**PARAMS}, action="testConnection"))
+    assert "requires sessions" in err
+
+
+@pytest.mark.parametrize(
+    "source",
+    [{"entity_type": "subscription", "topic_name": "t"}, {"entity_type": "queue"}, {}],
+    ids=["topic_without_subscription", "queue_without_name", "empty"],
+)
+def test_test_connection_listen_only_without_a_known_entity_is_informational(
+    broker, tmp_path, monkeypatch, capsys, source
+):
+    broker.management_denied = True
+    params = {"#connection_string": SAS, "source": source}
+    component(tmp_path, monkeypatch, params, action="testConnection").execute_action()
+    assert sync_result(capsys)["type"] == "info" and broker.receivers == []
+
+
+def test_test_connection_rejected_key_still_fails(broker, tmp_path, monkeypatch, capsys):
+    broker.add_queue("q")
+    broker.management_denied = True  # a rejected key is a 401 on the management plane as well
+    broker.auth_failure = True
+    err = sync_failure(capsys, component(tmp_path, monkeypatch, PARAMS, action="testConnection"))
+    assert err.startswith("Authentication to Azure Service Bus failed for 'q'") and "c2VjcmV0" not in err
+
+
+def test_test_connection_unreachable_namespace_still_fails(broker, tmp_path, monkeypatch, capsys):
+    from azure.core.exceptions import ServiceRequestError
+
+    broker.management_error = ServiceRequestError("Name or service not known")
+    err = sync_failure(capsys, component(tmp_path, monkeypatch, PARAMS, action="testConnection"))
+    assert err.startswith("Azure Service Bus management reported an error") and broker.receivers == []
+
+
+def test_test_connection_entity_path_mismatch_fails(broker, tmp_path, monkeypatch, capsys):
+    broker.management_denied = True
+    params = {**PARAMS, "#connection_string": SAS + ";EntityPath=other"}
+    err = sync_failure(capsys, component(tmp_path, monkeypatch, params, action="testConnection"))
+    assert "EntityPath" in err and "'q'" in err and "c2VjcmV0" not in err
+
+
+def test_test_connection_topic_scoped_key_with_the_subscription_in_the_row(broker, tmp_path, monkeypatch, capsys):
+    broker.add_subscription("t", "s")
+    broker.management_denied = True
+    params = {
+        "#connection_string": SAS + ";EntityPath=t",
+        "source": {"entity_type": "subscription", "topic_name": "t", "subscription_name": "s"},
+    }
+    component(tmp_path, monkeypatch, params, action="testConnection").execute_action()
+    assert sync_result(capsys)["type"] == "success"
+    assert broker.clients[-1].entity_name == "t"
+
+
+def test_test_connection_sp_without_management_and_an_entity_peeks_it(broker, tmp_path, monkeypatch, capsys):
+    broker.add_queue("q")
+    broker.management_denied = True
+    params = {**PARAMS, **SP_AUTH}
+    del params["#connection_string"]
+    component(tmp_path, monkeypatch, params, action="testConnection").execute_action()
+    assert sync_result(capsys)["type"] == "success" and broker.credentials
+
+
+def test_test_connection_sp_without_management_and_no_entity_keeps_the_role_message(
+    broker, tmp_path, monkeypatch, capsys
+):
+    broker.management_denied = True
+    err = sync_failure(capsys, component(tmp_path, monkeypatch, SP_AUTH, action="testConnection"))
+    assert err.startswith("The service principal cannot read the namespace: grant it the")
 
 
 def test_list_topics_and_subscriptions(broker, tmp_path, monkeypatch, capsys):
@@ -575,6 +687,78 @@ def test_building_the_connector_installs_log_redaction(broker, tmp_path, monkeyp
     assert not any(isinstance(f, RedactingFilter) for h in root.handlers for f in h.filters)
     assert comp._connector.secrets == (SAS,)
     assert root.handlers and all(any(isinstance(f, RedactingFilter) for f in h.filters) for h in root.handlers)
+
+
+# --- the optional row-level connection string (CFTL-784) -------------------------------------------------
+
+
+def namespaces(broker) -> set[str]:
+    return {c.fully_qualified_namespace for c in [*broker.clients, *broker.admin_clients]}
+
+
+@pytest.mark.parametrize("root", [{"#connection_string": SAS}, SP_AUTH, {}], ids=["sas", "service_principal", "none"])
+def test_run_uses_the_row_key_over_any_root_auth(broker, tmp_path, monkeypatch, root):
+    broker.add_queue("q").send(b"hello")
+    params = {**root, "#row_connection_string": ROW_SAS, "source": PARAMS["source"]}
+    component(tmp_path, monkeypatch, params).execute_action()
+    assert (tmp_path / "out/tables/q.csv").read_text().splitlines()[1].endswith(",hello")
+    assert namespaces(broker) == {"rowns.servicebus.windows.net"} and not broker.credentials
+
+
+def test_row_key_secret_is_redacted(broker, tmp_path, monkeypatch):
+    from client import RedactingFilter
+
+    comp = component(tmp_path, monkeypatch, {"#row_connection_string": ROW_SAS, "source": PARAMS["source"]})
+    assert comp._connector.secrets == (ROW_SAS,)
+    record = logging.LogRecord("x", logging.INFO, __file__, 1, "string %s, again %s", (ROW_SAS, ROW_SAS[:40]), None)
+    RedactingFilter(comp._connector.secrets).filter(record)
+    assert "cm93a2V5" not in record.getMessage() and "***" in record.getMessage()
+
+
+def test_run_without_root_or_row_key_is_a_validation_error(broker, tmp_path, monkeypatch):
+    comp = component(tmp_path, monkeypatch, {"#row_connection_string": "  ", "source": PARAMS["source"]})
+    with pytest.raises(UserException, match="`#connection_string` is required"):
+        comp.execute_action()
+
+
+def test_run_with_an_incomplete_root_service_principal_needs_the_row_key(broker, tmp_path, monkeypatch):
+    comp = component(tmp_path, monkeypatch, {"auth_type": "service_principal", "source": PARAMS["source"]})
+    with pytest.raises(UserException, match="Service principal auth requires"):
+        comp.execute_action()
+
+
+def test_preview_messages_uses_the_row_key(broker, tmp_path, monkeypatch, capsys):
+    broker.add_queue("q").send(b"x")
+    params = {**SP_AUTH, "#row_connection_string": ROW_SAS, "source": PARAMS["source"]}
+    component(tmp_path, monkeypatch, params, action="previewMessages").execute_action()
+    assert sync_result(capsys)["type"] == "table"
+    assert namespaces(broker) == {"rowns.servicebus.windows.net"} and not broker.credentials
+
+
+@pytest.mark.parametrize(
+    ("action", "extra", "names"),
+    [
+        ("listQueues", {}, ["q"]),
+        ("listTopics", {}, ["t"]),
+        ("listSubscriptions", {"source": {"entity_type": "subscription", "topic_name": "t"}}, ["s"]),
+    ],
+)
+def test_list_actions_use_the_row_key(broker, tmp_path, monkeypatch, capsys, action, extra, names):
+    broker.add_queue("q")
+    broker.add_subscription("t", "s")
+    params = {**SP_AUTH, "#row_connection_string": ROW_SAS, **extra}
+    component(tmp_path, monkeypatch, params, action=action).execute_action()
+    assert [item["value"] for item in sync_result(capsys)] == names
+    assert namespaces(broker) == {"rowns.servicebus.windows.net"} and not broker.credentials
+
+
+def test_test_connection_uses_the_row_key_for_the_entity_probe(broker, tmp_path, monkeypatch, capsys):
+    broker.add_queue("q")
+    broker.management_denied = True
+    params = {**SP_AUTH, "#row_connection_string": ROW_SAS, "source": PARAMS["source"]}
+    component(tmp_path, monkeypatch, params, action="testConnection").execute_action()
+    assert sync_result(capsys)["type"] == "success"
+    assert namespaces(broker) == {"rowns.servicebus.windows.net"} and not broker.credentials
 
 
 # --- the __main__ guard ----------------------------------------------------------------------------------

@@ -10,6 +10,7 @@ from configuration import AuthConfiguration, SourceConfig
 from entity import (
     EntityInfo,
     EntityRef,
+    ManagementDeniedError,
     list_entity_names,
     load_entity_info,
     partition_of,
@@ -271,3 +272,18 @@ def test_log_entity_counts(caplog):
     assert [r.getMessage() for r in caplog.records] == [
         "Entity 'q' holds 3 active, 1 dead-lettered, 0 scheduled and 0 transfer-dead-lettered message(s)."
     ]
+
+
+@pytest.mark.parametrize("auth_type", ["connection_string", "service_principal"])
+def test_probe_management_denial_is_a_distinguishable_user_error(broker, auth_type):
+    broker.management_denied = True
+    with pytest.raises(ManagementDeniedError) as excinfo:
+        probe_management(connector(auth_type))
+    assert isinstance(excinfo.value, UserException)
+
+
+def test_probe_management_credential_failure_is_not_a_denial(broker):
+    broker.credential_failure = "AADSTS7000215: Invalid client secret provided."
+    with pytest.raises(UserException) as excinfo:
+        probe_management(connector("service_principal"))
+    assert not isinstance(excinfo.value, ManagementDeniedError)

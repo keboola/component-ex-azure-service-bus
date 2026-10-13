@@ -1,7 +1,7 @@
 """Service Bus connector: credential factory, client builders, error mapping, log redaction.
 
 This module is the pluggable auth seam (spec §3.1): ``ServiceBusConnector`` dispatches on
-``AuthConfiguration.auth_type`` to a concrete builder function via a dict, so a new auth method
+``AuthConfiguration.effective_auth_type`` to a concrete builder function via a dict, so a new auth method
 slots in by adding a builder and registering it. The transport is fixed to pyamqp -- no transport
 field is exposed and ``uamqp_transport`` is never set.
 
@@ -328,12 +328,16 @@ def to_user_exception(
 def _invalid_connection_string(auth: AuthConfiguration, error: ValueError) -> UserException:
     """Shared ``ValueError`` -> ``UserException`` mapping for a malformed connection string (§6.11);
     used by both the data-plane and management-plane connection-string builders."""
-    return UserException(f"Invalid connection string: {redact_secrets(str(error), (auth.connection_string,))}")
+    return UserException(
+        f"Invalid connection string: {redact_secrets(str(error), (auth.effective_connection_string,))}"
+    )
 
 
 def _connection_string_data_client(auth: AuthConfiguration, extra: dict[str, Any]) -> ServiceBusClient:
     try:
-        return ServiceBusClient.from_connection_string(conn_str=auth.connection_string, user_agent=USER_AGENT, **extra)
+        return ServiceBusClient.from_connection_string(
+            conn_str=auth.effective_connection_string, user_agent=USER_AGENT, **extra
+        )
     except ValueError as e:
         raise _invalid_connection_string(auth, e) from e
 
@@ -366,7 +370,7 @@ _DATA_BUILDERS: dict[AuthType, Callable[[AuthConfiguration, dict[str, Any]], Ser
 
 def _connection_string_admin_client(auth: AuthConfiguration) -> ServiceBusAdministrationClient:
     try:
-        return ServiceBusAdministrationClient.from_connection_string(auth.connection_string)
+        return ServiceBusAdministrationClient.from_connection_string(auth.effective_connection_string)
     except ValueError as e:
         raise _invalid_connection_string(auth, e) from e
 
@@ -393,12 +397,14 @@ class ServiceBusConnector:
     def __init__(self, auth: AuthConfiguration, client_identifier: str) -> None:
         self._auth = auth
         self.client_identifier = client_identifier
-        self.secrets: tuple[str, ...] = tuple(s for s in (auth.connection_string, auth.client_secret) if s)
+        self.secrets: tuple[str, ...] = tuple(
+            s for s in (auth.connection_string, auth.row_connection_string, auth.client_secret) if s
+        )
 
     @property
     def auth_type(self) -> AuthType:
         """The auth method this connector was built with (SAS vs. service-principal wording)."""
-        return self._auth.auth_type
+        return self._auth.effective_auth_type
 
     def receive_client(self) -> ServiceBusClient:
         """The data-plane client used for every receive / peek / settle (SDK default retries)."""
@@ -418,7 +424,7 @@ class ServiceBusConnector:
 
     def admin_client(self) -> ServiceBusAdministrationClient:
         """The management-plane client of the sync actions and the run's metadata pre-check."""
-        return _ADMIN_BUILDERS[self._auth.auth_type](self._auth)
+        return _ADMIN_BUILDERS[self._auth.effective_auth_type](self._auth)
 
     def _data_client(self, extra: dict[str, Any]) -> ServiceBusClient:
-        return _DATA_BUILDERS[self._auth.auth_type](self._auth, extra)
+        return _DATA_BUILDERS[self._auth.effective_auth_type](self._auth, extra)

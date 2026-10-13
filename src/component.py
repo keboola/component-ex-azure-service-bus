@@ -30,6 +30,7 @@ from columns import format_timestamp, metadata_column_names, render_preview, utc
 from commit import ForeignDeferralProbe, OrphanScanner, PendingCommitter
 from configuration import (
     AuthConfiguration,
+    AuthType,
     BodyFormat,
     Configuration,
     EntityConfiguration,
@@ -40,6 +41,7 @@ from configuration import (
 from entity import (
     EntityInfo,
     EntityRef,
+    ManagementDeniedError,
     list_entity_names,
     load_entity_info,
     log_entity_counts,
@@ -60,6 +62,16 @@ LEGACY_QUEUE_WARNING = (
     "defer_commit for failure-safe consumption on this project."
 )
 PREVIEW_MESSAGE_COUNT = 10
+NO_MANAGE_UNKNOWN_ENTITY_MESSAGE = (
+    "The connection string has no Manage rights, so the namespace itself cannot be checked here. Extraction can "
+    "still work: Listen rights are enough. Select the queue or subscription in a row and use Preview Messages "
+    "there to check that the key can read it. (Azure answers a rejected key the same way, so this result does not "
+    "confirm the key.)"
+)
+NO_MANAGE_ENTITY_READABLE_MESSAGE = (
+    "The credentials have no Manage rights, so the namespace's management data cannot be read here, but the entity "
+    "'{path}' can be read: extraction can work."
+)
 
 # The platform stops a sync action after 30 seconds (image pull excluded) and then answers a generic
 # HTTP 500 "Internal Server Error" instead of the action's message [docs: help.keboola.com/extend/
@@ -356,10 +368,28 @@ class Component(ComponentBase):
     @sync_action("testConnection")
     @_within_deadline
     def test_connection(self) -> ValidationResult:
-        """The root **Test Connection**: a management listing proves service-principal / Manage-SAS
-        auth. Only the auth block is read -- a row's **Preview Messages** proves entity access."""
-        probe_management(self._connector)
+        """**Test Connection**: a management listing proves service-principal / Manage-SAS auth. Without
+        Manage rights -- by design for a Listen-only key -- the entity named in the merged parameters (a
+        row's source) is peeked instead, which needs Listen only; with no entity to peek the result is
+        informational, never a failure that would suggest extraction cannot work."""
+        try:
+            probe_management(self._connector)
+        except ManagementDeniedError as denied:
+            return self._probe_entity_instead(denied)
         return ValidationResult("Connected to the Service Bus namespace.", MessageType.SUCCESS)
+
+    def _probe_entity_instead(self, denied: ManagementDeniedError) -> ValidationResult:
+        """The data-plane fallback of ``testConnection``. A rejected key or a wrong entity still fails here
+        (``_peek_row_entity`` maps it); a service principal with nothing to peek keeps its denial."""
+        try:
+            config = self._entity_configuration()
+        except UserException:  # no complete source: the root button, or a topic without its subscription
+            if self._connector.auth_type is AuthType.CONNECTION_STRING:
+                return ValidationResult(NO_MANAGE_UNKNOWN_ENTITY_MESSAGE, MessageType.INFO)
+            raise denied from None
+        self._peek_row_entity(1)
+        path = EntityRef.from_source(config.source).path
+        return ValidationResult(NO_MANAGE_ENTITY_READABLE_MESSAGE.format(path=path), MessageType.SUCCESS)
 
     @sync_action("listQueues")
     @_within_deadline

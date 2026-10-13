@@ -13,7 +13,7 @@ from enum import StrEnum
 from typing import Any, Self
 
 from keboola.component.exceptions import UserException
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 _TABLE_NAME_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9_-]*[A-Za-z0-9])?$")
 
@@ -80,11 +80,17 @@ class PrimaryKey(StrEnum):
 
 
 class AuthConfiguration(BaseModel):
-    """The config-root auth block, identical to the sibling writer's.
+    """The auth block, identical to the sibling writer's: the config-root fields plus the optional
+    row-level ``#row_connection_string``.
 
     Kept separate from ``Configuration`` so sync actions that only need auth
     (e.g. the root ``testConnection``) can build a partial model straight from
     the merged ``parameters`` dict without the row fields being required.
+
+    The row key and the root fields have different names, so the platform's merge (a row's value
+    wins on a shared key) never drops either one; a non-empty ``#row_connection_string`` takes
+    precedence over the root auth, whatever its ``auth_type``. Read the credentials through
+    ``effective_auth_type`` / ``effective_connection_string``, never the raw root fields.
     """
 
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
@@ -95,6 +101,7 @@ class AuthConfiguration(BaseModel):
     client_id: str = ""
     client_secret: str = Field("", alias="#client_secret")
     fully_qualified_namespace: str = ""
+    row_connection_string: str = Field("", alias="#row_connection_string")
 
     def __init__(self, **data: Any) -> None:
         try:
@@ -104,8 +111,28 @@ class AuthConfiguration(BaseModel):
             message = "Validation Error: " + ", ".join(f"{loc}: {err['msg']}" for loc, err in located)
             raise UserException(message) from e
 
+    @field_validator("row_connection_string")
+    @classmethod
+    def _strip_row_connection_string(cls, value: str) -> str:
+        return value.strip()
+
+    @property
+    def uses_row_connection_string(self) -> bool:
+        """The row carries its own key, which then replaces the root auth entirely."""
+        return bool(self.row_connection_string)
+
+    @property
+    def effective_auth_type(self) -> AuthType:
+        return AuthType.CONNECTION_STRING if self.uses_row_connection_string else self.auth_type
+
+    @property
+    def effective_connection_string(self) -> str:
+        return self.row_connection_string if self.uses_row_connection_string else self.connection_string
+
     @model_validator(mode="after")
     def _validate_auth(self) -> Self:
+        if self.uses_row_connection_string:
+            return self
         if self.auth_type == AuthType.CONNECTION_STRING and not self.connection_string:
             raise ValueError("`#connection_string` is required for connection_string auth.")
         if self.auth_type == AuthType.SERVICE_PRINCIPAL:
