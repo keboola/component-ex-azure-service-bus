@@ -63,14 +63,18 @@ LEGACY_QUEUE_WARNING = (
 )
 PREVIEW_MESSAGE_COUNT = 10
 NO_MANAGE_UNKNOWN_ENTITY_MESSAGE = (
-    "The connection string has no Manage rights, so the namespace itself cannot be checked here. Extraction can "
-    "still work: Listen rights are enough. Select the queue or subscription in a row and use Preview Messages "
-    "there to check that the key can read it. (Azure answers a rejected key the same way, so this result does not "
-    "confirm the key.)"
+    "Could not verify the connection string: it has no Manage rights, and the entity to read is not known here. "
+    "Extraction can still work, because Listen rights are enough. Select the queue or subscription in a row and "
+    "use Preview Messages there to check that the key can read it. Azure answers a rejected key the same way, so "
+    "this result does not confirm the key."
 )
 NO_MANAGE_ENTITY_READABLE_MESSAGE = (
     "The credentials have no Manage rights, so the namespace's management data cannot be read here, but the entity "
     "'{path}' can be read: extraction can work."
+)
+NO_MANAGE_NO_SESSION_MESSAGE = (
+    "The credentials have no Manage rights, and the session-enabled entity '{path}' has no session with messages "
+    "to peek right now, so reading it could not be checked here. Use Preview Messages in a row once it holds messages."
 )
 
 # The platform stops a sync action after 30 seconds (image pull excluded) and then answers a generic
@@ -368,10 +372,6 @@ class Component(ComponentBase):
     @sync_action("testConnection")
     @_within_deadline
     def test_connection(self) -> ValidationResult:
-        """**Test Connection**: a management listing proves service-principal / Manage-SAS auth. Without
-        Manage rights -- by design for a Listen-only key -- the entity named in the merged parameters (a
-        row's source) is peeked instead, which needs Listen only; with no entity to peek the result is
-        informational, never a failure that would suggest extraction cannot work."""
         try:
             probe_management(self._connector)
         except ManagementDeniedError as denied:
@@ -379,16 +379,14 @@ class Component(ComponentBase):
         return ValidationResult("Connected to the Service Bus namespace.", MessageType.SUCCESS)
 
     def _probe_entity_instead(self, denied: ManagementDeniedError) -> ValidationResult:
-        """The data-plane fallback of ``testConnection``. A rejected key or a wrong entity still fails here
-        (``_peek_row_entity`` maps it); a service principal with nothing to peek keeps its denial."""
-        try:
-            config = self._entity_configuration()
-        except UserException:  # no complete source: the root button, or a topic without its subscription
+        config = self._entity_configuration_or_none()
+        if config is None:
             if self._connector.auth_type is AuthType.CONNECTION_STRING:
-                return ValidationResult(NO_MANAGE_UNKNOWN_ENTITY_MESSAGE, MessageType.INFO)
-            raise denied from None
-        self._peek_row_entity(1)
+                return ValidationResult(NO_MANAGE_UNKNOWN_ENTITY_MESSAGE, MessageType.WARNING)
+            raise denied
         path = EntityRef.from_source(config.source).path
+        if self._peek_row_entity(1, config) is None:
+            return ValidationResult(NO_MANAGE_NO_SESSION_MESSAGE.format(path=path), MessageType.WARNING)
         return ValidationResult(NO_MANAGE_ENTITY_READABLE_MESSAGE.format(path=path), MessageType.SUCCESS)
 
     @sync_action("listQueues")
@@ -426,16 +424,22 @@ class Component(ComponentBase):
         (spec §5.4), so an unrelated half-edited field never blocks it."""
         return EntityConfiguration(**self.configuration.parameters)
 
+    def _entity_configuration_or_none(self) -> EntityConfiguration | None:
+        try:
+            return self._entity_configuration()
+        except UserException:
+            return None
+
     def _select_elements(
         self, kind: Literal["queues", "topics", "subscriptions"], topic_name: str | None = None
     ) -> list[SelectElement]:
         return [SelectElement(value=name, label=name) for name in list_entity_names(self._connector, kind, topic_name)]
 
-    def _peek_row_entity(self, max_message_count: int) -> list[Any] | None:
+    def _peek_row_entity(self, max_message_count: int, config: EntityConfiguration | None = None) -> list[Any] | None:
         """Peek the row's entity from its first message on a PEEK_LOCK receiver with the thread-free
         profile (spec §6.2); a session entity takes the next available session for a moment. ``None``
         when a session entity has no session with an available message."""
-        config = self._entity_configuration()
+        config = config or self._entity_configuration()
         entity = EntityRef.from_source(config.source)
         sessions = config.source.session_enabled
         kwargs: dict[str, Any] = {

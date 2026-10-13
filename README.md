@@ -51,10 +51,12 @@ Per-row connection string
 A row can carry its own optional **Connection String (Override)** (`#row_connection_string`, stored
 encrypted). When it is filled in, it replaces the configuration's authentication — whatever its
 type, including a service principal — for everything in that row: the run, Preview Messages, the
-**Load Queues / Topics / Subscriptions** lists and Test Connection. When it is empty, the row uses
+**Load Queues / Topics / Subscriptions** lists. When it is empty, the row uses
 the configuration's authentication exactly as before. The configuration's own connection string or
 service principal is required only for rows that do not set their own key; a row with neither
-fails with a validation error.
+fails with a validation error. A configuration whose rows all carry their own key and which has no
+configuration-level authentication can still not use the configuration's **Test Connection**: that
+button sees no row key and reports the missing credentials. Use Preview Messages in a row instead.
 
 The typical use is a key per entity: a queue's or topic's own shared access policy with **Listen**
 rights only, whose connection string ends with `EntityPath=<queue or topic>`. A key scoped to a
@@ -62,11 +64,11 @@ topic reads that topic's subscription named in the row; a key scoped to another 
 row's fails with an `EntityPath` error. Entity-scoped keys cannot list entities, so type the names
 and use Preview Messages.
 
-Keboola merges the configuration's and the row's parameters into one set per run (a value in the row
-wins over the same key in the configuration); the two keys have different names, so both reach the
-component and the component applies the precedence above. Actions are given whatever parameters the
-UI sends: a button on a row carries the row's key, a button on the configuration itself carries only
-the configuration's parameters and never sees a row's key.
+Keboola merges the configuration's and the row's parameters into one set for a run; the two keys
+have different names, so both reach the component and the component applies the precedence above.
+Actions are given whatever parameters the UI sends (the existing row actions rely on this: Preview
+Messages needs the root auth and the row's source), so a row's action carries the row key, while a
+button on the configuration itself carries only the configuration's parameters.
 
 Provisioning
 ============
@@ -307,12 +309,15 @@ Sync actions
   Listen-only key, which is enough to extract) it falls back to the data plane: when the parameters
   name a complete source entity (a queue, or a topic with its subscription) it peeks that entity,
   which needs only **Listen**, and reports whether it can be read. When no entity is known — the
-  button on the configuration itself, or a topic without a subscription name — it answers with an
-  informational message (not an error) saying that Manage rights are missing, that extraction can
-  still work, and that Preview Messages in a row checks Listen access. Azure answers a rejected key
-  with the same "unauthorized" as a missing Manage right, so that informational message does not
-  confirm the key; a key that Azure rejects on the entity, a wrong namespace and an `EntityPath`
-  that differs from the row's entity still fail with their usual messages.
+  button on the configuration itself, or a topic without a subscription name — it answers with a
+  warning (not an error) saying that Manage rights are missing, that extraction can
+  still work, and that Preview Messages in a row checks Listen access. That message is a warning, not
+  a failure and not a confirmation: Azure answers a rejected key with the same "unauthorized" as a
+  missing Manage right, so with no entity to peek the two cannot be told apart. A key that Azure
+  rejects on the entity, a wrong namespace and an `EntityPath` that differs from the row's entity
+  still fail with their usual messages. The button on the configuration sends the configuration's
+  parameters; whether the UI also sends a row's source with it has not been verified live, so the
+  entity peek is certain only for calls that carry the source (the API, the tests).
 - **Preview Messages** (row) — peeks up to 10 messages and shows sequence number, enqueued time,
   message ID, subject, state, and the start of the decoded body. It proves that the credentials can
   read the row's entity. Nothing is settled (a session-enabled entity's session is held briefly).

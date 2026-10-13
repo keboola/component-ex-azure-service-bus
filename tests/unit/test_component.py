@@ -383,11 +383,11 @@ def test_test_connection_root_probes_management(broker, tmp_path, monkeypatch, c
     assert broker.admin_calls == [("list_queues", "")] and broker.receivers == []
 
 
-def test_test_connection_root_listen_sas_is_informational(broker, tmp_path, monkeypatch, capsys):
+def test_test_connection_root_listen_sas_is_a_warning_not_a_failure(broker, tmp_path, monkeypatch, capsys):
     broker.management_denied = True
     component(tmp_path, monkeypatch, {"#connection_string": SAS}, action="testConnection").execute_action()
     result = sync_result(capsys)
-    assert result["type"] == "info" and "Extraction can still work" in result["message"]
+    assert result["type"] == "warning" and "Extraction can still work" in result["message"]
     assert "Preview Messages" in result["message"] and broker.receivers == []
 
 
@@ -416,7 +416,20 @@ def test_test_connection_listen_only_session_entity_without_a_session(broker, tm
     broker.management_denied = True
     params = {"#connection_string": SAS, "source": {**PARAMS["source"], "session_enabled": True}}
     component(tmp_path, monkeypatch, params, action="testConnection").execute_action()
-    assert sync_result(capsys)["type"] == "success"
+    result = sync_result(capsys)
+    assert result["type"] == "warning" and "no session with messages" in result["message"]
+
+
+def test_test_connection_rejected_key_without_an_entity_cannot_be_told_from_missing_manage(
+    broker, tmp_path, monkeypatch, capsys
+):
+    """Azure answers a rejected key with the same 401 as a missing Manage right and there is no entity to
+    peek."""
+    broker.management_denied = True
+    broker.auth_failure = True
+    component(tmp_path, monkeypatch, {"#connection_string": SAS}, action="testConnection").execute_action()
+    result = sync_result(capsys)
+    assert result["type"] == "warning" and "does not confirm the key" in result["message"]
 
 
 def test_test_connection_listen_only_wrong_sessions_setting_fails(broker, tmp_path, monkeypatch, capsys):
@@ -431,18 +444,16 @@ def test_test_connection_listen_only_wrong_sessions_setting_fails(broker, tmp_pa
     [{"entity_type": "subscription", "topic_name": "t"}, {"entity_type": "queue"}, {}],
     ids=["topic_without_subscription", "queue_without_name", "empty"],
 )
-def test_test_connection_listen_only_without_a_known_entity_is_informational(
-    broker, tmp_path, monkeypatch, capsys, source
-):
+def test_test_connection_listen_only_without_a_known_entity_is_a_warning(broker, tmp_path, monkeypatch, capsys, source):
     broker.management_denied = True
     params = {"#connection_string": SAS, "source": source}
     component(tmp_path, monkeypatch, params, action="testConnection").execute_action()
-    assert sync_result(capsys)["type"] == "info" and broker.receivers == []
+    assert sync_result(capsys)["type"] == "warning" and broker.receivers == []
 
 
 def test_test_connection_rejected_key_still_fails(broker, tmp_path, monkeypatch, capsys):
     broker.add_queue("q")
-    broker.management_denied = True  # a rejected key is a 401 on the management plane as well
+    broker.management_denied = True
     broker.auth_failure = True
     err = sync_failure(capsys, component(tmp_path, monkeypatch, PARAMS, action="testConnection"))
     assert err.startswith("Authentication to Azure Service Bus failed for 'q'") and "c2VjcmV0" not in err
@@ -687,9 +698,6 @@ def test_building_the_connector_installs_log_redaction(broker, tmp_path, monkeyp
     assert not any(isinstance(f, RedactingFilter) for h in root.handlers for f in h.filters)
     assert comp._connector.secrets == (SAS,)
     assert root.handlers and all(any(isinstance(f, RedactingFilter) for f in h.filters) for h in root.handlers)
-
-
-# --- the optional row-level connection string (CFTL-784) -------------------------------------------------
 
 
 def namespaces(broker) -> set[str]:

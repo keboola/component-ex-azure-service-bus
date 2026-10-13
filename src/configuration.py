@@ -80,17 +80,15 @@ class PrimaryKey(StrEnum):
 
 
 class AuthConfiguration(BaseModel):
-    """The auth block, identical to the sibling writer's: the config-root fields plus the optional
-    row-level ``#row_connection_string``.
+    """The config-root auth block, identical to the sibling writer's, plus the optional row-level
+    ``#row_connection_string``.
 
     Kept separate from ``Configuration`` so sync actions that only need auth
     (e.g. the root ``testConnection``) can build a partial model straight from
     the merged ``parameters`` dict without the row fields being required.
 
-    The row key and the root fields have different names, so the platform's merge (a row's value
-    wins on a shared key) never drops either one; a non-empty ``#row_connection_string`` takes
-    precedence over the root auth, whatever its ``auth_type``. Read the credentials through
-    ``effective_auth_type`` / ``effective_connection_string``, never the raw root fields.
+    The row key has its own name because the platform merges row parameters over root ones, so a key
+    shared with the root would replace it instead of overriding it in the component.
     """
 
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
@@ -111,14 +109,15 @@ class AuthConfiguration(BaseModel):
             message = "Validation Error: " + ", ".join(f"{loc}: {err['msg']}" for loc, err in located)
             raise UserException(message) from e
 
-    @field_validator("row_connection_string")
+    @field_validator("row_connection_string", mode="before")
     @classmethod
-    def _strip_row_connection_string(cls, value: str) -> str:
-        return value.strip()
+    def _normalise_row_connection_string(cls, value: Any) -> Any:
+        if value is None:
+            return ""
+        return value.strip() if isinstance(value, str) else value
 
     @property
     def uses_row_connection_string(self) -> bool:
-        """The row carries its own key, which then replaces the root auth entirely."""
         return bool(self.row_connection_string)
 
     @property

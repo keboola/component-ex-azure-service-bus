@@ -1,10 +1,3 @@
-"""Functional cases 75-79: the optional row-level ``#row_connection_string`` (CFTL-784).
-
-A row key replaces the root auth for the whole row -- run, Preview Messages and the list actions --
-and a configuration needs a root auth only when the row brings no key. The fake records the namespace
-every client was built for, which is how these cases tell the two credentials apart.
-"""
-
 from tests.functional.conftest import DUMMY_CLIENT_SECRET, DUMMY_SAS_KEY, run_case, sync_result
 
 ROW_NAMESPACE = "rowns.servicebus.windows.net"
@@ -27,7 +20,7 @@ def test_76_row_key_overrides_a_root_service_principal(fake_broker, tmp_path, mo
     assert result.exit_code == 0
     assert len(result.tables["q.csv"]) == 1
     assert {c.fully_qualified_namespace for c in fake_broker.clients + fake_broker.admin_clients} == {ROW_NAMESPACE}
-    assert not fake_broker.credentials  # the root service principal was never used
+    assert not fake_broker.credentials
     assert DUMMY_CLIENT_SECRET not in result.log and DUMMY_SAS_KEY not in result.log
 
 
@@ -44,7 +37,7 @@ def test_78_list_action_uses_the_row_key(fake_broker, tmp_path, monkeypatch, cap
     fake_broker.management_denied = True
     result = run_case("78_listQueues_row_connection_string_denied", tmp_path, monkeypatch, capsys)
     assert result.exit_code == 1
-    assert "type the queue name instead" in result.stderr  # the connection-string wording, not the SP one
+    assert "type the queue name instead" in result.stderr
     assert {c.fully_qualified_namespace for c in fake_broker.admin_clients} == {ROW_NAMESPACE}
     assert not fake_broker.credentials
     assert DUMMY_SAS_KEY not in result.stderr
@@ -58,7 +51,6 @@ def test_79_run_without_any_connection_string(fake_broker, tmp_path, monkeypatch
 
 
 def test_row_key_is_ignored_when_empty(fake_broker, tmp_path, monkeypatch, capsys):
-    """An empty or blank row key changes nothing: the root auth (and its validation) applies."""
     fake_broker.add_queue("q").send(b"x")
     overrides = {"#row_connection_string": "   "}
     result = run_case("20_run_c1_queue", tmp_path, monkeypatch, capsys, overrides=overrides)

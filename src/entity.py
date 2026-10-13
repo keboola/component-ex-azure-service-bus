@@ -305,17 +305,11 @@ def list_entity_names(
         raise to_user_exception(e, topic_name, connector.secrets) from e
 
 
-class ManagementDeniedError(UserException):
-    """The management endpoint refused the probe for lacking rights -- not a failed credential. Still a
-    ``UserException`` (its message names the missing right), so a caller with no better answer lets it
-    propagate; ``testConnection`` instead tries the data plane, where Listen alone is enough."""
+class ManagementDeniedError(UserException): ...
 
 
 def probe_management(connector: ServiceBusConnector) -> None:
-    """``testConnection``: lists the first queue to prove SP / Manage-SAS auth. A denial raises
-    :class:`ManagementDeniedError` naming the missing right (a Listen-only SAS is pointed at a row's
-    Preview Messages); rejected SP credentials and every other failure raise a plain ``UserException``
-    (``to_user_exception``)."""
+    """``testConnection``: lists the first queue to prove SP / Manage-SAS auth."""
     try:
         with connector.admin_client() as admin:
             next(iter(admin.list_queues()), None)

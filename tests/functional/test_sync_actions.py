@@ -56,13 +56,13 @@ def test_05_testConnection_root_sp(fake_broker, tmp_path, monkeypatch, capsys):
 
 
 def test_06_testConnection_root_listen_sas(fake_broker, tmp_path, monkeypatch, capsys):
-    """A Listen-only key with no entity to probe is not a failure: extraction can still work (CFTL-784)."""
     fake_broker.management_denied = True
     result = run_case("06_testConnection_root_listen_sas", tmp_path, monkeypatch, capsys)
     assert result.exit_code == 0
     payload = sync_result(result)
-    assert payload["type"] == "info"
+    assert payload["type"] == "warning"
     assert "no Manage rights" in payload["message"] and "Extraction can still work" in payload["message"]
+    assert "does not confirm the key" in payload["message"]
     assert "Preview Messages" in payload["message"] and fake_broker.receivers == []
 
 
@@ -168,7 +168,7 @@ def test_70_testConnection_listen_only_queue_key_probes_the_queue(fake_broker, t
     payload = sync_result(result)
     assert payload["status"] == "success" and "'q' can be read" in payload["message"]
     assert [r.entity_path for r in fake_broker.receivers] == ["q"]
-    assert q.state_of(seq) == "ACTIVE" and q.delivery_count(seq) == 0  # peeked, never locked
+    assert q.state_of(seq) == "ACTIVE" and q.delivery_count(seq) == 0
 
 
 def test_71_testConnection_topic_scoped_key_probes_the_subscription(fake_broker, tmp_path, monkeypatch, capsys):
@@ -178,7 +178,7 @@ def test_71_testConnection_topic_scoped_key_probes_the_subscription(fake_broker,
     assert result.exit_code == 0
     payload = sync_result(result)
     assert payload["status"] == "success" and "'t/Subscriptions/s' can be read" in payload["message"]
-    assert fake_broker.clients[-1].entity_name == "t"  # the key is scoped to the topic
+    assert fake_broker.clients[-1].entity_name == "t"
 
 
 def test_72_testConnection_topic_scoped_key_without_subscription(fake_broker, tmp_path, monkeypatch, capsys):
@@ -186,7 +186,7 @@ def test_72_testConnection_topic_scoped_key_without_subscription(fake_broker, tm
     fake_broker.management_denied = True
     result = run_case("72_testConnection_topic_scoped_without_subscription", tmp_path, monkeypatch, capsys)
     assert result.exit_code == 0
-    assert sync_result(result)["type"] == "info" and fake_broker.receivers == []
+    assert sync_result(result)["type"] == "warning" and fake_broker.receivers == []
 
 
 def test_73_testConnection_rejected_key_still_fails(fake_broker, tmp_path, monkeypatch, capsys):
@@ -208,7 +208,7 @@ def test_74_testConnection_entity_path_mismatch(fake_broker, tmp_path, monkeypat
     assert "EntityPath" in result.stderr and "'q'" in result.stderr
 
 
-def test_75_testConnection_missing_entity_fails(fake_broker, tmp_path, monkeypatch, capsys):
+def test_70_testConnection_missing_entity_fails(fake_broker, tmp_path, monkeypatch, capsys):
     """Service Bus reports a missing entity as unauthorized to a SAS key; the probe fails like Preview Messages."""
     fake_broker.management_denied = True
     result = run_case("70_testConnection_listen_only_queue_row", tmp_path, monkeypatch, capsys)

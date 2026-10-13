@@ -147,8 +147,6 @@ def test_sync_action_configuration_reads_a_partial_source():
         sync_cfg(source="not-an-object")
 
 
-# --- the optional row-level connection string (CFTL-784) ---------------------------------------------------
-
 ROW_SAS = "Endpoint=sb://rowns.servicebus.windows.net/;SharedAccessKeyName=row;SharedAccessKey=cm93a2V5;EntityPath=t"
 
 
@@ -194,3 +192,14 @@ def test_row_connection_string_in_the_full_and_the_sync_models():
     row = {"#row_connection_string": ROW_SAS, "source": SOURCE}
     assert Configuration(**row).effective_connection_string == ROW_SAS  # ty: ignore[invalid-argument-type]
     assert SyncActionConfiguration(**row).effective_connection_string == ROW_SAS  # ty: ignore[invalid-argument-type]
+
+
+@pytest.mark.parametrize("empty", [None, "", "  "])
+def test_a_null_row_connection_string_is_empty(empty):
+    auth = AuthConfiguration(**{"#connection_string": SAS, "#row_connection_string": empty})
+    assert auth.row_connection_string == "" and auth.effective_connection_string == SAS
+
+
+def test_a_non_string_row_connection_string_is_a_validation_error():
+    with pytest.raises(UserException, match="Validation Error: #row_connection_string"):
+        AuthConfiguration(**{"#connection_string": SAS, "#row_connection_string": 5})
