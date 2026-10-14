@@ -156,11 +156,11 @@ _ROOT_CREDENTIAL_FIELDS = {
 
 def has_no_credentials(parameters: Mapping[str, Any]) -> bool:
     """Neither a row key nor any credential field of the selected root auth type is filled in. An
-    unknown ``auth_type`` is not this case: ``AuthConfiguration`` reports it."""
+    unknown ``auth_type`` or a non-string credential is not this case: ``AuthConfiguration`` reports it."""
 
     def filled(key: str) -> bool:
         value = parameters.get(key)
-        return isinstance(value, str) and bool(value.strip())
+        return value is not None and (not isinstance(value, str) or bool(value.strip()))
 
     if filled("#row_connection_string"):
         return False

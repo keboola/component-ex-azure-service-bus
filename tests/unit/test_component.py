@@ -707,6 +707,12 @@ def test_test_connection_without_any_credentials_points_at_the_rows(broker, tmp_
     assert broker.clients == [] and broker.admin_clients == []
 
 
+def test_test_connection_with_a_non_string_row_key_reports_the_validation_error(broker, tmp_path, monkeypatch, capsys):
+    params = {"#row_connection_string": 5, "source": {"entity_type": "queue", "queue_name": "q"}}
+    err = sync_failure(capsys, component(tmp_path, monkeypatch, params, action="testConnection"))
+    assert err == "Validation Error: #row_connection_string: Input should be a valid string"
+
+
 def test_test_connection_with_a_half_filled_service_principal_keeps_the_validation_message(
     broker, tmp_path, monkeypatch, capsys
 ):

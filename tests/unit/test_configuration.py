@@ -220,6 +220,9 @@ def test_a_non_string_row_connection_string_is_a_validation_error():
         ({"auth_type": "connection_string", "#client_secret": "s"}, True),
         ({"#row_connection_string": ROW_SAS}, False),
         ({"auth_type": "bogus"}, False),
+        ({"#row_connection_string": None}, True),
+        ({"#row_connection_string": 5}, False),
+        ({"#connection_string": ["x"]}, False),
     ],
 )
 def test_has_no_credentials(params, missing):

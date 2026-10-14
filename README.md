@@ -69,7 +69,8 @@ Keboola merges the configuration's and the row's parameters into one set for a r
 have different names, so both reach the component and the component applies the precedence above.
 Actions are given whatever parameters the UI sends (the existing row actions rely on this: Preview
 Messages needs the root auth and the row's source), so a row's action carries the row key, while a
-button on the configuration itself carries only the configuration's parameters.
+button on the configuration itself is expected to carry only the configuration's parameters (not
+verified live).
 
 Provisioning
 ============
@@ -316,9 +317,9 @@ Sync actions
   a failure and not a confirmation: Azure answers a rejected key with the same "unauthorized" as a
   missing Manage right, so with no entity to peek the two cannot be told apart. A key that Azure
   rejects on the entity, a wrong namespace and an `EntityPath` that differs from the row's entity
-  still fail with their usual messages. The button on the configuration sends only the
-  configuration's parameters, so the entity peek runs from the row's **Test Connection**, which
-  sends the row's source and its `#row_connection_string`. With no credentials at all (no
+  still fail with their usual messages. The button on the configuration is expected to send only
+  the configuration's parameters (not verified live), so the entity peek runs from the row's **Test
+  Connection**, which sends the row's source and its `#row_connection_string`. With no credentials at all (no
   configuration-level authentication and no row key) it fails with a message pointing at the row's
   button.
 - **Preview Messages** (row) — peeks up to 10 messages and shows sequence number, enqueued time,
