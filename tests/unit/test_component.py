@@ -472,6 +472,7 @@ def test_test_connection_entity_path_mismatch_fails(broker, tmp_path, monkeypatc
     params = {**PARAMS, "#connection_string": SAS + ";EntityPath=other"}
     err = sync_failure(capsys, component(tmp_path, monkeypatch, params, action="testConnection"))
     assert "EntityPath" in err and "'q'" in err and "c2VjcmV0" not in err
+    assert err.startswith("The connection string is scoped") and "#row_connection_string" not in err
 
 
 def test_test_connection_topic_scoped_key_with_the_subscription_in_the_row(broker, tmp_path, monkeypatch, capsys):
@@ -674,7 +675,7 @@ def test_preview_normalises_the_source_like_a_run(broker, tmp_path, monkeypatch,
     assert "session_id" not in broker.receivers[0].kwargs
 
 
-@pytest.mark.parametrize("action", ["listQueues", "listTopics", "testConnection"])
+@pytest.mark.parametrize("action", ["listQueues", "listTopics"])
 def test_missing_credentials_fail_through_the_sync_action(broker, tmp_path, monkeypatch, capsys, action):
     comp = component(tmp_path, monkeypatch, {}, action=action)  # auth is no longer parsed in __init__
     err = sync_failure(capsys, comp)  # the sync-action wrapper writes the message to stderr and exits 1
@@ -682,6 +683,56 @@ def test_missing_credentials_fail_through_the_sync_action(broker, tmp_path, monk
         err
         == "Validation Error: configuration: Value error, `#connection_string` is required for connection_string auth."
     )
+
+
+NO_CREDENTIALS = (
+    "No credentials are set on the configuration. "
+    "If each row has its own row connection string, use Test Connection in that row."
+)
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {},
+        {"auth_type": "connection_string", "#connection_string": "  "},
+        {"auth_type": "service_principal"},
+        {"auth_type": "service_principal", "tenant_id": "", "#client_secret": ""},
+        {"#row_connection_string": "   ", "source": {"entity_type": "queue", "queue_name": "q"}},
+    ],
+)
+def test_test_connection_without_any_credentials_points_at_the_rows(broker, tmp_path, monkeypatch, capsys, params):
+    err = sync_failure(capsys, component(tmp_path, monkeypatch, params, action="testConnection"))
+    assert err == NO_CREDENTIALS
+    assert broker.clients == [] and broker.admin_clients == []
+
+
+def test_test_connection_with_a_half_filled_service_principal_keeps_the_validation_message(
+    broker, tmp_path, monkeypatch, capsys
+):
+    params = {"auth_type": "service_principal", "tenant_id": "t"}
+    err = sync_failure(capsys, component(tmp_path, monkeypatch, params, action="testConnection"))
+    assert err.startswith("Validation Error:") and "client_id, #client_secret, fully_qualified_namespace" in err
+
+
+def test_test_connection_with_only_a_row_key_probes_it(broker, tmp_path, monkeypatch, capsys):
+    broker.add_queue("q")
+    broker.management_denied = True
+    params = {
+        "#row_connection_string": ROW_SAS + ";EntityPath=q",
+        "source": {"entity_type": "queue", "queue_name": "q"},
+    }
+    component(tmp_path, monkeypatch, params, action="testConnection").execute_action()
+    assert sync_result(capsys)["type"] == "success"
+    assert {c.fully_qualified_namespace for c in broker.clients} == {"rowns.servicebus.windows.net"}
+
+
+def test_test_connection_row_key_entity_path_mismatch_names_the_row_key(broker, tmp_path, monkeypatch, capsys):
+    broker.management_denied = True
+    params = {**PARAMS, "#row_connection_string": ROW_SAS + ";EntityPath=other"}
+    err = sync_failure(capsys, component(tmp_path, monkeypatch, params, action="testConnection"))
+    assert err.startswith("The row connection string (#row_connection_string) is scoped to another entity")
+    assert "cm93a2V5" not in err and "c2VjcmV0" not in err
 
 
 def test_run_without_credentials_is_a_validation_error(broker, tmp_path, monkeypatch):

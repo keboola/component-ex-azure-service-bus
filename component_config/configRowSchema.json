@@ -11,7 +11,7 @@
       "description": "Optional. Overrides the configuration's authentication for this row",
       "format": "password",
       "options": {
-        "tooltip": "Optional. When filled in, this row uses this connection string instead of the configuration's authentication (also when that is a service principal). Handy for entity-scoped keys: a queue's or topic's own shared access policy with **Listen** rights only, whose connection string ends with `EntityPath=<name>`.\n\nThe **Load Queues / Topics / Subscriptions** lists need **Manage** rights; with a Listen-only key, type the entity name and use **Preview Messages** to check access. Leave empty to use the configuration's authentication.",
+        "tooltip": "Optional. When filled in, this row uses this connection string instead of the configuration's authentication (also when that is a service principal). Handy for entity-scoped keys: a queue's or topic's own shared access policy with **Listen** rights only, whose connection string ends with `EntityPath=<name>`.\n\nThe **Load Queues / Topics / Subscriptions** lists need **Manage** rights; with a Listen-only key, type the entity name and use **Test Connection** or **Preview Messages** to check access. Leave empty to use the configuration's authentication.",
         "inputAttributes": {
           "placeholder": "Endpoint=sb://<namespace>.servicebus.windows.net/;SharedAccessKeyName=<name>;SharedAccessKey=<key>;EntityPath=<queue or topic>"
         }
@@ -216,6 +216,18 @@
           },
           "default": 10,
           "propertyOrder": 9
+        },
+        "test_connection": {
+          "type": "button",
+          "format": "sync-action",
+          "options": {
+            "async": {
+              "label": "Test Connection",
+              "action": "testConnection"
+            },
+            "grid_columns": 4
+          },
+          "propertyOrder": 10
         },
         "preview_messages": {
           "type": "button",

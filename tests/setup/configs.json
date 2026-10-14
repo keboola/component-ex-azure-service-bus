@@ -1277,5 +1277,51 @@
       },
       "storage": {}
     }
+  },
+  {
+    "name": "80_testConnection_root_without_credentials",
+    "description": "The configuration's testConnection with no root auth (each row carries its own key): points at the row's Test Connection.",
+    "config": {
+      "action": "testConnection",
+      "parameters": {
+        "auth_type": "connection_string"
+      },
+      "storage": {}
+    }
+  },
+  {
+    "name": "81_testConnection_row_key_listen_only",
+    "description": "The row's testConnection with a Listen-only row key over a root service principal: management is denied, the row's entity is peeked with the row key.",
+    "config": {
+      "action": "testConnection",
+      "parameters": {
+        "auth_type": "service_principal",
+        "tenant_id": "00000000-0000-0000-0000-000000000000",
+        "client_id": "00000000-0000-0000-0000-000000000000",
+        "#client_secret": "dummy-secret",
+        "fully_qualified_namespace": "rootns.servicebus.windows.net",
+        "#row_connection_string": "Endpoint=sb://rowns.servicebus.windows.net/;SharedAccessKeyName=rowkey;SharedAccessKey=ZmFrZWtleWZha2VrZXlmYWtla2V5ZmFrZWtleTEyMzQ1Njc4OTA=;EntityPath=q",
+        "source": {
+          "entity_type": "queue",
+          "queue_name": "q"
+        }
+      },
+      "storage": {}
+    }
+  },
+  {
+    "name": "82_testConnection_row_key_entity_path_mismatch",
+    "description": "The row's testConnection with a row key scoped to another entity: the EntityPath error names the row key.",
+    "config": {
+      "action": "testConnection",
+      "parameters": {
+        "#row_connection_string": "Endpoint=sb://rowns.servicebus.windows.net/;SharedAccessKeyName=rowkey;SharedAccessKey=ZmFrZWtleWZha2VrZXlmYWtla2V5ZmFrZWtleTEyMzQ1Njc4OTA=;EntityPath=other",
+        "source": {
+          "entity_type": "queue",
+          "queue_name": "q"
+        }
+      },
+      "storage": {}
+    }
   }
 ]

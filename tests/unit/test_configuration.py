@@ -13,6 +13,7 @@ from configuration import (
     SubQueue,
     SyncActionConfiguration,
     UnreadablePolicy,
+    has_no_credentials,
 )
 
 SAS = "Endpoint=sb://ns.servicebus.windows.net/;SharedAccessKeyName=k;SharedAccessKey=c2VjcmV0"
@@ -203,3 +204,23 @@ def test_a_null_row_connection_string_is_empty(empty):
 def test_a_non_string_row_connection_string_is_a_validation_error():
     with pytest.raises(UserException, match="Validation Error: #row_connection_string"):
         AuthConfiguration(**{"#connection_string": SAS, "#row_connection_string": 5})
+
+
+@pytest.mark.parametrize(
+    ("params", "missing"),
+    [
+        ({}, True),
+        ({"auth_type": None, "#connection_string": ""}, True),
+        ({"#connection_string": "  \n"}, True),
+        ({"auth_type": "service_principal", "#connection_string": SAS}, True),
+        ({"auth_type": "service_principal", "client_id": " "}, True),
+        ({"#row_connection_string": "   "}, True),
+        ({"#connection_string": SAS}, False),
+        ({"auth_type": "service_principal", "tenant_id": "t"}, False),
+        ({"auth_type": "connection_string", "#client_secret": "s"}, True),
+        ({"#row_connection_string": ROW_SAS}, False),
+        ({"auth_type": "bogus"}, False),
+    ],
+)
+def test_has_no_credentials(params, missing):
+    assert has_no_credentials(params) is missing

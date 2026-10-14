@@ -260,7 +260,7 @@ class PendingCommitter:
         kwargs = _receiver_profile(self._connector, ServiceBusReceiveMode.RECEIVE_AND_DELETE)
         if session_id is not None and not ref.is_sub_queue:
             kwargs["session_id"] = session_id
-        receiver = ref.open_receiver(client, **kwargs)
+        receiver = ref.open_receiver(client, row_key=self._connector.uses_row_connection_string, **kwargs)
         try:
             return receiver.__enter__()
         except Exception:
@@ -318,7 +318,11 @@ def is_qualifying(message: Any, now: datetime) -> bool:
 def _peek_lock_receiver(connector: ServiceBusConnector, entity: EntityRef, client: ServiceBusClient) -> Any:
     """A PEEK_LOCK receiver for the entity: the peek receiver (a peek locks nothing) on the receive
     client, and the orphan-recovery receiver (a deferred receive locks the message) on the commit client."""
-    return entity.open_receiver(client, **_receiver_profile(connector, ServiceBusReceiveMode.PEEK_LOCK))
+    return entity.open_receiver(
+        client,
+        row_key=connector.uses_row_connection_string,
+        **_receiver_profile(connector, ServiceBusReceiveMode.PEEK_LOCK),
+    )
 
 
 class OrphanScanner:

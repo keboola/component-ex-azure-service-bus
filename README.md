@@ -38,7 +38,7 @@ Set once for the whole configuration. Choose one method:
   entity, with **Listen** rights. The entity dropdowns and the configuration's **Test Connection**
   additionally need **Manage** rights; a Listen-only connection string still works for reading, but
   loading a dropdown shows an error, the entity name has to be typed instead of picked from a list,
-  and **Preview Messages** in a row is the way to check access.
+  and **Test Connection** or **Preview Messages** in a row is the way to check access.
 - **Service principal (Entra ID)** — a Microsoft Entra ID application identity: tenant ID, client
   ID, client secret, and the fully qualified namespace host name (e.g.
   `my-namespace.servicebus.windows.net`). Grant it the **Azure Service Bus Data Receiver** RBAC
@@ -51,18 +51,19 @@ Per-row connection string
 A row can carry its own optional **Connection String (Override)** (`#row_connection_string`, stored
 encrypted). When it is filled in, it replaces the configuration's authentication — whatever its
 type, including a service principal — for everything in that row: the run, Preview Messages, the
-**Load Queues / Topics / Subscriptions** lists. When it is empty, the row uses
+**Load Queues / Topics / Subscriptions** lists and the row's **Test Connection**. When it is empty, the row uses
 the configuration's authentication exactly as before. The configuration's own connection string or
 service principal is required only for rows that do not set their own key; a row with neither
-fails with a validation error. A configuration whose rows all carry their own key and which has no
-configuration-level authentication can still not use the configuration's **Test Connection**: that
-button sees no row key and reports the missing credentials. Use Preview Messages in a row instead.
+fails with a validation error. In a configuration whose rows all carry their own key and which has
+no configuration-level authentication, the configuration's **Test Connection** sees no row key and
+fails with "No credentials are set on the configuration. If each row has its own row connection
+string, use Test Connection in that row." Use **Test Connection** in the row instead.
 
 The typical use is a key per entity: a queue's or topic's own shared access policy with **Listen**
 rights only, whose connection string ends with `EntityPath=<queue or topic>`. A key scoped to a
 topic reads that topic's subscription named in the row; a key scoped to another entity than the
-row's fails with an `EntityPath` error. Entity-scoped keys cannot list entities, so type the names
-and use Preview Messages.
+row's fails with an `EntityPath` error that names `#row_connection_string`. Entity-scoped keys
+cannot list entities, so type the names and use the row's Test Connection or Preview Messages.
 
 Keboola merges the configuration's and the row's parameters into one set for a run; the two keys
 have different names, so both reach the component and the component applies the precedence above.
@@ -304,20 +305,22 @@ to recover).
 Sync actions
 ============
 
-- **Test Connection** (configuration) — lists the namespace's queues to verify the credentials: a
+- **Test Connection** (configuration and row) — lists the namespace's queues to verify the credentials: a
   service principal, or a connection string with **Manage** rights. Without Manage rights (a
   Listen-only key, which is enough to extract) it falls back to the data plane: when the parameters
   name a complete source entity (a queue, or a topic with its subscription) it peeks that entity,
   which needs only **Listen**, and reports whether it can be read. When no entity is known — the
   button on the configuration itself, or a topic without a subscription name — it answers with a
   warning (not an error) saying that Manage rights are missing, that extraction can
-  still work, and that Preview Messages in a row checks Listen access. That message is a warning, not
+  still work, and that Test Connection in a row checks Listen access. That message is a warning, not
   a failure and not a confirmation: Azure answers a rejected key with the same "unauthorized" as a
   missing Manage right, so with no entity to peek the two cannot be told apart. A key that Azure
   rejects on the entity, a wrong namespace and an `EntityPath` that differs from the row's entity
-  still fail with their usual messages. The button on the configuration sends the configuration's
-  parameters; whether the UI also sends a row's source with it has not been verified live, so the
-  entity peek is certain only for calls that carry the source (the API, the tests).
+  still fail with their usual messages. The button on the configuration sends only the
+  configuration's parameters, so the entity peek runs from the row's **Test Connection**, which
+  sends the row's source and its `#row_connection_string`. With no credentials at all (no
+  configuration-level authentication and no row key) it fails with a message pointing at the row's
+  button.
 - **Preview Messages** (row) — peeks up to 10 messages and shows sequence number, enqueued time,
   message ID, subject, state, and the start of the decoded body. It proves that the credentials can
   read the row's entity. Nothing is settled (a session-enabled entity's session is held briefly).

@@ -402,6 +402,10 @@ class ServiceBusConnector:
         )
 
     @property
+    def uses_row_connection_string(self) -> bool:
+        return self._auth.uses_row_connection_string
+
+    @property
     def auth_type(self) -> AuthType:
         """The auth method this connector was built with (SAS vs. service-principal wording)."""
         return self._auth.effective_auth_type

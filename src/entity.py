@@ -106,9 +106,10 @@ class EntityRef:
         ``orders/$Transfer/$DeadLetterQueue`` or ``t/Subscriptions/s``."""
         return self.main_path + _SUB_QUEUE_SUFFIXES.get(self.sub_queue, "")
 
-    def open_receiver(self, client: ServiceBusClient, **kwargs: Any) -> ServiceBusReceiver:
+    def open_receiver(self, client: ServiceBusClient, *, row_key: bool = False, **kwargs: Any) -> ServiceBusReceiver:
         """Open the configured receiver on ``client``. The only ``ValueError`` mapping outside
-        ``ServiceBusConnector`` (§6.11): the connection string's ``EntityPath`` names another entity."""
+        ``ServiceBusConnector`` (§6.11): the connection string's ``EntityPath`` names another entity.
+        ``row_key``: the client uses the row's ``#row_connection_string``, which the hint then names."""
         extra = dict(kwargs)
         if self.sub_queue is not SubQueue.NONE:
             extra["sub_queue"] = _SUB_QUEUE_SDK[self.sub_queue]
@@ -122,9 +123,10 @@ class EntityRef:
             # `str(e)` is the SDK's own client-side message (it names the mismatched EntityPath, never
             # echoes the connection string), so `redact_secrets` needs no `secrets=` list here -- unlike
             # `to_user_exception`, which redacts raw SDK-error text that can quote request details.
+            key = "The row connection string (#row_connection_string)" if row_key else "The connection string"
             raise UserException(
-                f"The connection string is scoped to another entity (EntityPath) than '{self.path}'. Use a "
-                f"namespace-level connection string or select the entity named in it. (details: {redact_secrets(str(e))})"
+                f"{key} is scoped to another entity (EntityPath) than '{self.path}'. Use a namespace-level "
+                f"connection string or select the entity named in it. (details: {redact_secrets(str(e))})"
             ) from e
 
     def default_table_name(self) -> str:

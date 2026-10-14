@@ -37,6 +37,7 @@ from configuration import (
     FetchMode,
     SettlementMode,
     SyncActionConfiguration,
+    has_no_credentials,
 )
 from entity import (
     EntityInfo,
@@ -62,11 +63,15 @@ LEGACY_QUEUE_WARNING = (
     "defer_commit for failure-safe consumption on this project."
 )
 PREVIEW_MESSAGE_COUNT = 10
+NO_CREDENTIALS_MESSAGE = (
+    "No credentials are set on the configuration. "
+    "If each row has its own row connection string, use Test Connection in that row."
+)
 NO_MANAGE_UNKNOWN_ENTITY_MESSAGE = (
     "Could not verify the connection string: it has no Manage rights, and the entity to read is not known here. "
     "Extraction can still work, because Listen rights are enough. Select the queue or subscription in a row and "
-    "use Preview Messages there to check that the key can read it. Azure answers a rejected key the same way, so "
-    "this result does not confirm the key."
+    "use Test Connection or Preview Messages there to check that the key can read it. Azure answers a rejected "
+    "key the same way, so this result does not confirm the key."
 )
 NO_MANAGE_ENTITY_READABLE_MESSAGE = (
     "The credentials have no Manage rights, so the namespace's management data cannot be read here, but the entity "
@@ -372,6 +377,8 @@ class Component(ComponentBase):
     @sync_action("testConnection")
     @_within_deadline
     def test_connection(self) -> ValidationResult:
+        if has_no_credentials(self.configuration.parameters):
+            raise UserException(NO_CREDENTIALS_MESSAGE)
         try:
             probe_management(self._connector)
         except ManagementDeniedError as denied:
@@ -453,7 +460,8 @@ class Component(ComponentBase):
         # A session accept that finds no session must fail after one wait, not after four (spec §5.4).
         client_factory = self._connector.session_probe_client if sessions else self._connector.receive_client
         try:
-            with client_factory() as client, entity.open_receiver(client, **kwargs) as receiver:
+            row_key = self._connector.uses_row_connection_string
+            with client_factory() as client, entity.open_receiver(client, row_key=row_key, **kwargs) as receiver:
                 return receiver.peek_messages(max_message_count)
         except OperationTimeoutError as e:
             if sessions:

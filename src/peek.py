@@ -353,7 +353,9 @@ class PeekPager:
             self.config.advanced.prefetch_count,
             session_wait=SESSION_ACCEPT_WAIT_SECONDS if session else None,
         )
-        return enter_receiver(self._entity.open_receiver(self._client, **kwargs))
+        return enter_receiver(
+            self._entity.open_receiver(self._client, row_key=self._connector.uses_row_connection_string, **kwargs)
+        )
 
     def _recover(self, error: Exception) -> None:
         self._close()

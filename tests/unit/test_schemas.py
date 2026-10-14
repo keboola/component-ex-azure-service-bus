@@ -144,9 +144,9 @@ def test_portal_urls_point_at_main():
     assert (ROOT / "licenseUrl.md").read_text().strip() == f"{repo}/blob/main/LICENSE.md"
 
 
-def test_test_connection_is_a_root_button_only():
-    # Phase 8 (maintainer decision): the row form offers Preview Messages, which proves entity access;
-    # Test Connection (the management probe) lives on the configuration only.
+def test_test_connection_is_on_the_configuration_and_on_the_row():
+    # CFTL-784: the root button sends only root parameters, so only the row's button lets
+    # testConnection peek the row's entity with a Listen-only (or row) key.
     def buttons(schema: dict) -> dict[str, str]:
         return {
             name: prop.get("options", {}).get("async", {}).get("action") or prop["format"]
@@ -155,4 +155,9 @@ def test_test_connection_is_a_root_button_only():
         }
 
     assert buttons(ROOT_SCHEMA) == {"test_connection": "test-connection"}
-    assert buttons(ROW_SCHEMA) == {"source.preview_messages": "previewMessages"}
+    assert buttons(ROW_SCHEMA) == {
+        "source.test_connection": "testConnection",
+        "source.preview_messages": "previewMessages",
+    }
+    row_button = ROW_SCHEMA["properties"]["source"]["properties"]["test_connection"]
+    assert row_button["format"] == "sync-action" and row_button["options"]["async"]["label"] == "Test Connection"

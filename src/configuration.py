@@ -9,6 +9,7 @@ instead of the whole configuration.
 """
 
 import re
+from collections.abc import Mapping
 from enum import StrEnum
 from typing import Any, Self
 
@@ -145,6 +146,29 @@ class AuthConfiguration(BaseModel):
             if missing:
                 raise ValueError(f"Service principal auth requires: {', '.join(missing)}.")
         return self
+
+
+_ROOT_CREDENTIAL_FIELDS = {
+    AuthType.CONNECTION_STRING: ("#connection_string",),
+    AuthType.SERVICE_PRINCIPAL: ("tenant_id", "client_id", "#client_secret", "fully_qualified_namespace"),
+}
+
+
+def has_no_credentials(parameters: Mapping[str, Any]) -> bool:
+    """Neither a row key nor any credential field of the selected root auth type is filled in. An
+    unknown ``auth_type`` is not this case: ``AuthConfiguration`` reports it."""
+
+    def filled(key: str) -> bool:
+        value = parameters.get(key)
+        return isinstance(value, str) and bool(value.strip())
+
+    if filled("#row_connection_string"):
+        return False
+    try:
+        auth_type = AuthType(parameters.get("auth_type") or AuthType.CONNECTION_STRING)
+    except ValueError:
+        return False
+    return not any(filled(key) for key in _ROOT_CREDENTIAL_FIELDS[auth_type])
 
 
 class SourceConfig(BaseModel):
