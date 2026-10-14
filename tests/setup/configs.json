@@ -81,7 +81,7 @@
   },
   {
     "name": "06_testConnection_root_listen_sas",
-    "description": "Root testConnection with a Listen-only SAS explains it works only from a row.",
+    "description": "Root testConnection with a Listen-only SAS and no entity to probe: informational, not a failure.",
     "config": {
       "action": "testConnection",
       "parameters": {
@@ -1106,6 +1106,219 @@
         },
         "body": {
           "body_format": "json_flatten"
+        }
+      },
+      "storage": {}
+    }
+  },
+  {
+    "name": "70_testConnection_listen_only_queue_row",
+    "description": "testConnection with a Listen-only queue-scoped key from a row: management is denied, the queue is peeked instead.",
+    "config": {
+      "action": "testConnection",
+      "parameters": {
+        "auth_type": "connection_string",
+        "#connection_string": "Endpoint=sb://ns.servicebus.windows.net/;SharedAccessKeyName=listen;SharedAccessKey=ZmFrZWtleWZha2VrZXlmYWtla2V5ZmFrZWtleTEyMzQ1Njc4OTA=;EntityPath=q",
+        "source": {
+          "entity_type": "queue",
+          "queue_name": "q"
+        }
+      },
+      "storage": {}
+    }
+  },
+  {
+    "name": "71_testConnection_listen_only_topic_scoped_row",
+    "description": "testConnection with a Listen-only topic-scoped key and the subscription in the row: the subscription is peeked.",
+    "config": {
+      "action": "testConnection",
+      "parameters": {
+        "auth_type": "connection_string",
+        "#connection_string": "Endpoint=sb://ns.servicebus.windows.net/;SharedAccessKeyName=listen;SharedAccessKey=ZmFrZWtleWZha2VrZXlmYWtla2V5ZmFrZWtleTEyMzQ1Njc4OTA=;EntityPath=t",
+        "source": {
+          "entity_type": "subscription",
+          "topic_name": "t",
+          "subscription_name": "s"
+        }
+      },
+      "storage": {}
+    }
+  },
+  {
+    "name": "72_testConnection_topic_scoped_without_subscription",
+    "description": "testConnection with a topic-scoped Listen-only key and no subscription yet: informational, not a failure.",
+    "config": {
+      "action": "testConnection",
+      "parameters": {
+        "auth_type": "connection_string",
+        "#connection_string": "Endpoint=sb://ns.servicebus.windows.net/;SharedAccessKeyName=listen;SharedAccessKey=ZmFrZWtleWZha2VrZXlmYWtla2V5ZmFrZWtleTEyMzQ1Njc4OTA=;EntityPath=t",
+        "source": {
+          "entity_type": "subscription",
+          "topic_name": "t"
+        }
+      },
+      "storage": {}
+    }
+  },
+  {
+    "name": "73_testConnection_rejected_key_row",
+    "description": "testConnection where Azure rejects the key on every plane: the data-plane probe still fails with the authentication message.",
+    "config": {
+      "action": "testConnection",
+      "parameters": {
+        "auth_type": "connection_string",
+        "#connection_string": "Endpoint=sb://ns.servicebus.windows.net/;SharedAccessKeyName=listen;SharedAccessKey=ZmFrZWtleWZha2VrZXlmYWtla2V5ZmFrZWtleTEyMzQ1Njc4OTA=;EntityPath=q",
+        "source": {
+          "entity_type": "queue",
+          "queue_name": "q"
+        }
+      },
+      "storage": {}
+    }
+  },
+  {
+    "name": "74_testConnection_entity_path_mismatch_row",
+    "description": "testConnection with a key scoped to another entity than the row's: a clear EntityPath error.",
+    "config": {
+      "action": "testConnection",
+      "parameters": {
+        "auth_type": "connection_string",
+        "#connection_string": "Endpoint=sb://ns.servicebus.windows.net/;SharedAccessKeyName=listen;SharedAccessKey=ZmFrZWtleWZha2VrZXlmYWtla2V5ZmFrZWtleTEyMzQ1Njc4OTA=;EntityPath=other",
+        "source": {
+          "entity_type": "queue",
+          "queue_name": "q"
+        }
+      },
+      "storage": {}
+    }
+  },
+  {
+    "name": "75_run_row_connection_string_only",
+    "description": "A run whose only credential is the row's entity-scoped key (no root auth).",
+    "config": {
+      "action": "run",
+      "parameters": {
+        "#row_connection_string": "Endpoint=sb://rowns.servicebus.windows.net/;SharedAccessKeyName=rowkey;SharedAccessKey=ZmFrZWtleWZha2VrZXlmYWtla2V5ZmFrZWtleTEyMzQ1Njc4OTA=;EntityPath=t",
+        "source": {
+          "entity_type": "subscription",
+          "topic_name": "t",
+          "subscription_name": "s",
+          "settlement_mode": "receive_and_delete"
+        }
+      },
+      "storage": {}
+    }
+  },
+  {
+    "name": "76_run_row_connection_string_overrides_service_principal",
+    "description": "A row key overrides a root service principal for the run.",
+    "config": {
+      "action": "run",
+      "parameters": {
+        "auth_type": "service_principal",
+        "tenant_id": "00000000-0000-0000-0000-000000000000",
+        "client_id": "00000000-0000-0000-0000-000000000000",
+        "#client_secret": "dummy-secret",
+        "fully_qualified_namespace": "rootns.servicebus.windows.net",
+        "#row_connection_string": "Endpoint=sb://rowns.servicebus.windows.net/;SharedAccessKeyName=rowkey;SharedAccessKey=ZmFrZWtleWZha2VrZXlmYWtla2V5ZmFrZWtleTEyMzQ1Njc4OTA=",
+        "source": {
+          "entity_type": "queue",
+          "queue_name": "q",
+          "settlement_mode": "receive_and_delete"
+        }
+      },
+      "storage": {}
+    }
+  },
+  {
+    "name": "77_previewMessages_row_connection_string",
+    "description": "previewMessages with a row key and no root auth peeks the row's entity.",
+    "config": {
+      "action": "previewMessages",
+      "parameters": {
+        "#row_connection_string": "Endpoint=sb://rowns.servicebus.windows.net/;SharedAccessKeyName=rowkey;SharedAccessKey=ZmFrZWtleWZha2VrZXlmYWtla2V5ZmFrZWtleTEyMzQ1Njc4OTA=;EntityPath=q",
+        "source": {
+          "entity_type": "queue",
+          "queue_name": "q"
+        }
+      },
+      "storage": {}
+    }
+  },
+  {
+    "name": "78_listQueues_row_connection_string_denied",
+    "description": "listQueues in a row context uses the row key: a Listen-only key gets the type-the-name hint.",
+    "config": {
+      "action": "listQueues",
+      "parameters": {
+        "auth_type": "service_principal",
+        "tenant_id": "00000000-0000-0000-0000-000000000000",
+        "client_id": "00000000-0000-0000-0000-000000000000",
+        "#client_secret": "dummy-secret",
+        "fully_qualified_namespace": "rootns.servicebus.windows.net",
+        "#row_connection_string": "Endpoint=sb://rowns.servicebus.windows.net/;SharedAccessKeyName=rowkey;SharedAccessKey=ZmFrZWtleWZha2VrZXlmYWtla2V5ZmFrZWtleTEyMzQ1Njc4OTA=",
+        "source": {
+          "entity_type": "queue"
+        }
+      },
+      "storage": {}
+    }
+  },
+  {
+    "name": "79_run_without_any_connection_string",
+    "description": "A run with neither a root auth nor a row key fails with a validation error.",
+    "config": {
+      "action": "run",
+      "parameters": {
+        "source": {
+          "entity_type": "queue",
+          "queue_name": "q"
+        }
+      },
+      "storage": {}
+    }
+  },
+  {
+    "name": "80_testConnection_root_without_credentials",
+    "description": "The configuration's testConnection with no root auth (each row carries its own key): points at the row's Test Connection.",
+    "config": {
+      "action": "testConnection",
+      "parameters": {
+        "auth_type": "connection_string"
+      },
+      "storage": {}
+    }
+  },
+  {
+    "name": "81_testConnection_row_key_listen_only",
+    "description": "The row's testConnection with a Listen-only row key over a root service principal: management is denied, the row's entity is peeked with the row key.",
+    "config": {
+      "action": "testConnection",
+      "parameters": {
+        "auth_type": "service_principal",
+        "tenant_id": "00000000-0000-0000-0000-000000000000",
+        "client_id": "00000000-0000-0000-0000-000000000000",
+        "#client_secret": "dummy-secret",
+        "fully_qualified_namespace": "rootns.servicebus.windows.net",
+        "#row_connection_string": "Endpoint=sb://rowns.servicebus.windows.net/;SharedAccessKeyName=rowkey;SharedAccessKey=ZmFrZWtleWZha2VrZXlmYWtla2V5ZmFrZWtleTEyMzQ1Njc4OTA=;EntityPath=q",
+        "source": {
+          "entity_type": "queue",
+          "queue_name": "q"
+        }
+      },
+      "storage": {}
+    }
+  },
+  {
+    "name": "82_testConnection_row_key_entity_path_mismatch",
+    "description": "The row's testConnection with a row key scoped to another entity: the EntityPath error names the row key.",
+    "config": {
+      "action": "testConnection",
+      "parameters": {
+        "#row_connection_string": "Endpoint=sb://rowns.servicebus.windows.net/;SharedAccessKeyName=rowkey;SharedAccessKey=ZmFrZWtleWZha2VrZXlmYWtla2V5ZmFrZWtleTEyMzQ1Njc4OTA=;EntityPath=other",
+        "source": {
+          "entity_type": "queue",
+          "queue_name": "q"
         }
       },
       "storage": {}

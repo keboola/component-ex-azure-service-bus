@@ -116,6 +116,50 @@ def test_secrets_tuple():
     assert ServiceBusConnector(sp_auth(), "id").secrets == ("s3cr3t",)
 
 
+ROW_SAS = "Endpoint=sb://rowns.servicebus.windows.net/;SharedAccessKeyName=row;SharedAccessKey=cm93a2V5"
+
+
+def row_auth(**root) -> AuthConfiguration:
+    return AuthConfiguration(**{**root, "#row_connection_string": ROW_SAS})
+
+
+def test_secrets_include_every_credential_of_the_merged_parameters():
+    connector = ServiceBusConnector(row_auth(**{"#connection_string": SAS, "#client_secret": "s3cr3t"}), "id")
+    assert connector.secrets == (SAS, ROW_SAS, "s3cr3t")
+
+
+def test_row_connection_string_builds_the_data_and_admin_clients():
+    with (
+        mock.patch.object(client_mod, "ServiceBusClient") as data,
+        mock.patch.object(client_mod, "ServiceBusAdministrationClient") as adm,
+    ):
+        connector = ServiceBusConnector(row_auth(**{"#connection_string": SAS}), "id")
+        connector.receive_client()
+        connector.admin_client()
+    assert data.from_connection_string.call_args.kwargs["conn_str"] == ROW_SAS
+    adm.from_connection_string.assert_called_once_with(ROW_SAS)
+
+
+def test_row_connection_string_replaces_a_root_service_principal():
+    connector = ServiceBusConnector(row_auth(**sp_auth().model_dump(by_alias=True)), "id")
+    assert connector.auth_type is AuthType.CONNECTION_STRING
+    with (
+        mock.patch.object(client_mod, "ServiceBusClient") as data,
+        mock.patch.object(client_mod, "ClientSecretCredential") as credential,
+    ):
+        connector.receive_client()
+    data.from_connection_string.assert_called_once()
+    credential.assert_not_called()
+
+
+def test_malformed_row_connection_string_is_redacted():
+    auth = row_auth(**{"#connection_string": SAS})
+    object.__setattr__(auth, "row_connection_string", "garbage;SharedAccessKey=cm93a2V5")
+    with pytest.raises(UserException, match="Invalid connection string") as excinfo:
+        ServiceBusConnector(auth, "id").receive_client()
+    assert "cm93a2V5" not in str(excinfo.value)
+
+
 def test_auth_type_property():
     assert ServiceBusConnector(sas_auth(), "id").auth_type is AuthType.CONNECTION_STRING
     assert ServiceBusConnector(sp_auth(), "id").auth_type is AuthType.SERVICE_PRINCIPAL

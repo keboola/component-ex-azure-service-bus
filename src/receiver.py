@@ -403,7 +403,9 @@ class ReceiveLoop:
             self._config.advanced.prefetch_count,
             session_wait=self._wait if session else None,
         )
-        receiver = enter_receiver(self._entity.open_receiver(client, **kwargs))
+        receiver = enter_receiver(
+            self._entity.open_receiver(client, row_key=self._connector.uses_row_connection_string, **kwargs)
+        )
         self._received_on_receiver = False
         return receiver
 
@@ -498,7 +500,9 @@ class ReceiveLoop:
         now = self._clock()
         kwargs = receiver_profile(self._connector, ServiceBusReceiveMode.PEEK_LOCK, 1, session_wait=None)
         start = 0 if self._info.is_partitioned else (self._highest_processed or 0) + 1
-        peeker = enter_receiver(self._entity.open_receiver(self._client, **kwargs))
+        peeker = enter_receiver(
+            self._entity.open_receiver(self._client, row_key=self._connector.uses_row_connection_string, **kwargs)
+        )
         try:
             page = peeker.peek_messages(DRAIN_CHECK_PEEK_COUNT, sequence_number=start)
         finally:

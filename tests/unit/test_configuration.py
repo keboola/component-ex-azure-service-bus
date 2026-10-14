@@ -13,6 +13,7 @@ from configuration import (
     SubQueue,
     SyncActionConfiguration,
     UnreadablePolicy,
+    has_no_credentials,
 )
 
 SAS = "Endpoint=sb://ns.servicebus.windows.net/;SharedAccessKeyName=k;SharedAccessKey=c2VjcmV0"
@@ -145,3 +146,84 @@ def test_sync_action_configuration_reads_a_partial_source():
     assert sync_cfg().topic_name is None
     with pytest.raises(UserException, match="source"):
         sync_cfg(source="not-an-object")
+
+
+ROW_SAS = "Endpoint=sb://rowns.servicebus.windows.net/;SharedAccessKeyName=row;SharedAccessKey=cm93a2V5;EntityPath=t"
+
+
+def test_row_connection_string_is_optional_and_empty_by_default():
+    auth = AuthConfiguration(**{"#connection_string": SAS})
+    assert auth.row_connection_string == "" and not auth.uses_row_connection_string
+    assert auth.effective_auth_type is AuthType.CONNECTION_STRING and auth.effective_connection_string == SAS
+
+
+def test_row_connection_string_replaces_the_root_connection_string():
+    auth = AuthConfiguration(**{"#connection_string": SAS, "#row_connection_string": f"  {ROW_SAS}\n"})
+    assert auth.uses_row_connection_string and auth.effective_connection_string == ROW_SAS
+
+
+@pytest.mark.parametrize(
+    "root",
+    [{}, {"auth_type": "service_principal"}, {"auth_type": "service_principal", "tenant_id": "t"}],
+    ids=["no_root_auth", "empty_service_principal", "partial_service_principal"],
+)
+def test_row_connection_string_makes_the_root_auth_optional(root):
+    auth = AuthConfiguration(**root, **{"#row_connection_string": ROW_SAS})
+    assert auth.effective_auth_type is AuthType.CONNECTION_STRING and auth.effective_connection_string == ROW_SAS
+
+
+def test_row_connection_string_wins_over_a_complete_service_principal():
+    auth = AuthConfiguration(
+        auth_type="service_principal",
+        tenant_id="t",
+        client_id="c",
+        fully_qualified_namespace="ns.servicebus.windows.net",
+        **{"#client_secret": "x", "#row_connection_string": ROW_SAS},
+    )
+    assert auth.effective_auth_type is AuthType.CONNECTION_STRING and auth.auth_type is AuthType.SERVICE_PRINCIPAL
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\n"])
+def test_a_blank_row_connection_string_leaves_the_root_auth_required(blank):
+    with pytest.raises(UserException, match="`#connection_string` is required for connection_string auth."):
+        AuthConfiguration(**{"#row_connection_string": blank})
+
+
+def test_row_connection_string_in_the_full_and_the_sync_models():
+    row = {"#row_connection_string": ROW_SAS, "source": SOURCE}
+    assert Configuration(**row).effective_connection_string == ROW_SAS  # ty: ignore[invalid-argument-type]
+    assert SyncActionConfiguration(**row).effective_connection_string == ROW_SAS  # ty: ignore[invalid-argument-type]
+
+
+@pytest.mark.parametrize("empty", [None, "", "  "])
+def test_a_null_row_connection_string_is_empty(empty):
+    auth = AuthConfiguration(**{"#connection_string": SAS, "#row_connection_string": empty})
+    assert auth.row_connection_string == "" and auth.effective_connection_string == SAS
+
+
+def test_a_non_string_row_connection_string_is_a_validation_error():
+    with pytest.raises(UserException, match="Validation Error: #row_connection_string"):
+        AuthConfiguration(**{"#connection_string": SAS, "#row_connection_string": 5})
+
+
+@pytest.mark.parametrize(
+    ("params", "missing"),
+    [
+        ({}, True),
+        ({"auth_type": None, "#connection_string": ""}, True),
+        ({"#connection_string": "  \n"}, True),
+        ({"auth_type": "service_principal", "#connection_string": SAS}, True),
+        ({"auth_type": "service_principal", "client_id": " "}, True),
+        ({"#row_connection_string": "   "}, True),
+        ({"#connection_string": SAS}, False),
+        ({"auth_type": "service_principal", "tenant_id": "t"}, False),
+        ({"auth_type": "connection_string", "#client_secret": "s"}, True),
+        ({"#row_connection_string": ROW_SAS}, False),
+        ({"auth_type": "bogus"}, False),
+        ({"#row_connection_string": None}, True),
+        ({"#row_connection_string": 5}, False),
+        ({"#connection_string": ["x"]}, False),
+    ],
+)
+def test_has_no_credentials(params, missing):
+    assert has_no_credentials(params) is missing

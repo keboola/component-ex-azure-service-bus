@@ -9,11 +9,12 @@ instead of the whole configuration.
 """
 
 import re
+from collections.abc import Mapping
 from enum import StrEnum
 from typing import Any, Self
 
 from keboola.component.exceptions import UserException
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 _TABLE_NAME_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9_-]*[A-Za-z0-9])?$")
 
@@ -80,11 +81,15 @@ class PrimaryKey(StrEnum):
 
 
 class AuthConfiguration(BaseModel):
-    """The config-root auth block, identical to the sibling writer's.
+    """The config-root auth block, identical to the sibling writer's, plus the optional row-level
+    ``#row_connection_string``.
 
     Kept separate from ``Configuration`` so sync actions that only need auth
     (e.g. the root ``testConnection``) can build a partial model straight from
     the merged ``parameters`` dict without the row fields being required.
+
+    The row key has its own name because the platform merges row parameters over root ones, so a key
+    shared with the root would replace it instead of overriding it in the component.
     """
 
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
@@ -95,6 +100,7 @@ class AuthConfiguration(BaseModel):
     client_id: str = ""
     client_secret: str = Field("", alias="#client_secret")
     fully_qualified_namespace: str = ""
+    row_connection_string: str = Field("", alias="#row_connection_string")
 
     def __init__(self, **data: Any) -> None:
         try:
@@ -104,8 +110,29 @@ class AuthConfiguration(BaseModel):
             message = "Validation Error: " + ", ".join(f"{loc}: {err['msg']}" for loc, err in located)
             raise UserException(message) from e
 
+    @field_validator("row_connection_string", mode="before")
+    @classmethod
+    def _normalise_row_connection_string(cls, value: Any) -> Any:
+        if value is None:
+            return ""
+        return value.strip() if isinstance(value, str) else value
+
+    @property
+    def uses_row_connection_string(self) -> bool:
+        return bool(self.row_connection_string)
+
+    @property
+    def effective_auth_type(self) -> AuthType:
+        return AuthType.CONNECTION_STRING if self.uses_row_connection_string else self.auth_type
+
+    @property
+    def effective_connection_string(self) -> str:
+        return self.row_connection_string if self.uses_row_connection_string else self.connection_string
+
     @model_validator(mode="after")
     def _validate_auth(self) -> Self:
+        if self.uses_row_connection_string:
+            return self
         if self.auth_type == AuthType.CONNECTION_STRING and not self.connection_string:
             raise ValueError("`#connection_string` is required for connection_string auth.")
         if self.auth_type == AuthType.SERVICE_PRINCIPAL:
@@ -119,6 +146,29 @@ class AuthConfiguration(BaseModel):
             if missing:
                 raise ValueError(f"Service principal auth requires: {', '.join(missing)}.")
         return self
+
+
+_ROOT_CREDENTIAL_FIELDS = {
+    AuthType.CONNECTION_STRING: ("#connection_string",),
+    AuthType.SERVICE_PRINCIPAL: ("tenant_id", "client_id", "#client_secret", "fully_qualified_namespace"),
+}
+
+
+def has_no_credentials(parameters: Mapping[str, Any]) -> bool:
+    """Neither a row key nor any credential field of the selected root auth type is filled in. An
+    unknown ``auth_type`` or a non-string credential is not this case: ``AuthConfiguration`` reports it."""
+
+    def filled(key: str) -> bool:
+        value = parameters.get(key)
+        return value is not None and (not isinstance(value, str) or bool(value.strip()))
+
+    if filled("#row_connection_string"):
+        return False
+    try:
+        auth_type = AuthType(parameters.get("auth_type") or AuthType.CONNECTION_STRING)
+    except ValueError:
+        return False
+    return not any(filled(key) for key in _ROOT_CREDENTIAL_FIELDS[auth_type])
 
 
 class SourceConfig(BaseModel):

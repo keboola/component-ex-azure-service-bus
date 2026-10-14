@@ -10,6 +10,7 @@ from configuration import AuthConfiguration, SourceConfig
 from entity import (
     EntityInfo,
     EntityRef,
+    ManagementDeniedError,
     list_entity_names,
     load_entity_info,
     partition_of,
@@ -254,8 +255,25 @@ def test_open_receiver_entity_path_mismatch(broker):
     broker.add_queue("orders")
     auth = AuthConfiguration(**{"auth_type": "connection_string", "#connection_string": SAS + ";EntityPath=other"})
     ref = EntityRef.from_source(SourceConfig(entity_type="queue", queue_name="orders"))
-    with pytest.raises(UserException, match="EntityPath"):
+    with pytest.raises(UserException, match="EntityPath") as raised:
         ref.open_receiver(ServiceBusConnector(auth, "id").receive_client(), prefetch_count=1, keep_alive=0)
+    assert str(raised.value).startswith("The connection string is scoped to another entity (EntityPath) than 'orders'.")
+
+
+def test_open_receiver_entity_path_mismatch_names_the_row_key(broker):
+    broker.add_queue("orders")
+    auth = AuthConfiguration(**{"#row_connection_string": SAS + ";EntityPath=other"})
+    connector = ServiceBusConnector(auth, "id")
+    ref = EntityRef.from_source(SourceConfig(entity_type="queue", queue_name="orders"))
+    with pytest.raises(UserException) as raised:
+        ref.open_receiver(
+            connector.receive_client(), row_key=connector.uses_row_connection_string, prefetch_count=1, keep_alive=0
+        )
+    assert str(raised.value).startswith(
+        "The row connection string (#row_connection_string) is scoped to another entity (EntityPath) than 'orders'. "
+        "Use a namespace-level connection string or select the entity named in it."
+    )
+    assert "c2VjcmV0" not in str(raised.value)
 
 
 def test_log_entity_counts(caplog):
@@ -271,3 +289,18 @@ def test_log_entity_counts(caplog):
     assert [r.getMessage() for r in caplog.records] == [
         "Entity 'q' holds 3 active, 1 dead-lettered, 0 scheduled and 0 transfer-dead-lettered message(s)."
     ]
+
+
+@pytest.mark.parametrize("auth_type", ["connection_string", "service_principal"])
+def test_probe_management_denial_is_a_distinguishable_user_error(broker, auth_type):
+    broker.management_denied = True
+    with pytest.raises(ManagementDeniedError) as excinfo:
+        probe_management(connector(auth_type))
+    assert isinstance(excinfo.value, UserException)
+
+
+def test_probe_management_credential_failure_is_not_a_denial(broker):
+    broker.credential_failure = "AADSTS7000215: Invalid client secret provided."
+    with pytest.raises(UserException) as excinfo:
+        probe_management(connector("service_principal"))
+    assert not isinstance(excinfo.value, ManagementDeniedError)

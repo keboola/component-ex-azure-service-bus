@@ -30,16 +30,19 @@ from columns import format_timestamp, metadata_column_names, render_preview, utc
 from commit import ForeignDeferralProbe, OrphanScanner, PendingCommitter
 from configuration import (
     AuthConfiguration,
+    AuthType,
     BodyFormat,
     Configuration,
     EntityConfiguration,
     FetchMode,
     SettlementMode,
     SyncActionConfiguration,
+    has_no_credentials,
 )
 from entity import (
     EntityInfo,
     EntityRef,
+    ManagementDeniedError,
     list_entity_names,
     load_entity_info,
     log_entity_counts,
@@ -60,6 +63,24 @@ LEGACY_QUEUE_WARNING = (
     "defer_commit for failure-safe consumption on this project."
 )
 PREVIEW_MESSAGE_COUNT = 10
+NO_CREDENTIALS_MESSAGE = (
+    "No credentials are set on the configuration. "
+    "If each row has its own row connection string, use Test Connection in that row."
+)
+NO_MANAGE_UNKNOWN_ENTITY_MESSAGE = (
+    "Could not verify the connection string: it has no Manage rights, and the entity to read is not known here. "
+    "Extraction can still work, because Listen rights are enough. Select the queue or subscription in a row and "
+    "use Test Connection or Preview Messages there to check that the key can read it. Azure answers a rejected "
+    "key the same way, so this result does not confirm the key."
+)
+NO_MANAGE_ENTITY_READABLE_MESSAGE = (
+    "The credentials have no Manage rights, so the namespace's management data cannot be read here, but the entity "
+    "'{path}' can be read: extraction can work."
+)
+NO_MANAGE_NO_SESSION_MESSAGE = (
+    "The credentials have no Manage rights, and the session-enabled entity '{path}' has no session with messages "
+    "to peek right now, so reading it could not be checked here. Use Preview Messages in a row once it holds messages."
+)
 
 # The platform stops a sync action after 30 seconds (image pull excluded) and then answers a generic
 # HTTP 500 "Internal Server Error" instead of the action's message [docs: help.keboola.com/extend/
@@ -356,10 +377,24 @@ class Component(ComponentBase):
     @sync_action("testConnection")
     @_within_deadline
     def test_connection(self) -> ValidationResult:
-        """The root **Test Connection**: a management listing proves service-principal / Manage-SAS
-        auth. Only the auth block is read -- a row's **Preview Messages** proves entity access."""
-        probe_management(self._connector)
+        if has_no_credentials(self.configuration.parameters):
+            raise UserException(NO_CREDENTIALS_MESSAGE)
+        try:
+            probe_management(self._connector)
+        except ManagementDeniedError as denied:
+            return self._probe_entity_instead(denied)
         return ValidationResult("Connected to the Service Bus namespace.", MessageType.SUCCESS)
+
+    def _probe_entity_instead(self, denied: ManagementDeniedError) -> ValidationResult:
+        config = self._entity_configuration_or_none()
+        if config is None:
+            if self._connector.auth_type is AuthType.CONNECTION_STRING:
+                return ValidationResult(NO_MANAGE_UNKNOWN_ENTITY_MESSAGE, MessageType.WARNING)
+            raise denied
+        path = EntityRef.from_source(config.source).path
+        if self._peek_row_entity(1, config) is None:
+            return ValidationResult(NO_MANAGE_NO_SESSION_MESSAGE.format(path=path), MessageType.WARNING)
+        return ValidationResult(NO_MANAGE_ENTITY_READABLE_MESSAGE.format(path=path), MessageType.SUCCESS)
 
     @sync_action("listQueues")
     @_within_deadline
@@ -396,16 +431,22 @@ class Component(ComponentBase):
         (spec §5.4), so an unrelated half-edited field never blocks it."""
         return EntityConfiguration(**self.configuration.parameters)
 
+    def _entity_configuration_or_none(self) -> EntityConfiguration | None:
+        try:
+            return self._entity_configuration()
+        except UserException:
+            return None
+
     def _select_elements(
         self, kind: Literal["queues", "topics", "subscriptions"], topic_name: str | None = None
     ) -> list[SelectElement]:
         return [SelectElement(value=name, label=name) for name in list_entity_names(self._connector, kind, topic_name)]
 
-    def _peek_row_entity(self, max_message_count: int) -> list[Any] | None:
+    def _peek_row_entity(self, max_message_count: int, config: EntityConfiguration | None = None) -> list[Any] | None:
         """Peek the row's entity from its first message on a PEEK_LOCK receiver with the thread-free
         profile (spec §6.2); a session entity takes the next available session for a moment. ``None``
         when a session entity has no session with an available message."""
-        config = self._entity_configuration()
+        config = config or self._entity_configuration()
         entity = EntityRef.from_source(config.source)
         sessions = config.source.session_enabled
         kwargs: dict[str, Any] = {
@@ -419,7 +460,8 @@ class Component(ComponentBase):
         # A session accept that finds no session must fail after one wait, not after four (spec §5.4).
         client_factory = self._connector.session_probe_client if sessions else self._connector.receive_client
         try:
-            with client_factory() as client, entity.open_receiver(client, **kwargs) as receiver:
+            row_key = self._connector.uses_row_connection_string
+            with client_factory() as client, entity.open_receiver(client, row_key=row_key, **kwargs) as receiver:
                 return receiver.peek_messages(max_message_count)
         except OperationTimeoutError as e:
             if sessions:
